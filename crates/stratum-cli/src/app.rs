@@ -5,11 +5,11 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use stratum_runtime::{
-    CancelToken, EchoProvider, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, Paths,
-    Tier,
+    CancelToken, EchoProvider, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml,
+    ModelInstaller, Paths, Tier,
 };
 use stratum_types::{Block, ErrorCode, ModelId};
 use time::OffsetDateTime;
@@ -48,6 +48,32 @@ enum Command {
     },
     /// Open the interactive `EchoProvider`-backed chat TUI.
     Chat,
+    /// Manage on-disk model files.
+    #[command(subcommand)]
+    Models(ModelsCommand),
+}
+
+/// Subcommands under `stratum models`.
+#[derive(Debug, Subcommand)]
+enum ModelsCommand {
+    /// List installed model files in `<data>/stratum/models/`.
+    List,
+    /// Install a model file from a local source path.
+    Add(AddArgs),
+}
+
+/// Arguments for `stratum models add`.
+#[derive(Debug, Args)]
+struct AddArgs {
+    /// Local file to copy into the models directory.
+    #[arg(long)]
+    from_file: PathBuf,
+    /// Destination filename (defaults to the source filename).
+    #[arg(long)]
+    name: Option<String>,
+    /// Expected SHA-256 (lowercase hex). When set, the install verifies.
+    #[arg(long)]
+    sha256: Option<String>,
 }
 
 /// Run the CLI against the provided argv (excluding argv[0]).
@@ -99,7 +125,124 @@ where
         Some(Command::Init) => init(cli.json, &paths, out, err),
         Some(Command::Echo { prompt, max_blocks }) => echo(cli.json, &prompt, max_blocks, out),
         Some(Command::Chat) => chat_command(&paths, err),
+        Some(Command::Models(ModelsCommand::List)) => models_list(cli.json, &paths, out, err),
+        Some(Command::Models(ModelsCommand::Add(add_args))) => {
+            models_add(cli.json, &paths, &add_args, out, err)
+        }
     }
+}
+
+fn models_dir(paths: &Paths) -> PathBuf {
+    paths.data.join("models")
+}
+
+#[derive(Debug, Serialize)]
+struct ModelEntry {
+    name: String,
+    bytes: u64,
+}
+
+fn models_list(json: bool, paths: &Paths, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let dir = models_dir(paths);
+    let mut entries: Vec<ModelEntry> = Vec::new();
+    match std::fs::read_dir(&dir) {
+        Ok(iter) => {
+            for entry in iter.flatten() {
+                if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                entries.push(ModelEntry {
+                    name: entry.file_name().to_string_lossy().to_string(),
+                    bytes,
+                });
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 read {}: {}", dir.display(), e);
+            return ExitCode::from(74);
+        }
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if json {
+        #[allow(
+            clippy::expect_used,
+            reason = "ModelEntry serialization is infallible (primitives only)"
+        )]
+        let rendered =
+            serde_json::to_string_pretty(&entries).expect("ModelEntry serialization is infallible");
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+    } else if entries.is_empty() {
+        if writeln!(out, "(no models installed)").is_err() {
+            return ExitCode::from(74);
+        }
+    } else {
+        for entry in &entries {
+            if writeln!(out, "{:>12} bytes  {}", entry.bytes, entry.name).is_err() {
+                return ExitCode::from(74);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn models_add(
+    json: bool,
+    paths: &Paths,
+    args: &AddArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let dest_dir = models_dir(paths);
+    let dest_filename = args.name.as_deref().map_or_else(
+        || {
+            args.from_file.file_name().map_or_else(
+                || "model.bin".to_string(),
+                |s| s.to_string_lossy().into_owned(),
+            )
+        },
+        ToString::to_string,
+    );
+    let installer = ModelInstaller {
+        dest_dir: &dest_dir,
+        dest_filename: &dest_filename,
+        expected_sha256: args.sha256.as_deref(),
+    };
+    let report = match installer.install_local(&args.from_file) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            return ExitCode::from(73);
+        }
+    };
+
+    if json {
+        #[allow(
+            clippy::expect_used,
+            reason = "InstallReport serialization is infallible (primitives only)"
+        )]
+        let rendered = serde_json::to_string_pretty(&report)
+            .expect("InstallReport serialization is infallible");
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+    } else if writeln!(
+        out,
+        "installed · {} · {} bytes · sha256={} · verified={}",
+        report.dest.display(),
+        report.bytes,
+        report.sha256,
+        report.verified
+    )
+    .is_err()
+    {
+        return ExitCode::from(74);
+    }
+    ExitCode::SUCCESS
 }
 
 fn chat_command(paths: &Paths, err: &mut dyn Write) -> ExitCode {
@@ -486,6 +629,142 @@ mod tests {
     fn failing_writer_flush_errors() {
         let mut fail = FailingWriter;
         assert!(fail.flush().is_err());
+    }
+
+    #[test]
+    fn models_list_empty_emits_message() {
+        let tmp = TempDir::new().unwrap();
+        let (_code, out, _err) = drive_under(&["models", "list"], tmp.path());
+        assert!(out.contains("no models installed"));
+    }
+
+    #[test]
+    fn models_list_json_empty_array() {
+        let tmp = TempDir::new().unwrap();
+        let (_code, out, _err) = drive_under(&["--json", "models", "list"], tmp.path());
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert!(v.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn models_add_then_list() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        std::fs::write(&src, b"hello").unwrap();
+        let (_code, _out, _err) = drive_under(
+            &["models", "add", "--from-file", src.to_str().unwrap()],
+            tmp.path(),
+        );
+        let (_code, out, _err) = drive_under(&["models", "list"], tmp.path());
+        assert!(out.contains("src.bin"));
+        assert!(out.contains("5 bytes"));
+    }
+
+    #[test]
+    fn models_add_json_emits_install_report() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        std::fs::write(&src, b"hello").unwrap();
+        let (_code, out, _err) = drive_under(
+            &[
+                "--json",
+                "models",
+                "add",
+                "--from-file",
+                src.to_str().unwrap(),
+                "--name",
+                "renamed.bin",
+                "--sha256",
+                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            ],
+            tmp.path(),
+        );
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["verified"], true);
+        assert_eq!(v["bytes"], 5);
+        assert!(v["dest"].as_str().unwrap().ends_with("renamed.bin"));
+    }
+
+    #[test]
+    fn models_add_mismatch_exits_73() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        std::fs::write(&src, b"hello").unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "models",
+                "add",
+                "--from-file",
+                src.to_str().unwrap(),
+                "--sha256",
+                "deadbeef",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(73)));
+        assert!(err.contains("mismatch"));
+    }
+
+    #[test]
+    fn models_add_prose_uses_source_filename_when_name_absent() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("auto.bin");
+        std::fs::write(&src, b"hi").unwrap();
+        let (_code, out, _err) = drive_under(
+            &["models", "add", "--from-file", src.to_str().unwrap()],
+            tmp.path(),
+        );
+        assert!(out.contains("auto.bin"));
+    }
+
+    #[test]
+    fn models_list_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        std::fs::write(&src, b"hi").unwrap();
+        let _ = drive_under(
+            &["models", "add", "--from-file", src.to_str().unwrap()],
+            tmp.path(),
+        );
+        let code = drive_with_failing_out(&["models", "list"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn models_list_json_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let code = drive_with_failing_out(&["--json", "models", "list"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn models_add_prose_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        std::fs::write(&src, b"hi").unwrap();
+        let code = drive_with_failing_out(
+            &["models", "add", "--from-file", src.to_str().unwrap()],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn models_add_json_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        std::fs::write(&src, b"hi").unwrap();
+        let code = drive_with_failing_out(
+            &[
+                "--json",
+                "models",
+                "add",
+                "--from-file",
+                src.to_str().unwrap(),
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
     }
 
     #[test]

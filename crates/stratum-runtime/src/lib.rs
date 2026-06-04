@@ -11,6 +11,8 @@
 
 /// Cooperative cancellation token.
 pub mod cancel;
+/// Model-file install: SHA-256 verification, atomic copy with `.partial` swap.
+pub mod download;
 /// First-run install record and atomic TOML writer.
 pub mod install;
 /// `tracing` subscriber initialization with env-filter + file output.
@@ -27,6 +29,7 @@ pub mod provider;
 pub mod tier;
 
 pub use cancel::CancelToken;
+pub use download::{InstallReport, ModelInstaller};
 pub use install::{InstalledToml, TierInputs};
 pub use paths::Paths;
 pub use probe::{GpuBackend, HardwareProbe};
