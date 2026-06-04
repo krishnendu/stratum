@@ -13,6 +13,11 @@
 pub mod cancel;
 /// Model-file install: SHA-256 verification, atomic copy with `.partial` swap.
 pub mod download;
+/// Memory-safety gate.
+///
+/// Refuses model loads when free RAM minus the would-be hot footprint falls
+/// below the configured margin.
+pub mod gate;
 /// First-run install record and atomic TOML writer.
 pub mod install;
 /// `tracing` subscriber initialization with env-filter + file output.
@@ -23,6 +28,8 @@ pub mod panic;
 pub mod paths;
 /// Hardware probe: RAM, CPU features, GPU backend, OS.
 pub mod probe;
+/// Embedded caveman-rewriter and polisher system prompts.
+pub mod prompts;
 /// Provider abstractions and concrete `EchoProvider` for end-to-end loop tests.
 pub mod provider;
 /// Composite tier classifier (low / medium / high).
@@ -30,8 +37,10 @@ pub mod tier;
 
 pub use cancel::CancelToken;
 pub use download::{InstallReport, ModelInstaller};
+pub use gate::{MemoryGate, DEFAULT_MARGIN_MIB};
 pub use install::{InstalledToml, TierInputs};
 pub use paths::Paths;
 pub use probe::{GpuBackend, HardwareProbe};
+pub use prompts::{system_prompt, PromptRole};
 pub use provider::{EchoProvider, GenerateRequest};
 pub use tier::Tier;
