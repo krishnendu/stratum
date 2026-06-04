@@ -7,8 +7,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
-use stratum_runtime::{GpuBackend, HardwareProbe, InstalledToml, Paths, Tier};
-use stratum_types::ErrorCode;
+use stratum_runtime::{
+    CancelToken, EchoProvider, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, Paths,
+    Tier,
+};
+use stratum_types::{Block, ErrorCode, ModelId};
 use time::OffsetDateTime;
 
 /// Stratum CLI.
@@ -35,6 +38,14 @@ enum Command {
     Doctor,
     /// First-run install: probe, classify, write `installed.toml`.
     Init,
+    /// Smoke-test the chat loop against the `EchoProvider`.
+    Echo {
+        /// Prompt to feed the provider.
+        prompt: Vec<String>,
+        /// Maximum number of text blocks to emit (default 64).
+        #[arg(long, default_value_t = 64)]
+        max_blocks: u32,
+    },
 }
 
 /// Run the CLI against the provided argv (excluding argv[0]).
@@ -84,6 +95,7 @@ where
         None => print_greeting(&paths, out),
         Some(Command::Doctor) => doctor(cli.json, &paths, out, err),
         Some(Command::Init) => init(cli.json, &paths, out, err),
+        Some(Command::Echo { prompt, max_blocks }) => echo(cli.json, &prompt, max_blocks, out),
     }
 }
 
@@ -212,6 +224,49 @@ fn init(json: bool, paths: &Paths, out: &mut dyn Write, err: &mut dyn Write) -> 
         return ExitCode::from(74);
     }
     ExitCode::SUCCESS
+}
+
+fn echo(json: bool, prompt: &[String], max_blocks: u32, out: &mut dyn Write) -> ExitCode {
+    let provider = EchoProvider::new("echo: ");
+    let request = GenerateRequest {
+        model: ModelId::from("echo"),
+        prompt: prompt.join(" "),
+        max_blocks,
+    };
+    let cancel = CancelToken::new();
+    let blocks = provider.generate(&request, &cancel);
+
+    if json {
+        #[allow(
+            clippy::expect_used,
+            reason = "Block serialization is infallible (primitives only)"
+        )]
+        let rendered =
+            serde_json::to_string_pretty(&blocks).expect("Block serialization is infallible");
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+    } else {
+        for block in &blocks {
+            if render_block(out, block).is_err() {
+                return ExitCode::from(74);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn render_block(out: &mut dyn Write, block: &Block) -> std::io::Result<()> {
+    match block {
+        Block::Text { text } => writeln!(out, "{text}"),
+        Block::Usage { prompt, completion } => {
+            writeln!(out, "(usage: prompt={prompt} completion={completion})")
+        }
+        Block::Done => writeln!(out, "(done)"),
+        Block::Cancelled { reason } => writeln!(out, "(cancelled: {reason})"),
+        Block::ToolCall { tool, .. } => writeln!(out, "(tool_call: {tool})"),
+        Block::ToolResult { id, .. } => writeln!(out, "(tool_result: {id})"),
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +509,95 @@ mod tests {
         assert!(String::from_utf8(err)
             .unwrap()
             .contains("synthetic resolver failure"));
+    }
+
+    #[test]
+    fn echo_prose_emits_words_then_done() {
+        let tmp = TempDir::new().unwrap();
+        let (_code, out, _err) = drive_under(&["echo", "hello", "world"], tmp.path());
+        assert!(out.contains("echo: hello"));
+        assert!(out.contains("echo: world"));
+        assert!(out.contains("(usage:"));
+        assert!(out.contains("(done)"));
+    }
+
+    #[test]
+    fn echo_json_emits_block_array() {
+        let tmp = TempDir::new().unwrap();
+        let (_code, out, _err) = drive_under(&["--json", "echo", "hi"], tmp.path());
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let arr = v.as_array().unwrap();
+        assert!(!arr.is_empty());
+        assert_eq!(arr.last().unwrap()["kind"], "done");
+    }
+
+    #[test]
+    fn echo_max_blocks_limits_output() {
+        let tmp = TempDir::new().unwrap();
+        let (_code, out, _err) = drive_under(
+            &["echo", "--max-blocks", "1", "alpha", "beta", "gamma"],
+            tmp.path(),
+        );
+        assert!(out.contains("echo: alpha"));
+        assert!(!out.contains("echo: beta"));
+    }
+
+    #[test]
+    fn echo_prose_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let code = drive_with_failing_out(&["echo", "x"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn echo_json_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let code = drive_with_failing_out(&["--json", "echo", "x"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn render_block_handles_all_variants() {
+        let mut out = Vec::new();
+        render_block(&mut out, &Block::Text { text: "t".into() }).unwrap();
+        render_block(
+            &mut out,
+            &Block::Usage {
+                prompt: 1,
+                completion: 2,
+            },
+        )
+        .unwrap();
+        render_block(&mut out, &Block::Done).unwrap();
+        render_block(
+            &mut out,
+            &Block::Cancelled {
+                reason: "STRAT-E4002".into(),
+            },
+        )
+        .unwrap();
+        render_block(
+            &mut out,
+            &Block::ToolCall {
+                id: "t1".into(),
+                tool: "fs.read".into(),
+                args: "{}".into(),
+            },
+        )
+        .unwrap();
+        render_block(
+            &mut out,
+            &Block::ToolResult {
+                id: "t1".into(),
+                output: "ok".into(),
+            },
+        )
+        .unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("(done)"));
+        assert!(s.contains("(cancelled: STRAT-E4002)"));
+        assert!(s.contains("(tool_call: fs.read)"));
+        assert!(s.contains("(tool_result: t1)"));
     }
 
     #[cfg(unix)]

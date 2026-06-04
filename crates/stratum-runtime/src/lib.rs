@@ -9,16 +9,26 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Cooperative cancellation token.
+pub mod cancel;
 /// First-run install record and atomic TOML writer.
 pub mod install;
+/// `tracing` subscriber initialization with env-filter + file output.
+pub mod logging;
+/// Panic hook + crash report file writer.
+pub mod panic;
 /// XDG-aware filesystem path resolution.
 pub mod paths;
 /// Hardware probe: RAM, CPU features, GPU backend, OS.
 pub mod probe;
+/// Provider abstractions and concrete `EchoProvider` for end-to-end loop tests.
+pub mod provider;
 /// Composite tier classifier (low / medium / high).
 pub mod tier;
 
+pub use cancel::CancelToken;
 pub use install::{InstalledToml, TierInputs};
 pub use paths::Paths;
 pub use probe::{GpuBackend, HardwareProbe};
+pub use provider::{EchoProvider, GenerateRequest};
 pub use tier::Tier;

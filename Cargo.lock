@@ -738,6 +738,7 @@ dependencies = [
  "time",
  "toml_edit",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
