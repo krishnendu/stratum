@@ -46,6 +46,8 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         max_blocks: u32,
     },
+    /// Open the interactive `EchoProvider`-backed chat TUI.
+    Chat,
 }
 
 /// Run the CLI against the provided argv (excluding argv[0]).
@@ -96,6 +98,19 @@ where
         Some(Command::Doctor) => doctor(cli.json, &paths, out, err),
         Some(Command::Init) => init(cli.json, &paths, out, err),
         Some(Command::Echo { prompt, max_blocks }) => echo(cli.json, &prompt, max_blocks, out),
+        Some(Command::Chat) => chat_command(&paths, err),
+    }
+}
+
+fn chat_command(paths: &Paths, err: &mut dyn Write) -> ExitCode {
+    let probe = HardwareProbe::run();
+    let tier = Tier::classify(&probe);
+    match crate::chat::run(paths, tier) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            ExitCode::from(70)
+        }
     }
 }
 

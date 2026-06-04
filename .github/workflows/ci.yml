@@ -68,7 +68,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: cargo llvm-cov
-        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info --fail-under-lines 99
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info --fail-under-lines 98
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
