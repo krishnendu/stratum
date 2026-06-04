@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest new capability or change to an existing one.
+title: "[feat] "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Stratum is focused on **local agentic outcomes on 8-16 GB laptops**. Proposals that meaningfully conflict with that target will be closed; the bar is high.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem you're trying to solve
+      description: What can't you do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What would the user-facing surface look like? CLI flags, TUI keys, config knobs.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, other designs you ruled out.
+    validations:
+      required: false
+  - type: textarea
+    id: impact
+    attributes:
+      label: Hardware / scope impact
+      description: Does this need more RAM, GPU, or network than the existing baseline?
+    validations:
+      required: false

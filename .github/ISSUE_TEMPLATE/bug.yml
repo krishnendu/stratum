@@ -1,0 +1,60 @@
+name: Bug report
+description: Something is broken or behaves wrong.
+title: "[bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug! Stratum is pre-alpha — clear reproducers help land fixes fast.
+  - type: input
+    id: version
+    attributes:
+      label: Stratum version
+      description: Output of `stratum --version`.
+      placeholder: e.g. 0.0.0 (commit abc1234)
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (x86_64)
+        - Linux (aarch64)
+        - Windows (x86_64)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: stratum doctor --json
+      description: Paste the output. Helps narrow tier / GPU / capability differences.
+      render: json
+    validations:
+      required: false
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproducer
+      description: Minimal steps. Commands as `code blocks`. Expected vs actual.
+      placeholder: |
+        1. `stratum models add ...`
+        2. `stratum chat`
+        3. Type "hi" + Enter
+
+        Expected: ...
+        Actual: ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / error codes
+      description: Any `STRAT-Exxxx` codes from stderr or `<state>/logs/`.
+      render: shell
+    validations:
+      required: false

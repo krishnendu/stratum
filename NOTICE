@@ -1,0 +1,12 @@
+Stratum
+Copyright (c) 2026 Krishnendu
+
+This project is dual-licensed under either:
+
+  * Apache License, Version 2.0 (see LICENSE-APACHE)
+  * MIT License (see LICENSE-MIT)
+
+at your option.
+
+Third-party dependencies retain their own licenses; a SBOM is generated per
+release and published alongside the binary artifacts.
