@@ -105,6 +105,24 @@ pub struct ModelInstaller<'a> {
 }
 
 impl ModelInstaller<'_> {
+    /// Fetch a model file from a HTTP(S) URL and install it.
+    ///
+    /// The flow mirrors [`Self::install_local`]: stream the response body
+    /// through [`hash_and_copy`] into `<dest>.partial`, verify the digest
+    /// when set, then atomically rename. Resume is not implemented in this
+    /// pass; a pre-existing partial is overwritten.
+    ///
+    /// # Errors
+    /// Returns [`E1001_INSTALLED_SCHEMA_UNREADABLE`] for HTTP, io, or
+    /// digest-mismatch failures.
+    pub fn install_from_url(&self, url: &str) -> StratumResult<InstallReport> {
+        let response = ureq::get(url).call().map_err(|e| {
+            StratumError::new(E1001_INSTALLED_SCHEMA_UNREADABLE, format!("http get {url}"))
+                .with_cause(e)
+        })?;
+        self.install_from_reader(response.into_reader())
+    }
+
     /// Run the install from a local source path.
     ///
     /// # Errors
@@ -411,6 +429,105 @@ mod tests {
             .install_from_reader(Cursor::new(b"hi".to_vec()))
             .unwrap_err();
         assert_eq!(err.code(), &E1001_INSTALLED_SCHEMA_UNREADABLE);
+    }
+
+    fn spawn_static_server(body: Vec<u8>) -> String {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0_u8; 4096];
+                let _ = stream.read(&mut buf);
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(headers.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/file")
+    }
+
+    fn spawn_404_server() -> String {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0_u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/missing")
+    }
+
+    #[test]
+    fn install_from_url_writes_and_verifies() {
+        let tmp = TempDir::new().unwrap();
+        let url = spawn_static_server(b"hello".to_vec());
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some(HELLO_SHA),
+        };
+        let report = installer.install_from_url(&url).unwrap();
+        assert_eq!(report.bytes, 5);
+        assert!(report.verified);
+        assert_eq!(std::fs::read(&report.dest).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn install_from_url_errors_on_404() {
+        let tmp = TempDir::new().unwrap();
+        let url = spawn_404_server();
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "x.bin",
+            expected_sha256: None,
+        };
+        let err = installer.install_from_url(&url).unwrap_err();
+        assert_eq!(err.code(), &E1001_INSTALLED_SCHEMA_UNREADABLE);
+    }
+
+    #[test]
+    fn install_from_url_errors_on_unreachable() {
+        let tmp = TempDir::new().unwrap();
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "x.bin",
+            expected_sha256: None,
+        };
+        // Unbound port on the loopback interface; connect fails immediately.
+        let err = installer
+            .install_from_url("http://127.0.0.1:1/never")
+            .unwrap_err();
+        assert_eq!(err.code(), &E1001_INSTALLED_SCHEMA_UNREADABLE);
+    }
+
+    #[test]
+    fn install_from_url_errors_on_sha_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let url = spawn_static_server(b"hello".to_vec());
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some("deadbeef"),
+        };
+        let err = installer.install_from_url(&url).unwrap_err();
+        assert!(format!("{err}").contains("mismatch"));
     }
 
     #[test]

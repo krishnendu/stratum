@@ -62,12 +62,16 @@ enum ModelsCommand {
     Add(AddArgs),
 }
 
-/// Arguments for `stratum models add`.
+/// Arguments for `stratum models add`. Either `--from-file` or `--from-url`
+/// must be supplied (clap enforces the choice).
 #[derive(Debug, Args)]
 struct AddArgs {
     /// Local file to copy into the models directory.
-    #[arg(long)]
-    from_file: PathBuf,
+    #[arg(long, conflicts_with = "from_url")]
+    from_file: Option<PathBuf>,
+    /// HTTP(S) URL to fetch the model from.
+    #[arg(long, conflicts_with = "from_file")]
+    from_url: Option<String>,
     /// Destination filename (defaults to the source filename).
     #[arg(long)]
     name: Option<String>,
@@ -198,21 +202,27 @@ fn models_add(
     err: &mut dyn Write,
 ) -> ExitCode {
     let dest_dir = models_dir(paths);
-    let dest_filename = args.name.as_deref().map_or_else(
-        || {
-            args.from_file.file_name().map_or_else(
-                || "model.bin".to_string(),
-                |s| s.to_string_lossy().into_owned(),
-            )
-        },
-        ToString::to_string,
-    );
+    let dest_filename = args
+        .name
+        .as_deref()
+        .map_or_else(|| default_filename_for(args), ToString::to_string);
     let installer = ModelInstaller {
         dest_dir: &dest_dir,
         dest_filename: &dest_filename,
         expected_sha256: args.sha256.as_deref(),
     };
-    let report = match installer.install_local(&args.from_file) {
+    let result = match (args.from_file.as_deref(), args.from_url.as_deref()) {
+        (Some(path), None) => installer.install_local(path),
+        (None, Some(url)) => installer.install_from_url(url),
+        _ => {
+            let _ = writeln!(
+                err,
+                "STRAT-E1001 supply exactly one of --from-file or --from-url"
+            );
+            return ExitCode::from(64);
+        }
+    };
+    let report = match result {
         Ok(r) => r,
         Err(e) => {
             let _ = writeln!(err, "{e}");
@@ -243,6 +253,25 @@ fn models_add(
         return ExitCode::from(74);
     }
     ExitCode::SUCCESS
+}
+
+fn default_filename_for(args: &AddArgs) -> String {
+    if let Some(p) = args.from_file.as_deref() {
+        return p.file_name().map_or_else(
+            || "model.bin".to_string(),
+            |s| s.to_string_lossy().into_owned(),
+        );
+    }
+    if let Some(u) = args.from_url.as_deref() {
+        if !u.ends_with('/') {
+            if let Some(last) = u.rsplit('/').next() {
+                if !last.is_empty() && !last.contains(':') {
+                    return last.to_string();
+                }
+            }
+        }
+    }
+    "model.bin".to_string()
 }
 
 fn chat_command(paths: &Paths, err: &mut dyn Write) -> ExitCode {
@@ -765,6 +794,49 @@ mod tests {
             tmp.path(),
         );
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn models_add_neither_source_exits_64() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(&["models", "add"], tmp.path());
+        // clap allows --from-file/--from-url as optional but we reject missing
+        // sources ourselves with exit 64.
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(64)));
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn default_filename_from_url_uses_last_segment() {
+        let args = AddArgs {
+            from_file: None,
+            from_url: Some("https://example.com/x/y/weights.gguf".into()),
+            name: None,
+            sha256: None,
+        };
+        assert_eq!(default_filename_for(&args), "weights.gguf");
+    }
+
+    #[test]
+    fn default_filename_falls_back_when_url_empty_after_slash() {
+        let args = AddArgs {
+            from_file: None,
+            from_url: Some("https://example.com/".into()),
+            name: None,
+            sha256: None,
+        };
+        assert_eq!(default_filename_for(&args), "model.bin");
+    }
+
+    #[test]
+    fn default_filename_falls_back_when_no_source() {
+        let args = AddArgs {
+            from_file: None,
+            from_url: None,
+            name: None,
+            sha256: None,
+        };
+        assert_eq!(default_filename_for(&args), "model.bin");
     }
 
     #[test]
