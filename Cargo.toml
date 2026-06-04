@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/stratum-types",
     "crates/stratum-testkit",
+    "crates/stratum-runtime",
     "crates/stratum-cli",
 ]
 
@@ -57,6 +58,10 @@ tokio           = { version = "1", features = ["macros", "rt-multi-thread", "sig
 tokio-util      = "0.7"
 insta           = "1"
 proptest        = "1"
+sysinfo         = "0.32"
+dirs            = "5"
+time            = { version = "0.3", features = ["formatting", "serde"] }
+tempfile        = "3"
 
 [profile.release]
 lto             = "thin"

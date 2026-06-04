@@ -237,7 +237,7 @@ mod tests {
             &E9001_INTERNAL_PANIC,
         ];
         let set: HashSet<_> = codes.iter().copied().collect();
-        assert_eq!(set.len(), codes.len(), "duplicate STRAT-E codes in catalog");
+        assert_eq!(set.len(), codes.len());
     }
 
     #[test]

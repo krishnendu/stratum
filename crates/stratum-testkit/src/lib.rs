@@ -138,7 +138,7 @@ mod tests {
             Block::Done,
         ];
         let err = t.assert_step(0, &actual).unwrap_err();
-        matches!(err, TranscriptMismatch::Diverged { idx: 0, .. });
+        assert!(matches!(err, TranscriptMismatch::Diverged { idx: 0, .. }));
     }
 
     #[test]
@@ -146,7 +146,7 @@ mod tests {
         let t = sample();
         let actual: Vec<Block> = vec![];
         let err = t.assert_step(7, &actual).unwrap_err();
-        matches!(err, TranscriptMismatch::OutOfRange { idx: 7 });
+        assert!(matches!(err, TranscriptMismatch::OutOfRange { idx: 7 }));
     }
 
     #[test]
