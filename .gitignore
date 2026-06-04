@@ -1,0 +1,34 @@
+# Stratum private design corpus — never published
+plan/
+
+# Rust
+target/
+**/*.rs.bk
+.cargo/config.toml.local
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Stratum runtime artifacts
+/.stratum-dev/
+/scrollback/
+/prompt-cache/
+*.gguf
+*.bin
+*.onnx
+
+# Test / coverage artifacts
+/tmp/
+/coverage/
+*.profraw
+*.lcov
+
+# Secrets
+.env
+.env.*
+!.env.example

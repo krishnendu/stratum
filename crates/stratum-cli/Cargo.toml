@@ -1,0 +1,31 @@
+[package]
+name         = "stratum-cli"
+description  = "Stratum CLI entry point."
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+homepage     = { workspace = true }
+readme       = { workspace = true }
+keywords     = { workspace = true }
+categories   = { workspace = true }
+
+[[bin]]
+name = "stratum"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+stratum-types       = { path = "../stratum-types" }
+clap                = { workspace = true }
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+tracing             = { workspace = true }
+tracing-subscriber  = { workspace = true }
+
+[dev-dependencies]
+serde_json          = { workspace = true }

@@ -1,0 +1,73 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/stratum-types",
+    "crates/stratum-testkit",
+    "crates/stratum-cli",
+]
+
+[workspace.package]
+version       = "0.0.0"
+edition       = "2021"
+rust-version  = "1.90"
+authors       = ["Krishnendu <krishnenduchatterjee25@gmail.com>"]
+license       = "Apache-2.0 OR MIT"
+repository    = "https://github.com/krishnendu/stratum"
+homepage      = "https://stratum.dev"
+readme        = "README.md"
+keywords      = ["llm", "agent", "tui", "local", "ai"]
+categories    = ["command-line-utilities"]
+
+[workspace.lints.rust]
+unsafe_code                  = "deny"
+missing_debug_implementations = "warn"
+missing_docs                 = "warn"
+rust_2018_idioms             = { level = "warn", priority = -1 }
+unreachable_pub              = "warn"
+unused_must_use              = "deny"
+
+[workspace.lints.clippy]
+# Bars are intentionally high; relax per-call with `#[allow(...)]` only with a comment justifying it.
+pedantic    = { level = "warn", priority = -1 }
+nursery     = { level = "warn", priority = -1 }
+cargo       = { level = "warn", priority = -1 }
+# G4 — no panics, unwraps, or expects outside tests.
+unwrap_used = "deny"
+expect_used = "deny"
+panic       = "deny"
+todo        = "warn"
+dbg_macro   = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Style nits we don't care about as errors.
+module_name_repetitions = { level = "allow", priority = 1 }
+multiple_crate_versions  = { level = "allow", priority = 1 }
+
+[workspace.dependencies]
+# Pinned across the workspace; bumped in lockstep.
+thiserror       = "2"
+tracing         = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+serde           = { version = "1", features = ["derive"] }
+serde_json      = "1"
+toml_edit       = "0.22"
+clap            = { version = "4", features = ["derive", "env"] }
+anyhow          = "1"            # only allowed in stratum-cli (boundary)
+tokio           = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util      = "0.7"
+insta           = "1"
+proptest        = "1"
+
+[profile.release]
+lto             = "thin"
+codegen-units   = 1
+strip           = "symbols"
+panic           = "abort"
+opt-level       = 3
+
+[profile.dev]
+opt-level       = 0
+debug           = "limited"
+
+[profile.test]
+opt-level       = 1
