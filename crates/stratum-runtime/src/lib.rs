@@ -23,6 +23,8 @@ pub mod panic;
 pub mod paths;
 /// Hardware probe: RAM, CPU features, GPU backend, OS.
 pub mod probe;
+/// Embedded caveman-rewriter and polisher system prompts.
+pub mod prompts;
 /// Provider abstractions and concrete `EchoProvider` for end-to-end loop tests.
 pub mod provider;
 /// Composite tier classifier (low / medium / high).
@@ -33,5 +35,6 @@ pub use download::{InstallReport, ModelInstaller};
 pub use install::{InstalledToml, TierInputs};
 pub use paths::Paths;
 pub use probe::{GpuBackend, HardwareProbe};
+pub use prompts::{system_prompt, PromptRole};
 pub use provider::{EchoProvider, GenerateRequest};
 pub use tier::Tier;
