@@ -71,7 +71,7 @@ jobs:
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info --fail-under-lines 98
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lcov
           path: lcov.info
