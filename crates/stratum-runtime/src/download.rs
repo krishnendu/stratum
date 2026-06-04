@@ -83,6 +83,36 @@ pub const fn digest_matches(expected: &str, actual: &str) -> bool {
     expected.eq_ignore_ascii_case(actual)
 }
 
+/// Wrap an `io::Error` into a [`StratumError`] tagged with
+/// `E1001_INSTALLED_SCHEMA_UNREADABLE` and the supplied context message.
+fn io_err(message: impl Into<String>, cause: std::io::Error) -> StratumError {
+    StratumError::new(E1001_INSTALLED_SCHEMA_UNREADABLE, message).with_cause(cause)
+}
+
+/// Predicate: does the server's `Content-Range` header begin at the offset
+/// the client requested (`bytes <start>-…/…`)? A missing or malformed
+/// header conservatively returns `false`, which forces a clean restart.
+fn content_range_starts_at(response: &ureq::Response, expected_start: u64) -> bool {
+    let Some(value) = response.header("Content-Range") else {
+        return false;
+    };
+    // Accept `bytes <start>-<end>/<total>` and `bytes=<start>-<end>/<total>`.
+    let rest = value
+        .trim()
+        .strip_prefix("bytes")
+        .map(|s| s.trim_start_matches([' ', '=']));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let Some((start_str, _)) = rest.split_once('-') else {
+        return false;
+    };
+    start_str
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|n| n == expected_start)
+}
+
 /// Build the partial-file path next to `dest`.
 #[must_use]
 pub fn partial_path(dest: &Path) -> PathBuf {
@@ -109,18 +139,118 @@ impl ModelInstaller<'_> {
     ///
     /// The flow mirrors [`Self::install_local`]: stream the response body
     /// through [`hash_and_copy`] into `<dest>.partial`, verify the digest
-    /// when set, then atomically rename. Resume is not implemented in this
-    /// pass; a pre-existing partial is overwritten.
+    /// when set, then atomically rename. If a `<dest>.partial` already
+    /// exists from a previous interrupted run, the installer issues a
+    /// `Range: bytes={n}-` request and — if the server replies `206
+    /// Partial Content` with a coherent `Content-Range` — resumes by
+    /// re-hashing the partial bytes off disk to seed the SHA-256 state and
+    /// then appending the new bytes. A `200 OK` reply (range ignored)
+    /// transparently restarts from scratch.
     ///
     /// # Errors
     /// Returns [`E1001_INSTALLED_SCHEMA_UNREADABLE`] for HTTP, io, or
     /// digest-mismatch failures.
     pub fn install_from_url(&self, url: &str) -> StratumResult<InstallReport> {
-        let response = ureq::get(url).call().map_err(|e| {
+        std::fs::create_dir_all(self.dest_dir)
+            .map_err(|e| io_err(format!("create {}", self.dest_dir.display()), e))?;
+        let dest = self.dest_dir.join(self.dest_filename);
+        let partial = partial_path(&dest);
+        let resume_from = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+
+        let mut req = ureq::get(url);
+        if resume_from > 0 {
+            req = req.set("Range", &format!("bytes={resume_from}-"));
+        }
+        let response = req.call().map_err(|e| {
             StratumError::new(E1001_INSTALLED_SCHEMA_UNREADABLE, format!("http get {url}"))
                 .with_cause(e)
         })?;
-        self.install_from_reader(response.into_reader())
+
+        if resume_from > 0
+            && response.status() == 206
+            && content_range_starts_at(&response, resume_from)
+        {
+            self.finish_resumed_install(&dest, &partial, resume_from, response.into_reader())
+        } else {
+            // 200 OK (or 206 the client cannot trust): start over from byte 0.
+            if partial.exists() {
+                std::fs::remove_file(&partial)
+                    .map_err(|e| io_err(format!("clear stale partial {}", partial.display()), e))?;
+            }
+            self.install_from_reader(response.into_reader())
+        }
+    }
+
+    /// Finish a `206 Partial Content` install by re-hashing the existing
+    /// `<dest>.partial` bytes off disk, then appending the streamed
+    /// remainder while updating the hash in lockstep.
+    fn finish_resumed_install<R: Read>(
+        &self,
+        dest: &Path,
+        partial: &Path,
+        resume_from: u64,
+        mut reader: R,
+    ) -> StratumResult<InstallReport> {
+        let mut hasher = Sha256::new();
+        // Re-hash the on-disk prefix so the final digest covers the whole file.
+        let mut existing = std::fs::File::open(partial)
+            .map_err(|e| io_err(format!("open partial {}", partial.display()), e))?;
+        let mut buf = vec![0_u8; COPY_CHUNK];
+        loop {
+            let n = existing
+                .read(&mut buf)
+                .map_err(|e| io_err(format!("rehash partial {}", partial.display()), e))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        drop(existing);
+
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(partial)
+            .map_err(|e| io_err(format!("append partial {}", partial.display()), e))?;
+        let mut written = 0_u64;
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| io_err(format!("stream into {}", partial.display()), e))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            writer
+                .write_all(&buf[..n])
+                .map_err(|e| io_err(format!("write partial {}", partial.display()), e))?;
+            written = written.saturating_add(n as u64);
+        }
+        let actual = hex(&hasher.finalize());
+        let bytes = resume_from.saturating_add(written);
+
+        let verified = if let Some(expected) = self.expected_sha256 {
+            if !digest_matches(expected, &actual) {
+                let _ = std::fs::remove_file(partial);
+                return Err(StratumError::new(
+                    E1001_INSTALLED_SCHEMA_UNREADABLE,
+                    format!(
+                        "sha256 mismatch for {}: expected {expected}, got {actual}",
+                        dest.display()
+                    ),
+                ));
+            }
+            true
+        } else {
+            false
+        };
+        std::fs::rename(partial, dest)
+            .map_err(|e| io_err(format!("rename to {}", dest.display()), e))?;
+        Ok(InstallReport {
+            dest: dest.to_path_buf(),
+            bytes,
+            sha256: actual,
+            verified,
+        })
     }
 
     /// Run the install from a local source path.
@@ -432,6 +562,19 @@ mod tests {
     }
 
     fn spawn_static_server(body: Vec<u8>) -> String {
+        spawn_range_server(body, RangeMode::Honor)
+    }
+
+    /// How the test server treats an inbound `Range:` header.
+    #[derive(Clone, Copy)]
+    enum RangeMode {
+        /// Reply `206 Partial Content` with a coherent `Content-Range`.
+        Honor,
+        /// Ignore the `Range` header and always reply `200 OK` with the full body.
+        Ignore,
+    }
+
+    fn spawn_range_server(body: Vec<u8>, mode: RangeMode) -> String {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
 
@@ -441,17 +584,48 @@ mod tests {
             for stream in listener.incoming().take(1) {
                 let Ok(mut stream) = stream else { continue };
                 let mut buf = [0_u8; 4096];
-                let _ = stream.read(&mut buf);
-                let headers = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                let range_start = parse_range_start(request);
+                let total = body.len();
+                let (headers, payload) = match (mode, range_start) {
+                    (RangeMode::Honor, Some(start))
+                        if usize::try_from(start).is_ok_and(|s| s < total) =>
+                    {
+                        let start_usize = usize::try_from(start).unwrap_or(0);
+                        let slice = &body[start_usize..];
+                        let end = total - 1;
+                        let h = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{total}\r\nConnection: close\r\n\r\n",
+                            slice.len()
+                        );
+                        (h, slice.to_vec())
+                    }
+                    _ => {
+                        let h = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                        );
+                        (h, body.clone())
+                    }
+                };
                 let _ = stream.write_all(headers.as_bytes());
-                let _ = stream.write_all(&body);
+                let _ = stream.write_all(&payload);
                 let _ = stream.flush();
             }
         });
         format!("http://{addr}/file")
+    }
+
+    fn parse_range_start(request: &str) -> Option<u64> {
+        for line in request.lines() {
+            let lower = line.to_ascii_lowercase();
+            if let Some(rest) = lower.strip_prefix("range:") {
+                let after = rest.trim().strip_prefix("bytes=")?;
+                let (s, _) = after.split_once('-')?;
+                return s.trim().parse::<u64>().ok();
+            }
+        }
+        None
     }
 
     fn spawn_404_server() -> String {
@@ -528,6 +702,241 @@ mod tests {
         };
         let err = installer.install_from_url(&url).unwrap_err();
         assert!(format!("{err}").contains("mismatch"));
+    }
+
+    #[test]
+    fn install_from_url_resumes_via_range_206() {
+        let tmp = TempDir::new().unwrap();
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some(HELLO_SHA),
+        };
+        // Pre-seed the partial with the first two bytes of "hello".
+        let partial = partial_path(&tmp.path().join("remote.bin"));
+        std::fs::write(&partial, b"he").unwrap();
+
+        let url = spawn_range_server(b"hello".to_vec(), RangeMode::Honor);
+        let report = installer.install_from_url(&url).unwrap();
+        assert_eq!(report.bytes, 5);
+        assert_eq!(report.sha256, HELLO_SHA);
+        assert!(report.verified);
+        assert_eq!(std::fs::read(&report.dest).unwrap(), b"hello");
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn install_from_url_falls_back_to_200_when_server_ignores_range() {
+        let tmp = TempDir::new().unwrap();
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some(HELLO_SHA),
+        };
+        // Stale partial that the server won't honor — must be discarded.
+        let partial = partial_path(&tmp.path().join("remote.bin"));
+        std::fs::write(&partial, b"XX").unwrap();
+
+        let url = spawn_range_server(b"hello".to_vec(), RangeMode::Ignore);
+        let report = installer.install_from_url(&url).unwrap();
+        assert_eq!(report.bytes, 5);
+        assert_eq!(report.sha256, HELLO_SHA);
+        assert_eq!(std::fs::read(&report.dest).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn install_from_url_resumes_across_chunk_boundary() {
+        // Body 11 bytes, partial 3 bytes, remaining 8 bytes.
+        let body = b"hello world".to_vec();
+        let expected = sha256_hex(&body);
+
+        let tmp = TempDir::new().unwrap();
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some(&expected),
+        };
+        let partial = partial_path(&tmp.path().join("remote.bin"));
+        std::fs::write(&partial, &body[..3]).unwrap();
+
+        let url = spawn_range_server(body.clone(), RangeMode::Honor);
+        let report = installer.install_from_url(&url).unwrap();
+        assert_eq!(report.bytes, body.len() as u64);
+        assert_eq!(report.sha256, expected);
+        assert!(report.verified);
+        assert_eq!(std::fs::read(&report.dest).unwrap(), body);
+    }
+
+    #[test]
+    fn install_from_url_resume_no_expected_sha_marks_unverified() {
+        let tmp = TempDir::new().unwrap();
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: None,
+        };
+        let partial = partial_path(&tmp.path().join("remote.bin"));
+        std::fs::write(&partial, b"he").unwrap();
+
+        let url = spawn_range_server(b"hello".to_vec(), RangeMode::Honor);
+        let report = installer.install_from_url(&url).unwrap();
+        assert!(!report.verified);
+        assert_eq!(report.bytes, 5);
+        assert_eq!(report.sha256, HELLO_SHA);
+    }
+
+    /// Server that emits a 206 response with a caller-supplied
+    /// `Content-Range` value, used to drive the parser's reject branches.
+    fn spawn_custom_content_range_server(body: Vec<u8>, content_range: String) -> String {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0_u8; 4096];
+                let _ = stream.read(&mut buf);
+                let headers = if content_range.is_empty() {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: {content_range}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                };
+                let _ = stream.write_all(headers.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}/file")
+    }
+
+    #[test]
+    fn install_from_url_rejects_206_without_content_range() {
+        // Pre-seed a partial, server returns 206 without Content-Range — must
+        // fall back to fresh-install path (discard partial and use full body).
+        let tmp = TempDir::new().unwrap();
+        let partial = partial_path(&tmp.path().join("remote.bin"));
+        std::fs::write(&partial, b"XX").unwrap();
+        let url = spawn_custom_content_range_server(b"hello".to_vec(), String::new());
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some(HELLO_SHA),
+        };
+        let report = installer.install_from_url(&url).unwrap();
+        assert_eq!(report.sha256, HELLO_SHA);
+        assert_eq!(std::fs::read(&report.dest).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn install_from_url_rejects_206_with_mismatched_offset() {
+        let tmp = TempDir::new().unwrap();
+        let partial = partial_path(&tmp.path().join("remote.bin"));
+        std::fs::write(&partial, b"XX").unwrap();
+        // Server says it's starting at 0, but the client asked for 2.
+        let url = spawn_custom_content_range_server(b"hello".to_vec(), "bytes 0-4/5".to_string());
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some(HELLO_SHA),
+        };
+        let report = installer.install_from_url(&url).unwrap();
+        assert_eq!(report.sha256, HELLO_SHA);
+    }
+
+    #[test]
+    fn install_from_url_rejects_malformed_content_range() {
+        let tmp = TempDir::new().unwrap();
+        let partial = partial_path(&tmp.path().join("remote.bin"));
+        std::fs::write(&partial, b"XX").unwrap();
+        // No dash → split_once('-') returns None → predicate rejects.
+        let url = spawn_custom_content_range_server(b"hello".to_vec(), "garbage".to_string());
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some(HELLO_SHA),
+        };
+        let report = installer.install_from_url(&url).unwrap();
+        assert_eq!(report.sha256, HELLO_SHA);
+    }
+
+    #[test]
+    fn install_from_url_rejects_content_range_without_bytes_unit() {
+        let tmp = TempDir::new().unwrap();
+        let partial = partial_path(&tmp.path().join("remote.bin"));
+        std::fs::write(&partial, b"XX").unwrap();
+        // Wrong unit → `strip_prefix("bytes")` returns None → predicate rejects.
+        let url = spawn_custom_content_range_server(b"hello".to_vec(), "items 2-4/5".to_string());
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some(HELLO_SHA),
+        };
+        let report = installer.install_from_url(&url).unwrap();
+        assert_eq!(report.sha256, HELLO_SHA);
+    }
+
+    #[test]
+    fn install_from_url_errors_when_dest_dir_unwritable() {
+        let tmp = TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let installer = ModelInstaller {
+            dest_dir: &blocker.join("nested"),
+            dest_filename: "x.bin",
+            expected_sha256: None,
+        };
+        let err = installer
+            .install_from_url("http://127.0.0.1:1/never")
+            .unwrap_err();
+        assert_eq!(err.code(), &E1001_INSTALLED_SCHEMA_UNREADABLE);
+    }
+
+    #[test]
+    fn install_from_url_resume_mismatch_clears_partial() {
+        let tmp = TempDir::new().unwrap();
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some("deadbeef"),
+        };
+        let partial = partial_path(&tmp.path().join("remote.bin"));
+        std::fs::write(&partial, b"he").unwrap();
+
+        let url = spawn_range_server(b"hello".to_vec(), RangeMode::Honor);
+        let err = installer.install_from_url(&url).unwrap_err();
+        assert_eq!(err.code(), &E1001_INSTALLED_SCHEMA_UNREADABLE);
+        assert!(format!("{err}").contains("mismatch"));
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn content_range_starts_at_parses_well_formed_header() {
+        // Construct via a faux loopback that always returns the header we want.
+        // Easier: round-trip through `parse_range_start` for symmetry, plus
+        // direct exercise of the predicate via a tiny live request.
+        let body = b"hello world".to_vec();
+        let url = spawn_range_server(body, RangeMode::Honor);
+        let resp = ureq::get(&url)
+            .set("Range", "bytes=3-")
+            .call()
+            .expect("range server replies");
+        assert_eq!(resp.status(), 206);
+        assert!(content_range_starts_at(&resp, 3));
+        assert!(!content_range_starts_at(&resp, 0));
+    }
+
+    #[test]
+    fn content_range_starts_at_rejects_missing_header() {
+        let url = spawn_range_server(b"hello".to_vec(), RangeMode::Ignore);
+        let resp = ureq::get(&url).call().expect("plain 200");
+        assert!(!content_range_starts_at(&resp, 0));
     }
 
     #[test]
