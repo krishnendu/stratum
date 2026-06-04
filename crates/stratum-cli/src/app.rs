@@ -9,9 +9,9 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use stratum_runtime::{
     CancelToken, EchoProvider, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml,
-    ModelInstaller, Paths, Tier,
+    MemoryGate, ModelInstaller, Paths, Tier, DEFAULT_MARGIN_MIB,
 };
-use stratum_types::{Block, ErrorCode, ModelId};
+use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::OffsetDateTime;
 
 /// Stratum CLI.
@@ -51,6 +51,32 @@ enum Command {
     /// Manage on-disk model files.
     #[command(subcommand)]
     Models(ModelsCommand),
+    /// Probe RAM and decide whether a synthetic `MemEstimate` would load.
+    MemCheck(MemCheckArgs),
+}
+
+/// Arguments for `stratum mem-check`. The values describe the model that
+/// would be loaded; the gate compares them against the live `HardwareProbe`.
+#[derive(Debug, Args)]
+struct MemCheckArgs {
+    /// Resident set of the weights, in mebibytes.
+    #[arg(long)]
+    weight_rss: u32,
+    /// KV cache bytes per token.
+    #[arg(long)]
+    kv_per_token: u32,
+    /// Planned context length, in tokens.
+    #[arg(long)]
+    context: u32,
+    /// Optional multimodal projector overhead, in mebibytes.
+    #[arg(long, default_value_t = 0)]
+    mmproj: u32,
+    /// Optional VRAM cost when fully GPU-offloaded, in mebibytes.
+    #[arg(long, default_value_t = 0)]
+    vram: u32,
+    /// Override the safety margin, in mebibytes.
+    #[arg(long, default_value_t = DEFAULT_MARGIN_MIB)]
+    margin: u32,
 }
 
 /// Subcommands under `stratum models`.
@@ -133,6 +159,7 @@ where
         Some(Command::Models(ModelsCommand::Add(add_args))) => {
             models_add(cli.json, &paths, &add_args, out, err)
         }
+        Some(Command::MemCheck(mem_args)) => mem_check(cli.json, &mem_args, out, err),
     }
 }
 
@@ -272,6 +299,106 @@ fn default_filename_for(args: &AddArgs) -> String {
         }
     }
     "model.bin".to_string()
+}
+
+#[derive(Debug, Serialize)]
+struct MemCheckOk {
+    status: &'static str,
+    free_mib: u32,
+    needed_mib: u32,
+    margin_mib: u32,
+    leftover_mib: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct MemCheckErr {
+    status: &'static str,
+    code: ErrorCode,
+    message: String,
+    free_mib: u32,
+    needed_mib: u32,
+    margin_mib: u32,
+}
+
+fn mem_check(
+    json: bool,
+    args: &MemCheckArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let probe = HardwareProbe::run();
+    let estimate = MemEstimate {
+        weight_rss_mib: args.weight_rss,
+        kv_per_token_bytes: args.kv_per_token,
+        mmproj_mib: args.mmproj,
+        vram_mib: args.vram,
+    };
+    let gate = MemoryGate::new(args.margin);
+    let needed_mib = estimate.hot_ram_mib(args.context);
+    let free_mib = probe.ram_available_mib;
+
+    match gate.check(&probe, &estimate, args.context) {
+        Ok(()) => {
+            let leftover = free_mib.saturating_sub(needed_mib);
+            if json {
+                let payload = MemCheckOk {
+                    status: "ok",
+                    free_mib,
+                    needed_mib,
+                    margin_mib: args.margin,
+                    leftover_mib: leftover,
+                };
+                #[allow(
+                    clippy::expect_used,
+                    reason = "MemCheckOk serialization is infallible (primitives only)"
+                )]
+                let rendered = serde_json::to_string_pretty(&payload)
+                    .expect("MemCheckOk serialization is infallible");
+                if writeln!(out, "{rendered}").is_err() {
+                    return ExitCode::from(74);
+                }
+            } else {
+                let leftover_gb = format_gb_one_decimal(leftover);
+                if writeln!(out, "ok: would leave {leftover_gb} GB free").is_err() {
+                    return ExitCode::from(74);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(diag) => {
+            if json {
+                let payload = MemCheckErr {
+                    status: "refused",
+                    code: diag.code().clone(),
+                    message: diag.message.clone(),
+                    free_mib,
+                    needed_mib,
+                    margin_mib: args.margin,
+                };
+                #[allow(
+                    clippy::expect_used,
+                    reason = "MemCheckErr serialization is infallible (primitives only)"
+                )]
+                let rendered = serde_json::to_string_pretty(&payload)
+                    .expect("MemCheckErr serialization is infallible");
+                if writeln!(err, "{rendered}").is_err() {
+                    return ExitCode::from(74);
+                }
+            } else if writeln!(err, "{diag}").is_err() {
+                return ExitCode::from(74);
+            }
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Mebibytes → base-10 GB with one decimal, matching the gate's renderer.
+fn format_gb_one_decimal(mib: u32) -> String {
+    let scaled = u64::from(mib) * 1_048_576;
+    let gb_x10 = (scaled + 50_000_000) / 100_000_000;
+    let whole = gb_x10 / 10;
+    let frac = gb_x10 % 10;
+    format!("{whole}.{frac}")
 }
 
 fn chat_command(paths: &Paths, err: &mut dyn Write) -> ExitCode {
@@ -964,6 +1091,208 @@ mod tests {
         assert!(s.contains("(cancelled: STRAT-E4002)"));
         assert!(s.contains("(tool_call: fs.read)"));
         assert!(s.contains("(tool_result: t1)"));
+    }
+
+    /// `stratum mem-check` with a tiny synthetic model should always pass
+    /// because the host has plenty of headroom.
+    #[test]
+    fn mem_check_ok_prose_path() {
+        let tmp = TempDir::new().unwrap();
+        let (code, out, err) = drive_under(
+            &[
+                "mem-check",
+                "--weight-rss",
+                "1",
+                "--kv-per-token",
+                "0",
+                "--context",
+                "0",
+                "--margin",
+                "0",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(out.starts_with("ok: would leave "), "out was: {out}");
+        assert!(out.contains(" GB free"));
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn mem_check_ok_json_path() {
+        let tmp = TempDir::new().unwrap();
+        let (code, out, _err) = drive_under(
+            &[
+                "--json",
+                "mem-check",
+                "--weight-rss",
+                "2",
+                "--kv-per-token",
+                "4",
+                "--context",
+                "8",
+                "--mmproj",
+                "1",
+                "--vram",
+                "0",
+                "--margin",
+                "0",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["margin_mib"], 0);
+        assert!(v["free_mib"].as_u64().unwrap_or(0) > 0);
+        assert!(v["leftover_mib"].as_u64().is_some());
+    }
+
+    /// `stratum mem-check` with a huge weight RSS must trigger the gate
+    /// regardless of host. Prose path: exit 1, error on stderr.
+    #[test]
+    fn mem_check_refused_prose_path() {
+        let tmp = TempDir::new().unwrap();
+        let (code, out, err) = drive_under(
+            &[
+                "mem-check",
+                "--weight-rss",
+                "4000000",
+                "--kv-per-token",
+                "0",
+                "--context",
+                "0",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(out.is_empty(), "out was: {out}");
+        assert!(err.contains("STRAT-E3007"), "err was: {err}");
+        assert!(err.contains("free "), "err was: {err}");
+        assert!(err.contains(" GB"), "err was: {err}");
+    }
+
+    #[test]
+    fn mem_check_refused_json_path() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "--json",
+                "mem-check",
+                "--weight-rss",
+                "4000000",
+                "--kv-per-token",
+                "0",
+                "--context",
+                "0",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        let v: serde_json::Value = serde_json::from_str(err.trim()).unwrap();
+        assert_eq!(v["status"], "refused");
+        assert_eq!(v["code"], "STRAT-E3007");
+        assert!(v["message"].as_str().unwrap().contains("GB"));
+        assert!(v["needed_mib"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn mem_check_prose_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let code = drive_with_failing_out(
+            &[
+                "mem-check",
+                "--weight-rss",
+                "1",
+                "--kv-per-token",
+                "0",
+                "--context",
+                "0",
+                "--margin",
+                "0",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn mem_check_json_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let code = drive_with_failing_out(
+            &[
+                "--json",
+                "mem-check",
+                "--weight-rss",
+                "1",
+                "--kv-per-token",
+                "0",
+                "--context",
+                "0",
+                "--margin",
+                "0",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    /// Refusal prose path is written to stderr, so a failing stdout writer is
+    /// fine — we instead drive a failing stderr.
+    #[test]
+    fn mem_check_refused_prose_stderr_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let mut out = Vec::new();
+        let mut fail = FailingWriter;
+        let mut argv: Vec<OsString> = vec![
+            OsString::from("--storage-root"),
+            OsString::from(tmp.path().as_os_str()),
+        ];
+        for s in [
+            "mem-check",
+            "--weight-rss",
+            "4000000",
+            "--kv-per-token",
+            "0",
+            "--context",
+            "0",
+        ] {
+            argv.push(OsString::from(s));
+        }
+        let code = run_with(argv, &mut out, &mut fail, Paths::resolve);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn mem_check_refused_json_stderr_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let mut out = Vec::new();
+        let mut fail = FailingWriter;
+        let mut argv: Vec<OsString> = vec![
+            OsString::from("--storage-root"),
+            OsString::from(tmp.path().as_os_str()),
+        ];
+        for s in [
+            "--json",
+            "mem-check",
+            "--weight-rss",
+            "4000000",
+            "--kv-per-token",
+            "0",
+            "--context",
+            "0",
+        ] {
+            argv.push(OsString::from(s));
+        }
+        let code = run_with(argv, &mut out, &mut fail, Paths::resolve);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn format_gb_one_decimal_matches_known_values() {
+        assert_eq!(format_gb_one_decimal(0), "0.0");
+        assert_eq!(format_gb_one_decimal(1024), "1.1");
+        assert_eq!(format_gb_one_decimal(400), "0.4");
     }
 
     #[cfg(unix)]
