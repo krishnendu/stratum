@@ -67,6 +67,8 @@ pub mod probe;
 /// re-tokenizing the static prefix on every turn. See
 /// `plan/13-prompt-cache.md`.
 pub mod prompt_cache;
+/// Structured prompt template + composition layer.
+pub mod prompt_template;
 /// Embedded caveman-rewriter and polisher system prompts.
 pub mod prompts;
 /// Provider abstractions and concrete `EchoProvider` for end-to-end loop tests.
@@ -167,6 +169,11 @@ pub use probe::{GpuBackend, HardwareProbe};
 pub use prompt_cache::{
     fingerprint_inputs, PromptCache, PromptCacheEntry, PromptCacheError, PromptCacheKey,
     PromptHash, PromptHashError,
+};
+pub use prompt_template::{
+    render as render_prompt_template, render_with_budget as render_prompt_template_with_budget,
+    truncate_tool_results, PromptBudget, PromptContext, PromptRenderError, PromptTemplate,
+    RenderedPrompt, TemplateId, TemplateIdError, ToolResultSnippet,
 };
 pub use prompts::{system_prompt, PromptRole};
 pub use provider::{EchoProvider, GenerateRequest, Provider};
