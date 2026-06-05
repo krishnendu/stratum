@@ -20,6 +20,8 @@ pub mod download;
 /// Refuses model loads when free RAM minus the would-be hot footprint falls
 /// below the configured margin.
 pub mod gate;
+/// Prompt-injection defense primitives.
+pub mod injection;
 /// First-run install record and atomic TOML writer.
 pub mod install;
 /// `tracing` subscriber initialization with env-filter + file output.
@@ -51,6 +53,7 @@ pub use agents::{AgentBudget, AgentDef, AgentLoader};
 pub use cancel::CancelToken;
 pub use download::{InstallReport, ModelInstaller};
 pub use gate::{MemoryGate, DEFAULT_MARGIN_MIB};
+pub use injection::{fence, is_suspicious, suspicion_score, FenceSource, SUSPICION_THRESHOLD};
 pub use install::{InstalledToml, TierInputs};
 pub use paths::Paths;
 pub use probe::{GpuBackend, HardwareProbe};
