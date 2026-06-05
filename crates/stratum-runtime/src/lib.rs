@@ -55,6 +55,8 @@ pub mod probe;
 pub mod prompts;
 /// Provider abstractions and concrete `EchoProvider` for end-to-end loop tests.
 pub mod provider;
+/// Provider warm-up / LRU cache + RAM-budget eviction.
+pub mod provider_cache;
 /// RAG index data shape and in-memory index (Phase 1 scaffold for Phase 4+).
 pub mod rag;
 /// Token-bucket rate limiter primitives (scaffold for `stratum serve`).
@@ -124,6 +126,7 @@ pub use paths::Paths;
 pub use probe::{GpuBackend, HardwareProbe};
 pub use prompts::{system_prompt, PromptRole};
 pub use provider::{EchoProvider, GenerateRequest, Provider};
+pub use provider_cache::{CacheError, CacheSlot, ProviderCache, ProviderKey};
 pub use rag::{chunk_document, Chunk, ChunkPlan, ChunkSpan, DocumentId, RagDocument, RagIndex};
 pub use rate_limit::{
     Clock, KeyedRateLimiter, ManualClock, RateLimitError, SystemClock, TokenBucket,
