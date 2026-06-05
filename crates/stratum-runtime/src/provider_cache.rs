@@ -304,7 +304,11 @@ impl ProviderCache {
         let lru = lock(&self.lru);
         let out: Vec<_> = lru
             .iter()
-            .filter_map(|key| entries.get(key).map(|slot| (key.clone(), slot.footprint_mib)))
+            .filter_map(|key| {
+                entries
+                    .get(key)
+                    .map(|slot| (key.clone(), slot.footprint_mib))
+            })
             .collect();
         drop(lru);
         drop(entries);

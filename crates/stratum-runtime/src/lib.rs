@@ -17,6 +17,8 @@ pub mod budget;
 pub mod cancel;
 /// Hierarchical cancellation cascade with reasons + RAII deadlines.
 pub mod cancel_cascade;
+/// Per-turn conversation state machine driving the agentic loop.
+pub mod conversation;
 /// Opt-in crash-report bundle + log redaction (Phase 4 scaffold).
 pub mod crash_report;
 /// Model-file install: SHA-256 verification, atomic copy with `.partial` swap.
@@ -88,6 +90,10 @@ pub use agents::{AgentBudget, AgentDef, AgentLoader};
 pub use budget::{BudgetCheck, BudgetTracker};
 pub use cancel::CancelToken;
 pub use cancel_cascade::{CancelError, CancelReason, CascadeToken, DeadlineGuard};
+pub use conversation::{
+    next_state, validate_history, TurnDriver, TurnEvent, TurnFsmError, TurnOutcome, TurnState,
+    TurnTransition,
+};
 pub use crash_report::{
     build_bundle, load_bundle, redact_log_lines, redact_path_user, write_bundle, CrashBundle,
     CrashBundleConfig, CrashBundleError, CrashEnv, CRASH_BUNDLE_SCHEMA_VERSION,
