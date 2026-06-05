@@ -1,0 +1,134 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stratum.dev/schemas/doctor.v1.json",
+  "title": "Stratum doctor report (v1)",
+  "description": "Stable JSON shape emitted by `stratum doctor --json`. Additive changes only within v1 per plan/29-error-taxonomy-and-logging.md §7-8.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "stratum_version",
+    "tier",
+    "probe",
+    "gpu_accel",
+    "sandbox",
+    "installed",
+    "issues"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Version of this doctor schema; bumped on breaking change."
+    },
+    "stratum_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Build version of the `stratum` binary (CARGO_PKG_VERSION)."
+    },
+    "tier": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "Composite hardware tier classification."
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "ram_total_mib",
+        "ram_available_mib",
+        "cpu_arch",
+        "cpu_features",
+        "cpu_cores",
+        "gpu",
+        "os"
+      ],
+      "properties": {
+        "ram_total_mib": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total physical RAM, mebibytes."
+        },
+        "ram_available_mib": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Currently-available RAM, mebibytes."
+        },
+        "cpu_arch": {
+          "type": "string",
+          "minLength": 1,
+          "description": "CPU architecture identifier (e.g. aarch64, x86_64, unknown)."
+        },
+        "cpu_features": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Detected SIMD feature flags, sorted."
+        },
+        "cpu_cores": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Logical CPU core count."
+        },
+        "gpu": {
+          "type": "string",
+          "enum": ["metal", "cuda", "vulkan", "cpu"],
+          "description": "Selected GPU backend (probe-level)."
+        },
+        "os": {
+          "type": "string",
+          "minLength": 1,
+          "description": "OS identifier (macos, linux, windows, unknown)."
+        }
+      }
+    },
+    "gpu_accel": {
+      "type": "string",
+      "enum": ["metal", "cuda", "vulkan", "cpu"],
+      "description": "GPU acceleration backend chosen at install time."
+    },
+    "sandbox": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["available"],
+      "properties": {
+        "available": {
+          "type": "array",
+          "description": "Sandbox backends the host can drive, strongest first.",
+          "items": {
+            "type": "string",
+            "enum": ["bwrap", "sandbox_exec", "windows_job", "passthrough"],
+            "description": "Snake-cased serde encoding of the SandboxBackend enum. Display-form labels (bwrap, sandbox-exec, windows-job, passthrough) are surfaced in prose output, not in JSON."
+          }
+        }
+      }
+    },
+    "installed": {
+      "type": "boolean",
+      "description": "True when `installed.toml` exists in the resolved config dir."
+    },
+    "issues": {
+      "type": "array",
+      "description": "Zero or more diagnostics surfaced by the probe.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["code", "level", "message"],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^STRAT-E\\d{4}$",
+            "description": "Stable error code per plan/29-error-taxonomy-and-logging.md §1."
+          },
+          "level": {
+            "type": "string",
+            "enum": ["info", "warn", "error"]
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

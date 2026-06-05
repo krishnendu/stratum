@@ -57,6 +57,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features --no-fail-fast
 
+  doctor-schema-check:
+    name: doctor schema invariant
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --test doctor_schema
+        run: cargo test --package stratum-cli --test doctor_schema -- --include-ignored
+
   coverage:
     name: 100% line coverage (Linux)
     runs-on: ubuntu-latest

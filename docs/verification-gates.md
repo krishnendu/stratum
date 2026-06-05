@@ -18,7 +18,7 @@ Stratum's CI enforces 12 per-PR gates. Each is also documented in the project's 
 | **G8** | Conventional commit + DCO sign-off | Subject matches `^(feat\|fix\|chore\|docs\|refactor\|test\|perf\|build\|ci\|revert)(\(.+\))?: `, body ends with `Signed-off-by:`. **No AI co-author trailers.** |
 | **G9** | Security review when applicable | Tool / sandbox / secret / network / FFI / `unsafe` surfaces → reviewer ticks the checklist. |
 | **G10** | TUI snapshot tests on UI changes | `ratatui::backend::TestBackend` snapshots for any rendering path. |
-| **G11** | Schema migration tested | On-disk schema bumps ship with a migration step + an N-1 fixture in CI. |
+| **G11** | Schema migration tested | On-disk schema bumps ship with a migration step + an N-1 fixture in CI. The first such target is [`docs/schemas/doctor.v1.json`](schemas/doctor.v1.json), validated against the live `stratum doctor --json` output by the `doctor-schema-check` CI job (see [`docs/schemas/README.md`](schemas/README.md)). |
 | **G12** | Network / telemetry impact disclosed | If a change introduces an outbound socket the PR description names the endpoint and the flag that gates it. |
 
 ## What CI blocks
