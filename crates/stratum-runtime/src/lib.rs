@@ -34,6 +34,8 @@ pub mod prompts;
 pub mod provider;
 /// Provider registry + role-to-provider routing table.
 pub mod registry;
+/// Sandbox backend detection.
+pub mod sandbox;
 /// Composite tier classifier (low / medium / high).
 pub mod tier;
 
@@ -46,4 +48,5 @@ pub use probe::{GpuBackend, HardwareProbe};
 pub use prompts::{system_prompt, PromptRole};
 pub use provider::{EchoProvider, GenerateRequest, Provider};
 pub use registry::Registry;
+pub use sandbox::{SandboxBackend, SandboxReport};
 pub use tier::Tier;

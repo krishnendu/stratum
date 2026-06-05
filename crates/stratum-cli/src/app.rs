@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use stratum_runtime::{
     CancelToken, EchoProvider, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml,
-    MemoryGate, ModelInstaller, Paths, Provider, Tier, DEFAULT_MARGIN_MIB,
+    MemoryGate, ModelInstaller, Paths, Provider, SandboxReport, Tier, DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::OffsetDateTime;
@@ -446,6 +446,7 @@ struct DoctorReport<'a> {
     tier: Tier,
     probe: &'a HardwareProbe,
     gpu_accel: GpuBackend,
+    sandbox: &'a SandboxReport,
     installed: bool,
     issues: Vec<DoctorIssue>,
 }
@@ -460,6 +461,7 @@ struct DoctorIssue {
 fn doctor(json: bool, paths: &Paths, out: &mut dyn Write, _err: &mut dyn Write) -> ExitCode {
     let probe = HardwareProbe::run();
     let tier = Tier::classify(&probe);
+    let sandbox = SandboxReport::run();
     let installed = paths.installed_toml().exists();
     let mut issues = Vec::new();
     if !installed {
@@ -475,6 +477,7 @@ fn doctor(json: bool, paths: &Paths, out: &mut dyn Write, _err: &mut dyn Write) 
         tier,
         probe: &probe,
         gpu_accel: probe.gpu,
+        sandbox: &sandbox,
         installed,
         issues,
     };
@@ -491,8 +494,14 @@ fn doctor(json: bool, paths: &Paths, out: &mut dyn Write, _err: &mut dyn Write) 
         }
     } else if writeln!(
         out,
-        "stratum {} · tier={} · gpu={} · ram={} MiB · cores={} · installed={}",
-        report.stratum_version, tier, probe.gpu, probe.ram_total_mib, probe.cpu_cores, installed
+        "stratum {} · tier={} · gpu={} · sandbox={} · ram={} MiB · cores={} · installed={}",
+        report.stratum_version,
+        tier,
+        probe.gpu,
+        sandbox.preferred(),
+        probe.ram_total_mib,
+        probe.cpu_cores,
+        installed
     )
     .is_err()
     {
