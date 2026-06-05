@@ -53,6 +53,8 @@ pub mod observability;
 pub mod panic;
 /// XDG-aware filesystem path resolution.
 pub mod paths;
+/// Interactive permission-prompt data shape + remembered-decision store.
+pub mod permission_prompt;
 /// Hardware probe: RAM, CPU features, GPU backend, OS.
 pub mod probe;
 /// Prefix prompt cache + reuse-key fingerprinting.
@@ -143,6 +145,11 @@ pub use observability::{
     format_tokens_per_second, RoleStep, RoleTimer, TurnId, TurnIdGen, TurnMetrics, TurnRecorder,
 };
 pub use paths::Paths;
+pub use permission_prompt::{
+    evaluate as evaluate_permission, request_digest, AllowAllResponder, DenyAllResponder,
+    PendingPrompt, PermissionDecision, PermissionRequest, PermissionStore, PromptId, PromptIdGen,
+    PromptResponder, ScriptedResponder,
+};
 pub use probe::{GpuBackend, HardwareProbe};
 pub use prompt_cache::{
     fingerprint_inputs, PromptCache, PromptCacheEntry, PromptCacheError, PromptCacheKey,
