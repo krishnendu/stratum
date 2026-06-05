@@ -15,6 +15,8 @@ pub mod agents;
 pub mod budget;
 /// Cooperative cancellation token.
 pub mod cancel;
+/// Hierarchical cancellation cascade with reasons + RAII deadlines.
+pub mod cancel_cascade;
 /// Model-file install: SHA-256 verification, atomic copy with `.partial` swap.
 pub mod download;
 /// Memory-safety gate.
@@ -62,6 +64,7 @@ pub mod workspace;
 pub use agents::{AgentBudget, AgentDef, AgentLoader};
 pub use budget::{BudgetCheck, BudgetTracker};
 pub use cancel::CancelToken;
+pub use cancel_cascade::{CancelError, CancelReason, CascadeToken, DeadlineGuard};
 pub use download::{InstallReport, ModelInstaller};
 pub use gate::{LoadedModel, MemoryGate, DEFAULT_MARGIN_MIB};
 pub use injection::{fence, is_suspicious, suspicion_score, FenceSource, SUSPICION_THRESHOLD};
