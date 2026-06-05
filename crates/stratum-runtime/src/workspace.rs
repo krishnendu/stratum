@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use stratum_types::error::codes::E1001_INSTALLED_SCHEMA_UNREADABLE;
 use stratum_types::{StratumError, StratumResult};
 
+use crate::tools::glob_match;
+
 /// Filename of the per-project marker.
 pub const PROJECT_FILE: &str = "stratum.toml";
 
@@ -130,6 +132,122 @@ impl Workspace {
                 || self.root.display().to_string(),
                 |name| format!("{name} ({})", self.root.display()),
             )
+    }
+}
+
+/// One parsed line of a `.stratumignore` file.
+///
+/// Stratum's matcher is a gitignore-shaped subset: blank lines and `#`
+/// comments are skipped, `!`-prefixed lines re-include a previously
+/// matched path, trailing `/` marks a directory-only rule. The pattern
+/// itself is matched by the workspace's tiny glob (`*`, `**`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoreRule {
+    /// Glob pattern after stripping `!` and trailing `/`.
+    pub pattern: String,
+    /// Re-include after a previous rule excluded the path.
+    pub negation: bool,
+    /// Apply only to directory-typed paths.
+    pub dir_only: bool,
+}
+
+impl IgnoreRule {
+    /// Parse one line into a rule. Returns `None` for blank lines and
+    /// comment lines.
+    #[must_use]
+    pub fn parse(line: &str) -> Option<Self> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return None;
+        }
+        let (negation, rest) = trimmed
+            .strip_prefix('!')
+            .map_or((false, trimmed), |s| (true, s));
+        let (dir_only, pattern) = rest.strip_suffix('/').map_or((false, rest), |s| (true, s));
+        if pattern.is_empty() {
+            return None;
+        }
+        Some(Self {
+            pattern: pattern.to_string(),
+            negation,
+            dir_only,
+        })
+    }
+
+    /// Does this rule's pattern match `relative_path`? When the rule is
+    /// directory-only, the caller must pass `is_dir = true` for it to
+    /// match.
+    #[must_use]
+    pub fn matches(&self, relative_path: &str, is_dir: bool) -> bool {
+        if self.dir_only && !is_dir {
+            return false;
+        }
+        glob_match(&self.pattern, relative_path)
+    }
+}
+
+/// Parsed `.stratumignore` file: an ordered list of rules. The matcher
+/// walks rules in order; last match wins (gitignore semantics).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StratumIgnore {
+    rules: Vec<IgnoreRule>,
+}
+
+impl StratumIgnore {
+    /// Parse the raw text of a `.stratumignore` file.
+    #[must_use]
+    pub fn parse(text: &str) -> Self {
+        let rules = text.lines().filter_map(IgnoreRule::parse).collect();
+        Self { rules }
+    }
+
+    /// Load `.stratumignore` from `path`. A missing file returns an
+    /// empty ignore set.
+    ///
+    /// # Errors
+    /// Returns [`E1001_INSTALLED_SCHEMA_UNREADABLE`] on io failures
+    /// other than `NotFound`.
+    pub fn load(path: &Path) -> StratumResult<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Self::parse(&text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(StratumError::new(
+                E1001_INSTALLED_SCHEMA_UNREADABLE,
+                format!("read {}", path.display()),
+            )
+            .with_cause(e)),
+        }
+    }
+
+    /// Number of rules in the file (blank + comment lines excluded).
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// No rules at all (also true when the file is empty or absent).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    /// Iterate the parsed rules in declaration order.
+    pub fn rules(&self) -> impl Iterator<Item = &IgnoreRule> {
+        self.rules.iter()
+    }
+
+    /// Is `relative_path` ignored under these rules? `is_dir` selects
+    /// directory-only rules. The walk applies every matching rule in
+    /// order; the last match wins.
+    #[must_use]
+    pub fn is_ignored(&self, relative_path: &str, is_dir: bool) -> bool {
+        let mut ignored = false;
+        for rule in &self.rules {
+            if rule.matches(relative_path, is_dir) {
+                ignored = !rule.negation;
+            }
+        }
+        ignored
     }
 }
 
@@ -290,5 +408,136 @@ mod tests {
         let cfg = WorkspaceConfig::default();
         assert!(cfg.name.is_none());
         assert_eq!(cfg.schema_version, 0);
+    }
+
+    #[test]
+    fn ignore_rule_parses_blank_and_comments_as_none() {
+        assert!(IgnoreRule::parse("").is_none());
+        assert!(IgnoreRule::parse("   ").is_none());
+        assert!(IgnoreRule::parse("# a comment").is_none());
+        // Lone `!` and lone `/` collapse to empty pattern → None.
+        assert!(IgnoreRule::parse("!").is_none());
+        assert!(IgnoreRule::parse("/").is_none());
+    }
+
+    #[test]
+    fn ignore_rule_parses_simple_pattern() {
+        let rule = IgnoreRule::parse("target").unwrap();
+        assert_eq!(rule.pattern, "target");
+        assert!(!rule.negation);
+        assert!(!rule.dir_only);
+    }
+
+    #[test]
+    fn ignore_rule_parses_negation() {
+        let rule = IgnoreRule::parse("!keep.txt").unwrap();
+        assert!(rule.negation);
+        assert_eq!(rule.pattern, "keep.txt");
+    }
+
+    #[test]
+    fn ignore_rule_parses_dir_only() {
+        let rule = IgnoreRule::parse("node_modules/").unwrap();
+        assert!(rule.dir_only);
+        assert_eq!(rule.pattern, "node_modules");
+    }
+
+    #[test]
+    fn ignore_rule_matches_file_only_when_not_dir_only() {
+        let rule = IgnoreRule::parse("target").unwrap();
+        assert!(rule.matches("target", false));
+        assert!(rule.matches("target", true));
+    }
+
+    #[test]
+    fn ignore_rule_dir_only_skips_file() {
+        let rule = IgnoreRule::parse("node_modules/").unwrap();
+        assert!(rule.matches("node_modules", true));
+        assert!(!rule.matches("node_modules", false));
+    }
+
+    #[test]
+    fn stratumignore_empty_when_text_is_blank() {
+        let ig = StratumIgnore::parse("");
+        assert!(ig.is_empty());
+        assert_eq!(ig.len(), 0);
+    }
+
+    #[test]
+    fn stratumignore_parses_multiple_rules() {
+        let text = r"
+# comment
+target
+*.log
+!keep.log
+node_modules/
+";
+        let ig = StratumIgnore::parse(text);
+        assert_eq!(ig.len(), 4);
+        let patterns: Vec<&str> = ig.rules().map(|r| r.pattern.as_str()).collect();
+        assert_eq!(
+            patterns,
+            vec!["target", "*.log", "keep.log", "node_modules"]
+        );
+    }
+
+    #[test]
+    fn stratumignore_negation_re_includes() {
+        let ig = StratumIgnore::parse("*.log\n!keep.log\n");
+        assert!(ig.is_ignored("foo.log", false));
+        assert!(!ig.is_ignored("keep.log", false));
+    }
+
+    #[test]
+    fn stratumignore_last_match_wins() {
+        // First rule includes, second excludes, third re-includes.
+        let ig = StratumIgnore::parse("foo\n!foo\nfoo\n");
+        assert!(ig.is_ignored("foo", false));
+    }
+
+    #[test]
+    fn stratumignore_dir_only_rule_does_not_match_file() {
+        let ig = StratumIgnore::parse("build/\n");
+        assert!(ig.is_ignored("build", true));
+        assert!(!ig.is_ignored("build", false));
+    }
+
+    #[test]
+    fn stratumignore_glob_pattern_matches() {
+        let ig = StratumIgnore::parse("**.bak\n");
+        assert!(ig.is_ignored("notes.bak", false));
+        assert!(ig.is_ignored("dir/a.bak", false));
+        assert!(!ig.is_ignored("notes.txt", false));
+    }
+
+    #[test]
+    fn stratumignore_load_returns_empty_for_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join(IGNORE_FILE);
+        let ig = StratumIgnore::load(&missing).unwrap();
+        assert!(ig.is_empty());
+    }
+
+    #[test]
+    fn stratumignore_load_parses_real_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(IGNORE_FILE);
+        std::fs::write(&path, "target\n!keep\n").unwrap();
+        let ig = StratumIgnore::load(&path).unwrap();
+        assert_eq!(ig.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stratumignore_load_propagates_io_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(IGNORE_FILE);
+        std::fs::write(&path, "target\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = StratumIgnore::load(&path);
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), &E1001_INSTALLED_SCHEMA_UNREADABLE);
     }
 }
