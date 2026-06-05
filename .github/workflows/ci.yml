@@ -91,11 +91,26 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: cargo llvm-cov
+      # `cargo llvm-cov` has historically silently skipped
+      # `--fail-under-lines` enforcement when combined with `--lcov
+      # --output-path` in some versions. To guarantee G2.1 is a hard gate, we
+      # split coverage into two invocations: the first is the gate (no LCOV
+      # output), the second is the artifact emitter (no threshold). See
+      # `docs/verification-gates.md` G2.1.
+      - name: cargo llvm-cov (threshold gate)
+        shell: bash
         # Excludes the `provider-llama-cpp` feature; see clippy job comment.
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 98
+        run: |
+          set -euxo pipefail
+          cargo llvm-cov --workspace --fail-under-lines 98
+      - name: cargo llvm-cov (lcov artifact)
+        shell: bash
+        # Excludes the `provider-llama-cpp` feature; see clippy job comment.
+        run: |
+          set -euxo pipefail
+          cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: Upload coverage report
-        if: always()
+        if: hashFiles('lcov.info') != ''
         uses: actions/upload-artifact@v7
         with:
           name: lcov
