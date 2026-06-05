@@ -25,6 +25,8 @@ pub mod crash_report;
 pub mod download;
 /// Embedding backend trait + deterministic `HashEmbedder` stub.
 pub mod embedder;
+/// Append-only structured event log for tool calls, permissions, hand-offs.
+pub mod event_log;
 /// Memory-safety gate.
 ///
 /// Refuses model loads when free RAM minus the would-be hot footprint falls
@@ -116,6 +118,10 @@ pub use download::{InstallReport, ModelInstaller};
 pub use embedder::{
     cosine_similarity, top_k, EmbedError, Embedder, EmbeddingDim, EmbeddingVector, HashEmbedder,
     InMemoryVectorStore,
+};
+pub use event_log::{
+    Event, EventClock, EventEmitter, EventLogError, EventRecord, EventSink, FixedEventClock,
+    JsonlEventSink, MemoryEventSink, SystemEventClock,
 };
 pub use gate::{LoadedModel, MemoryGate, DEFAULT_MARGIN_MIB};
 pub use i18n::{
