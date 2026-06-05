@@ -298,19 +298,36 @@ impl From<PlatformArg> for PlatformTag {
     }
 }
 
-/// Arguments for `stratum mem-check`. The values describe the model that
-/// would be loaded; the gate compares them against the live `HardwareProbe`.
+/// Arguments for `stratum mem-check`.
+///
+/// Three operating modes share the same subcommand:
+///
+/// * No flags → print the host's currently-available RAM and exit. This is
+///   the default operator surface.
+/// * `--requested <slug> --requested-mib <u64>` → consult
+///   [`MemoryGate::suggest_unloads`] against the resident set read from
+///   `<state_root>/loaded.json` (or `--loaded-file`) and print which slugs to
+///   evict. Both flags must be passed together; `--requested-mib` must be
+///   `> 0` (enforced via clap `value_parser`).
+/// * Legacy `--weight-rss/--kv-per-token/--context` → original
+///   synthetic-`MemEstimate` flow that runs the gate's full `check_with` and
+///   reports OK or refusal. `--loaded` lets the legacy mode also exercise the
+///   unload-hint path.
+///
+/// The three modes are dispatched in [`mem_check`] in the order above.
 #[derive(Debug, Args)]
 struct MemCheckArgs {
-    /// Resident set of the weights, in mebibytes.
+    /// Resident set of the weights, in mebibytes. Required for the legacy
+    /// `check_with`-driven mode; omit to use the available-RAM or
+    /// `--requested` modes.
     #[arg(long)]
-    weight_rss: u32,
-    /// KV cache bytes per token.
+    weight_rss: Option<u32>,
+    /// KV cache bytes per token. Required for the legacy mode.
     #[arg(long)]
-    kv_per_token: u32,
-    /// Planned context length, in tokens.
+    kv_per_token: Option<u32>,
+    /// Planned context length, in tokens. Required for the legacy mode.
     #[arg(long)]
-    context: u32,
+    context: Option<u32>,
     /// Optional multimodal projector overhead, in mebibytes.
     #[arg(long, default_value_t = 0)]
     mmproj: u32,
@@ -326,6 +343,25 @@ struct MemCheckArgs {
     /// to unload to free room. Pass the flag once per resident model.
     #[arg(long = "loaded", value_name = "SPEC")]
     loaded: Vec<String>,
+    /// Slug of a prospective model to load. Used together with
+    /// `--requested-mib` to drive [`MemoryGate::suggest_unloads`] against the
+    /// resident set read from `--loaded-file`.
+    #[arg(long, value_name = "SLUG", requires = "requested_mib")]
+    requested: Option<String>,
+    /// Estimated hot footprint, in mebibytes, of the prospective load. Must
+    /// be `> 0`. Used with `--requested`.
+    #[arg(
+        long,
+        value_name = "MIB",
+        requires = "requested",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    requested_mib: Option<u64>,
+    /// Path to the resident-set JSON file consumed in the `--requested` mode.
+    /// Defaults to `<state_root>/loaded.json`. A missing file is treated as
+    /// an empty resident set.
+    #[arg(long, value_name = "PATH")]
+    loaded_file: Option<PathBuf>,
 }
 
 /// Subcommands under `stratum models`.
@@ -581,7 +617,7 @@ where
         Some(Command::Models(ModelsCommand::InstallFile(inst_args))) => {
             models_install_file(cli.json, &paths, &inst_args, out, err)
         }
-        Some(Command::MemCheck(mem_args)) => mem_check(cli.json, &mem_args, out, err),
+        Some(Command::MemCheck(mem_args)) => mem_check(cli.json, &mem_args, &paths, out, err),
         Some(Command::SelfUpdate(su_args)) => self_update(cli.json, &su_args, out, err),
         Some(Command::Events(EventsCommand::Tail(tail_args))) => {
             events_tail(&paths, &tail_args, out, err)
@@ -966,6 +1002,30 @@ struct MemCheckErr {
     suggested_unloads: Vec<String>,
 }
 
+/// `--json` payload for the default (no-flags) and `--requested` modes.
+#[derive(Debug, Serialize)]
+struct MemCheckSuggestReport {
+    available_mib: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_mib: Option<u64>,
+    suggested_evictions: Vec<String>,
+}
+
+/// On-disk entry shape of `<state_root>/loaded.json`. The file is a JSON
+/// array of these objects; each row stands in for one resident model the
+/// gate may suggest evicting. `last_used_unix_secs` is read but not consumed
+/// by [`MemoryGate::suggest_unloads`] (it sorts by footprint); we still
+/// require the field so the on-disk schema matches the runtime's bookkeeping.
+#[derive(Debug, serde::Deserialize)]
+struct LoadedFileEntry {
+    slug: String,
+    footprint_mib: u64,
+    #[allow(dead_code, reason = "field is part of the persisted schema")]
+    last_used_unix_secs: u64,
+}
+
 /// Parse a single `--loaded model_id:weight_rss_mib:kv_per_token_bytes:context_tokens`
 /// spec into a [`LoadedModel`] plus the planned context length that will be
 /// charged to the candidate (we use the max across resident specs to be
@@ -1006,18 +1066,199 @@ fn parse_loaded_spec(spec: &str) -> Result<(LoadedModel, u32), String> {
 fn mem_check(
     json: bool,
     args: &MemCheckArgs,
+    paths: &Paths,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    // Mode selection. `--requested` and `--requested-mib` are bound together
+    // by clap (`requires`), so seeing one implies the other.
+    if let (Some(slug), Some(req_mib)) = (args.requested.as_deref(), args.requested_mib) {
+        return mem_check_suggest(
+            json,
+            slug,
+            req_mib,
+            args.loaded_file.as_deref(),
+            paths,
+            out,
+            err,
+        );
+    }
+    // Legacy mode requires all three of weight_rss / kv_per_token / context.
+    match (args.weight_rss, args.kv_per_token, args.context) {
+        (Some(w), Some(kv), Some(ctx)) => mem_check_legacy(json, args, w, kv, ctx, out, err),
+        (None, None, None) => mem_check_default(json, out, err),
+        _ => {
+            let _ = writeln!(
+                err,
+                "STRAT-E1001 --weight-rss, --kv-per-token, and --context must be passed together",
+            );
+            ExitCode::from(64)
+        }
+    }
+}
+
+/// "No flags" mode: just print the host's available RAM.
+fn mem_check_default(json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let probe = HardwareProbe::run();
+    let available_mib = probe.ram_available_mib;
+    if json {
+        let payload = MemCheckSuggestReport {
+            available_mib,
+            requested: None,
+            requested_mib: None,
+            suggested_evictions: Vec::new(),
+        };
+        #[allow(
+            clippy::expect_used,
+            reason = "MemCheckSuggestReport serialization is infallible (primitives only)"
+        )]
+        let rendered = serde_json::to_string_pretty(&payload)
+            .expect("MemCheckSuggestReport serialization is infallible");
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+    } else {
+        let gb = format_gb_one_decimal(available_mib);
+        if writeln!(out, "available: {gb} GB ({available_mib} MiB)").is_err() {
+            let _ = writeln!(err, "STRAT-E1001 stdout write failed");
+            return ExitCode::from(74);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `--requested` mode: consult `MemoryGate::suggest_unloads` against the
+/// resident-set file and print the recommended evictions.
+fn mem_check_suggest(
+    json: bool,
+    requested: &str,
+    requested_mib: u64,
+    loaded_file: Option<&Path>,
+    paths: &Paths,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let path = loaded_file.map_or_else(|| paths.state.join("loaded.json"), Path::to_path_buf);
+    let entries = match read_loaded_file(&path) {
+        Ok(v) => v,
+        Err(diag) => {
+            let _ = writeln!(err, "STRAT-E1001 {diag}");
+            return ExitCode::from(1);
+        }
+    };
+    let loaded: Vec<LoadedModel> = entries
+        .into_iter()
+        .map(|e| LoadedModel {
+            id: ModelId::from(e.slug.as_str()),
+            estimate: MemEstimate {
+                weight_rss_mib: u32::try_from(e.footprint_mib).unwrap_or(u32::MAX),
+                kv_per_token_bytes: 0,
+                mmproj_mib: 0,
+                vram_mib: 0,
+            },
+            role_hint: None,
+        })
+        .collect();
+
+    let probe = HardwareProbe::run();
+    let candidate = MemEstimate {
+        weight_rss_mib: u32::try_from(requested_mib).unwrap_or(u32::MAX),
+        kv_per_token_bytes: 0,
+        mmproj_mib: 0,
+        vram_mib: 0,
+    };
+    let gate = MemoryGate::new(DEFAULT_MARGIN_MIB);
+    let suggested: Vec<String> = gate
+        .suggest_unloads(&probe, &candidate, 0, &loaded)
+        .into_iter()
+        .map(|m| m.as_str().to_string())
+        .collect();
+    // suggest_unloads returns an empty Vec both when the load already fits
+    // AND when even unloading everything wouldn't free enough. Distinguish
+    // them by checking `would_fit` directly.
+    let fits = gate.would_fit(&probe, &candidate, 0);
+
+    if json {
+        let payload = MemCheckSuggestReport {
+            available_mib: probe.ram_available_mib,
+            requested: Some(requested.to_owned()),
+            requested_mib: Some(requested_mib),
+            suggested_evictions: suggested,
+        };
+        #[allow(
+            clippy::expect_used,
+            reason = "MemCheckSuggestReport serialization is infallible (primitives only)"
+        )]
+        let rendered = serde_json::to_string_pretty(&payload)
+            .expect("MemCheckSuggestReport serialization is infallible");
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+    } else {
+        let gb = format_gb_one_decimal(probe.ram_available_mib);
+        if writeln!(out, "available: {gb} GB ({} MiB)", probe.ram_available_mib,).is_err() {
+            return ExitCode::from(74);
+        }
+        if fits {
+            if writeln!(out, "fits without eviction").is_err() {
+                return ExitCode::from(74);
+            }
+        } else if suggested.is_empty() {
+            if writeln!(
+                out,
+                "to make room for {requested} ({requested_mib} MiB), evict: (no feasible subset)",
+            )
+            .is_err()
+            {
+                return ExitCode::from(74);
+            }
+        } else if writeln!(
+            out,
+            "to make room for {requested} ({requested_mib} MiB), evict: {}",
+            suggested.join(", "),
+        )
+        .is_err()
+        {
+            return ExitCode::from(74);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Read `<state_root>/loaded.json` (or the explicit override) into the
+/// strongly-typed entry list. A missing file returns an empty list; a
+/// malformed file returns a human-readable error string.
+fn read_loaded_file(path: &Path) -> Result<Vec<LoadedFileEntry>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => serde_json::from_str::<Vec<LoadedFileEntry>>(&body)
+            .map_err(|e| format!("loaded-file {} parse failed: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("loaded-file {} read failed: {e}", path.display())),
+    }
+}
+
+/// Legacy `check_with`-driven mode. Unchanged behaviour from the original
+/// implementation; the only structural difference is that the
+/// `weight_rss/kv_per_token/context` triple is now lifted out of the args
+/// struct so the caller can validate that all three were supplied.
+fn mem_check_legacy(
+    json: bool,
+    args: &MemCheckArgs,
+    weight_rss: u32,
+    kv_per_token: u32,
+    context: u32,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
     let probe = HardwareProbe::run();
     let estimate = MemEstimate {
-        weight_rss_mib: args.weight_rss,
-        kv_per_token_bytes: args.kv_per_token,
+        weight_rss_mib: weight_rss,
+        kv_per_token_bytes: kv_per_token,
         mmproj_mib: args.mmproj,
         vram_mib: args.vram,
     };
     let gate = MemoryGate::new(args.margin);
-    let needed_mib = estimate.hot_ram_mib(args.context);
+    let needed_mib = estimate.hot_ram_mib(context);
     let free_mib = probe.ram_available_mib;
 
     let mut loaded: Vec<LoadedModel> = Vec::with_capacity(args.loaded.len());
@@ -1031,7 +1272,7 @@ fn mem_check(
         }
     }
 
-    match gate.check_with(&probe, &estimate, args.context, &loaded) {
+    match gate.check_with(&probe, &estimate, context, &loaded) {
         Ok(()) => {
             let leftover = free_mib.saturating_sub(needed_mib);
             if json {
@@ -1061,7 +1302,7 @@ fn mem_check(
         }
         Err(diag) => {
             let suggested: Vec<String> = gate
-                .suggest_unloads(&probe, &estimate, args.context, &loaded)
+                .suggest_unloads(&probe, &estimate, context, &loaded)
                 .into_iter()
                 .map(|m| m.as_str().to_string())
                 .collect();
