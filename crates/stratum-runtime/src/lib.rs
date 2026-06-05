@@ -69,4 +69,4 @@ pub use sandbox::{SandboxBackend, SandboxReport};
 pub use sandbox_profile::{Mount, NetPolicy, SandboxProfile};
 pub use tier::Tier;
 pub use tools::{CapabilityEntry, CapabilityMatrix};
-pub use workspace::{Workspace, WorkspaceConfig};
+pub use workspace::{IgnoreRule, StratumIgnore, Workspace, WorkspaceConfig};
