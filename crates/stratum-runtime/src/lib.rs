@@ -56,6 +56,8 @@ pub mod sandbox;
 pub mod sandbox_profile;
 /// Sandbox-profile resolver — combine profile + caps + workspace → launch spec.
 pub mod sandbox_resolve;
+/// Secrets / keyring data shape (Phase 1 scaffold; real OS backend lands later).
+pub mod secrets;
 /// Composite tier classifier (low / medium / high).
 pub mod tier;
 /// Tool registry and capability matrix.
@@ -96,6 +98,10 @@ pub use sandbox_profile::{Mount, NetPolicy, SandboxProfile};
 pub use sandbox_resolve::{
     resolve, resolve_with_warnings, BackendChoice, MountMode, ResolveError, ResolvedMount,
     ResolvedNet, SandboxLaunchSpec,
+};
+pub use secrets::{
+    redact_for_log, InMemorySecretStore, ProjectId, SecretId, SecretIdError, SecretRef,
+    SecretScope, SecretStore, SecretStoreError, SecretValue,
 };
 pub use tier::Tier;
 pub use tools::{CapabilityEntry, CapabilityMatrix};
