@@ -26,6 +26,8 @@ pub mod injection;
 pub mod install;
 /// `tracing` subscriber initialization with env-filter + file output.
 pub mod logging;
+/// Turn-level observability primitives: token meter, latency steps, tok/s.
+pub mod observability;
 /// Panic hook + crash report file writer.
 pub mod panic;
 /// XDG-aware filesystem path resolution.
@@ -55,6 +57,9 @@ pub use download::{InstallReport, ModelInstaller};
 pub use gate::{MemoryGate, DEFAULT_MARGIN_MIB};
 pub use injection::{fence, is_suspicious, suspicion_score, FenceSource, SUSPICION_THRESHOLD};
 pub use install::{InstalledToml, TierInputs};
+pub use observability::{
+    format_tokens_per_second, RoleStep, RoleTimer, TurnId, TurnIdGen, TurnMetrics, TurnRecorder,
+};
 pub use paths::Paths;
 pub use probe::{GpuBackend, HardwareProbe};
 pub use prompts::{system_prompt, PromptRole};
