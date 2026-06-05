@@ -85,6 +85,8 @@ pub mod secrets;
 pub mod telemetry;
 /// Composite tier classifier (low / medium / high).
 pub mod tier;
+/// Per-tool-call timeout policy + RAII timer guard.
+pub mod tool_timeout;
 /// Tool registry and capability matrix.
 pub mod tools;
 /// On-disk conversation-transcript shape + atomic JSON store.
@@ -169,6 +171,9 @@ pub use telemetry::{
     TELEMETRY_SCHEMA_VERSION,
 };
 pub use tier::Tier;
+pub use tool_timeout::{
+    record_outcome, run_with_timeout, ToolTimeoutError, ToolTimeoutGuard, ToolTimeoutPolicy,
+};
 pub use tools::{CapabilityEntry, CapabilityMatrix};
 pub use transcript::{
     redact_pii, SessionId, SessionIdError, Transcript, TranscriptBlock, TranscriptBlockKind,
