@@ -34,6 +34,8 @@ pub mod gate;
 pub mod injection;
 /// First-run install record and atomic TOML writer.
 pub mod install;
+/// Pure-rules intent classifier mapping a prompt to a [`RoutedIntent`].
+pub mod intent_router;
 /// Llama.cpp-backed provider scaffold (feature-gated, off by default).
 #[cfg(feature = "provider-llama-cpp")]
 pub mod llama_provider;
@@ -108,6 +110,10 @@ pub use injection::{fence, is_suspicious, suspicion_score, FenceSource, SUSPICIO
 pub use install::{
     backup_path, load_with_migration, restore_backup, save_atomic, InstallIoError,
     InstallLoadError, InstalledToml, TierInputs, CURRENT_SCHEMA_VERSION,
+};
+pub use intent_router::{
+    fallback_intent, Intent, IntentPattern, IntentRouter, IntentRouterError, IntentRule,
+    RoutedIntent, SuggestedRole,
 };
 #[cfg(feature = "provider-llama-cpp")]
 pub use llama_provider::LlamaCppProvider;
