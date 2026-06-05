@@ -2,24 +2,25 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use stratum_runtime::{
     build_payload as build_telemetry_payload, evaluate as evaluate_update,
     payload_is_allowlisted as telemetry_payload_is_allowlisted, AnonInstallId,
-    ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CpuArchTag, EchoProvider,
-    GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadedModel, ManifestError,
-    MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag,
-    Paths, PlatformTag, Provider, ReleaseChannel, ReleaseVersion, SandboxReport, TelemetryConfig,
-    TelemetryEventKind, TelemetryPayload, Tier, UpdateChannel, UpdateDecision, UpdateManifest,
-    DEFAULT_MARGIN_MIB,
+    ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CpuArchTag, EchoProvider, Event,
+    EventRecord, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadedModel,
+    ManifestError, MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask,
+    ModelTier, OsTag, Paths, PlatformTag, Provider, ReleaseChannel, ReleaseVersion, SandboxReport,
+    TelemetryConfig, TelemetryEventKind, TelemetryPayload, Tier, UpdateChannel, UpdateDecision,
+    UpdateManifest, DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
+use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 /// Stratum CLI.
@@ -63,6 +64,64 @@ enum Command {
     MemCheck(MemCheckArgs),
     /// Self-update operations (read-only `--check` in this phase).
     SelfUpdate(SelfUpdateArgs),
+    /// Read the on-disk JSONL event log written by `JsonlEventSink`.
+    #[command(subcommand)]
+    Events(EventsCommand),
+}
+
+/// Subcommands under `stratum events`.
+#[derive(Debug, Subcommand)]
+enum EventsCommand {
+    /// Tail recent `EventRecord`s from `<state>/events.jsonl`.
+    Tail(EventsTailArgs),
+}
+
+/// Arguments for `stratum events tail`.
+#[derive(Debug, Args)]
+struct EventsTailArgs {
+    /// Skip records with `id <= since-id`.
+    #[arg(long, value_name = "ID")]
+    since_id: Option<u64>,
+    /// Maximum number of records to print after filtering.
+    #[arg(long, value_name = "N")]
+    limit: Option<usize>,
+    /// Filter by event kind.
+    #[arg(long, value_enum)]
+    kind: Option<EventKindArg>,
+    /// Emit each filtered record as compact JSON on its own line.
+    #[arg(long)]
+    json: bool,
+    /// Keep reading after EOF, polling for new lines.
+    #[arg(long)]
+    follow: bool,
+}
+
+/// Clap-friendly mirror of the `kind` tag of [`Event`].
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[clap(rename_all = "snake_case")]
+enum EventKindArg {
+    /// A tool invocation completed.
+    ToolCall,
+    /// A permission prompt was shown.
+    PermissionAsked,
+    /// Control was handed between agent roles.
+    AgentHandoff,
+    /// A provider returned an error.
+    ProviderError,
+    /// A sandboxed process was launched.
+    SandboxLaunched,
+}
+
+impl EventKindArg {
+    const fn as_wire(self) -> &'static str {
+        match self {
+            Self::ToolCall => "tool_call",
+            Self::PermissionAsked => "permission_asked",
+            Self::AgentHandoff => "agent_handoff",
+            Self::ProviderError => "provider_error",
+            Self::SandboxLaunched => "sandbox_launched",
+        }
+    }
 }
 
 /// Arguments for `stratum doctor`.
@@ -524,6 +583,9 @@ where
         }
         Some(Command::MemCheck(mem_args)) => mem_check(cli.json, &mem_args, out, err),
         Some(Command::SelfUpdate(su_args)) => self_update(cli.json, &su_args, out, err),
+        Some(Command::Events(EventsCommand::Tail(tail_args))) => {
+            events_tail(&paths, &tail_args, out, err)
+        }
     }
 }
 
@@ -1662,6 +1724,210 @@ fn fetch_manifest_https(url: &str) -> Result<UpdateManifest, String> {
         format!("{err}")
     })?;
     Ok(parsed)
+}
+
+// ---------------------------------------------------------------------------
+// events tail
+// ---------------------------------------------------------------------------
+
+/// Resolve the on-disk path of the JSONL event log under the configured state
+/// directory. Mirrors what `JsonlEventSink` writes to.
+fn events_log_path(paths: &Paths) -> PathBuf {
+    paths.state.join("events.jsonl")
+}
+
+/// Optional bound on `--follow` loops. Honors `STRATUM_EVENTS_TAIL_MAX_S`; in
+/// real runs the env var is absent and the loop tails forever.
+fn follow_deadline() -> Option<SystemTime> {
+    let raw = std::env::var("STRATUM_EVENTS_TAIL_MAX_S").ok()?;
+    let secs: u64 = raw.parse().ok()?;
+    SystemTime::now().checked_add(Duration::from_secs(secs))
+}
+
+fn deadline_reached(deadline: Option<SystemTime>) -> bool {
+    deadline.is_some_and(|d| SystemTime::now() >= d)
+}
+
+/// Format an [`EventRecord`] as a single-line prose summary.
+fn render_event_prose(record: &EventRecord) -> String {
+    let at = OffsetDateTime::from(record.at)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| String::from("?"));
+    let (kind, body) = match &record.event {
+        Event::ToolCall {
+            tool_id,
+            ok,
+            duration_ms,
+        } => ("tool_call", format!("{tool_id} ok={ok} {duration_ms}ms")),
+        Event::PermissionAsked { request, decision } => {
+            ("permission_asked", format!("{request} decision={decision}"))
+        }
+        Event::AgentHandoff { from, to, reason } => {
+            ("agent_handoff", format!("{from}->{to} reason={reason}"))
+        }
+        Event::ProviderError {
+            provider,
+            code,
+            message,
+        } => ("provider_error", format!("{provider} {code} {message}")),
+        Event::SandboxLaunched { backend, profile } => {
+            ("sandbox_launched", format!("{backend} profile={profile}"))
+        }
+    };
+    format!("[{}] {} {} {}", record.id, at, kind, body)
+}
+
+/// True when `record` matches the `kind` filter (or no filter is set).
+fn kind_matches(record: &EventRecord, kind: Option<EventKindArg>) -> bool {
+    kind.is_none_or(|k| {
+        let wire = match &record.event {
+            Event::ToolCall { .. } => "tool_call",
+            Event::PermissionAsked { .. } => "permission_asked",
+            Event::AgentHandoff { .. } => "agent_handoff",
+            Event::ProviderError { .. } => "provider_error",
+            Event::SandboxLaunched { .. } => "sandbox_launched",
+        };
+        wire == k.as_wire()
+    })
+}
+
+/// Apply `--since-id` / `--kind` to a single record and emit it via `out` if
+/// it passes. Returns `Ok(true)` when a record was emitted, `Ok(false)` when
+/// filtered out, and `Err(ExitCode)` on writer failure.
+fn maybe_emit_record(
+    out: &mut dyn Write,
+    record: &EventRecord,
+    args: &EventsTailArgs,
+) -> Result<bool, ExitCode> {
+    if let Some(since) = args.since_id {
+        if record.id <= since {
+            return Ok(false);
+        }
+    }
+    if !kind_matches(record, args.kind) {
+        return Ok(false);
+    }
+    let line = if args.json {
+        match serde_json::to_string(record) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "events tail: serialize failed");
+                return Ok(false);
+            }
+        }
+    } else {
+        render_event_prose(record)
+    };
+    if writeln!(out, "{line}").is_err() {
+        return Err(ExitCode::from(74));
+    }
+    Ok(true)
+}
+
+/// Drain `reader` until EOF, emitting matching records. `emitted` is the
+/// running count used to enforce `--limit`. Returns `Ok(true)` when the limit
+/// was reached (caller should stop), `Ok(false)` when EOF was hit cleanly, or
+/// `Err(ExitCode)` on writer failure.
+fn drain_reader<R: BufRead>(
+    reader: &mut R,
+    out: &mut dyn Write,
+    args: &EventsTailArgs,
+    emitted: &mut usize,
+) -> Result<bool, ExitCode> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = match reader.read_line(&mut line) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "events tail: read failed");
+                return Ok(false);
+            }
+        };
+        if n == 0 {
+            return Ok(false);
+        }
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+        if trimmed.is_empty() {
+            continue;
+        }
+        let record: EventRecord = match serde_json::from_str(trimmed) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, line = %trimmed, "events tail: skipping malformed line");
+                continue;
+            }
+        };
+        if maybe_emit_record(out, &record, args)? {
+            *emitted += 1;
+            if args.limit.is_some_and(|max| *emitted >= max) {
+                return Ok(true);
+            }
+        }
+    }
+}
+
+fn events_tail(
+    paths: &Paths,
+    args: &EventsTailArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let path = events_log_path(paths);
+    let deadline = follow_deadline();
+    let mut emitted: usize = 0;
+    let mut offset: u64 = 0;
+
+    loop {
+        match std::fs::File::open(&path) {
+            Ok(file) => {
+                let mut reader = BufReader::new(file);
+                if offset > 0 {
+                    if let Err(e) = reader.seek(SeekFrom::Start(offset)) {
+                        let _ = writeln!(err, "STRAT-E1001 cannot seek {}: {e}", path.display());
+                        return ExitCode::from(1);
+                    }
+                }
+                let stop = match drain_reader(&mut reader, out, args, &mut emitted) {
+                    Ok(s) => s,
+                    Err(code) => return code,
+                };
+                if stop {
+                    return ExitCode::SUCCESS;
+                }
+                if !args.follow {
+                    return ExitCode::SUCCESS;
+                }
+                offset = match reader.stream_position() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = writeln!(err, "STRAT-E1001 cannot tell {}: {e}", path.display());
+                        return ExitCode::from(1);
+                    }
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !args.follow {
+                    return ExitCode::SUCCESS;
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 cannot read {}: {e}", path.display());
+                return ExitCode::from(1);
+            }
+        }
+
+        if !args.follow {
+            return ExitCode::SUCCESS;
+        }
+        if deadline_reached(deadline) {
+            return ExitCode::SUCCESS;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        if deadline_reached(deadline) {
+            return ExitCode::SUCCESS;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3592,5 +3858,355 @@ mod tests {
         // must be Some.
         let detected = PlatformArg::detect();
         assert!(detected.is_some(), "detect() returned None on host");
+    }
+
+    // -----------------------------------------------------------------------
+    // events tail unit coverage
+    // -----------------------------------------------------------------------
+
+    fn make_record(id: u64, event: Event) -> EventRecord {
+        EventRecord {
+            id,
+            at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            turn_id: None,
+            event,
+        }
+    }
+
+    fn write_jsonl(root: &Path, lines: &[String]) {
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let body: String = lines
+            .iter()
+            .map(|s| format!("{s}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        std::fs::write(state.join("events.jsonl"), body).unwrap();
+    }
+
+    #[test]
+    fn render_prose_covers_all_event_variants() {
+        let cases = vec![
+            Event::ToolCall {
+                tool_id: "fs.read".into(),
+                ok: true,
+                duration_ms: 12,
+            },
+            Event::PermissionAsked {
+                request: "net".into(),
+                decision: "allow_once".into(),
+            },
+            Event::AgentHandoff {
+                from: "planner".into(),
+                to: "coder".into(),
+                reason: "ready".into(),
+            },
+            Event::ProviderError {
+                provider: "llama-cpp".into(),
+                code: "STRAT-E1001".into(),
+                message: "oops".into(),
+            },
+            Event::SandboxLaunched {
+                backend: "bwrap".into(),
+                profile: "default".into(),
+            },
+        ];
+        let expected_tags = [
+            "tool_call",
+            "permission_asked",
+            "agent_handoff",
+            "provider_error",
+            "sandbox_launched",
+        ];
+        for (event, tag) in cases.into_iter().zip(expected_tags) {
+            let rec = make_record(1, event);
+            let line = render_event_prose(&rec);
+            assert!(line.contains(tag), "expected {tag} in {line}");
+        }
+    }
+
+    #[test]
+    fn kind_matches_filters_each_variant() {
+        let variants = [
+            (
+                Event::ToolCall {
+                    tool_id: "x".into(),
+                    ok: true,
+                    duration_ms: 0,
+                },
+                EventKindArg::ToolCall,
+            ),
+            (
+                Event::PermissionAsked {
+                    request: "x".into(),
+                    decision: "deny".into(),
+                },
+                EventKindArg::PermissionAsked,
+            ),
+            (
+                Event::AgentHandoff {
+                    from: "a".into(),
+                    to: "b".into(),
+                    reason: "r".into(),
+                },
+                EventKindArg::AgentHandoff,
+            ),
+            (
+                Event::ProviderError {
+                    provider: "p".into(),
+                    code: "c".into(),
+                    message: "m".into(),
+                },
+                EventKindArg::ProviderError,
+            ),
+            (
+                Event::SandboxLaunched {
+                    backend: "b".into(),
+                    profile: "p".into(),
+                },
+                EventKindArg::SandboxLaunched,
+            ),
+        ];
+        for (event, kind) in variants {
+            let rec = make_record(1, event);
+            assert!(kind_matches(&rec, Some(kind)));
+            // None matches everything.
+            assert!(kind_matches(&rec, None));
+        }
+    }
+
+    #[test]
+    fn tail_each_kind_filter_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let records = vec![
+            make_record(
+                1,
+                Event::ToolCall {
+                    tool_id: "fs.read".into(),
+                    ok: true,
+                    duration_ms: 1,
+                },
+            ),
+            make_record(
+                2,
+                Event::PermissionAsked {
+                    request: "net".into(),
+                    decision: "allow_once".into(),
+                },
+            ),
+            make_record(
+                3,
+                Event::AgentHandoff {
+                    from: "planner".into(),
+                    to: "coder".into(),
+                    reason: "ready".into(),
+                },
+            ),
+            make_record(
+                4,
+                Event::ProviderError {
+                    provider: "echo".into(),
+                    code: "STRAT-E1001".into(),
+                    message: "boom".into(),
+                },
+            ),
+            make_record(
+                5,
+                Event::SandboxLaunched {
+                    backend: "bwrap".into(),
+                    profile: "default".into(),
+                },
+            ),
+        ];
+        let lines: Vec<String> = records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect();
+        write_jsonl(tmp.path(), &lines);
+
+        for kind in [
+            "tool_call",
+            "permission_asked",
+            "agent_handoff",
+            "provider_error",
+            "sandbox_launched",
+        ] {
+            let (code, out, _err) = drive_under(&["events", "tail", "--kind", kind], tmp.path());
+            assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+            let n = out.lines().count();
+            assert_eq!(n, 1, "kind={kind} got {n} lines: {out}");
+            assert!(out.contains(kind));
+        }
+    }
+
+    #[test]
+    fn tail_prose_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let rec = make_record(
+            1,
+            Event::ToolCall {
+                tool_id: "fs.read".into(),
+                ok: true,
+                duration_ms: 1,
+            },
+        );
+        write_jsonl(tmp.path(), &[serde_json::to_string(&rec).unwrap()]);
+        let code = drive_with_failing_out(&["events", "tail"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn tail_json_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let rec = make_record(
+            1,
+            Event::ToolCall {
+                tool_id: "fs.read".into(),
+                ok: true,
+                duration_ms: 1,
+            },
+        );
+        write_jsonl(tmp.path(), &[serde_json::to_string(&rec).unwrap()]);
+        let code = drive_with_failing_out(&["events", "tail", "--json"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn tail_open_error_when_state_is_a_file_returns_1() {
+        // Use a regular file as state/events.jsonl's parent so open() fails
+        // with something other than NotFound.
+        let tmp = TempDir::new().unwrap();
+        let state = tmp.path().join("state");
+        std::fs::write(&state, b"not a dir").unwrap();
+        let (code, _out, err) = drive_under(&["events", "tail"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("STRAT-E1001"));
+    }
+
+    #[test]
+    fn drain_reader_skips_malformed_then_reads_good() {
+        // Direct unit test on drain_reader so the malformed-line tracing branch
+        // is exercised without depending on follow timing.
+        let body = "{not json}\n\n{\"id\":1,\"at\":{\"secs_since_epoch\":1700000000,\"nanos_since_epoch\":0},\"turn_id\":null,\"event\":{\"kind\":\"tool_call\",\"tool_id\":\"x\",\"ok\":true,\"duration_ms\":1}}\n";
+        let mut reader = std::io::BufReader::new(body.as_bytes());
+        let mut sink = Vec::new();
+        let mut emitted = 0_usize;
+        let args = EventsTailArgs {
+            since_id: None,
+            limit: None,
+            kind: None,
+            json: false,
+            follow: false,
+        };
+        let stop = drain_reader(&mut reader, &mut sink, &args, &mut emitted).unwrap();
+        assert!(!stop);
+        assert_eq!(emitted, 1);
+        let out = String::from_utf8(sink).unwrap();
+        assert!(out.contains("tool_call"));
+    }
+
+    #[test]
+    fn drain_reader_stops_on_limit() {
+        let r1 = make_record(
+            1,
+            Event::ToolCall {
+                tool_id: "a".into(),
+                ok: true,
+                duration_ms: 0,
+            },
+        );
+        let r2 = make_record(
+            2,
+            Event::ToolCall {
+                tool_id: "b".into(),
+                ok: true,
+                duration_ms: 0,
+            },
+        );
+        let r3 = make_record(
+            3,
+            Event::ToolCall {
+                tool_id: "c".into(),
+                ok: true,
+                duration_ms: 0,
+            },
+        );
+        let body = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&r1).unwrap(),
+            serde_json::to_string(&r2).unwrap(),
+            serde_json::to_string(&r3).unwrap(),
+        );
+        let mut reader = std::io::BufReader::new(body.as_bytes());
+        let mut sink = Vec::new();
+        let mut emitted = 0_usize;
+        let args = EventsTailArgs {
+            since_id: None,
+            limit: Some(2),
+            kind: None,
+            json: false,
+            follow: false,
+        };
+        let stop = drain_reader(&mut reader, &mut sink, &args, &mut emitted).unwrap();
+        assert!(stop);
+        assert_eq!(emitted, 2);
+    }
+
+    #[test]
+    fn follow_deadline_honors_env_var() {
+        let _guard = EnvVarGuard::set("STRATUM_EVENTS_TAIL_MAX_S", "1");
+        let dl = follow_deadline().expect("deadline should be set");
+        // dl is in the future relative to now.
+        assert!(dl >= SystemTime::now());
+    }
+
+    #[test]
+    fn follow_deadline_returns_none_when_env_missing() {
+        let _guard = EnvVarGuard::unset("STRATUM_EVENTS_TAIL_MAX_S");
+        assert!(follow_deadline().is_none());
+    }
+
+    #[test]
+    fn follow_deadline_returns_none_when_env_invalid() {
+        let _guard = EnvVarGuard::set("STRATUM_EVENTS_TAIL_MAX_S", "not-a-number");
+        assert!(follow_deadline().is_none());
+    }
+
+    #[test]
+    fn deadline_reached_true_in_past_false_in_future() {
+        let past = SystemTime::UNIX_EPOCH;
+        let future = SystemTime::now() + std::time::Duration::from_secs(60);
+        assert!(deadline_reached(Some(past)));
+        assert!(!deadline_reached(Some(future)));
+        assert!(!deadline_reached(None));
+    }
+
+    /// RAII guard that sets or unsets an env var for the lifetime of the
+    /// scope. Used by the deadline tests so they don't poison each other.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 }
