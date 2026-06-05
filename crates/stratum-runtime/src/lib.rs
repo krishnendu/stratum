@@ -55,6 +55,12 @@ pub mod panic;
 pub mod paths;
 /// Hardware probe: RAM, CPU features, GPU backend, OS.
 pub mod probe;
+/// Prefix prompt cache + reuse-key fingerprinting.
+///
+/// Sha-256 over system + agent-header text — lets providers skip
+/// re-tokenizing the static prefix on every turn. See
+/// `plan/13-prompt-cache.md`.
+pub mod prompt_cache;
 /// Embedded caveman-rewriter and polisher system prompts.
 pub mod prompts;
 /// Provider abstractions and concrete `EchoProvider` for end-to-end loop tests.
@@ -136,6 +142,10 @@ pub use observability::{
 };
 pub use paths::Paths;
 pub use probe::{GpuBackend, HardwareProbe};
+pub use prompt_cache::{
+    fingerprint_inputs, PromptCache, PromptCacheEntry, PromptCacheError, PromptCacheKey,
+    PromptHash, PromptHashError,
+};
 pub use prompts::{system_prompt, PromptRole};
 pub use provider::{EchoProvider, GenerateRequest, Provider};
 pub use provider_cache::{CacheError, CacheSlot, ProviderCache, ProviderKey};
