@@ -9,10 +9,11 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use stratum_runtime::{
-    ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, EchoProvider, GenerateRequest,
-    GpuBackend, HardwareProbe, InstalledToml, LoadedModel, MemoryGate, ModelCatalog, ModelEntry,
-    ModelInstaller, ModelSlug, ModelTask, ModelTier, Paths, Provider, SandboxReport, Tier,
-    DEFAULT_MARGIN_MIB,
+    evaluate as evaluate_update, ArtifactRef as ModelArtifactRef, CancelToken, CatalogError,
+    EchoProvider, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadedModel,
+    ManifestError, MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask,
+    ModelTier, Paths, PlatformTag, Provider, ReleaseVersion, SandboxReport, Tier, UpdateChannel,
+    UpdateDecision, UpdateManifest, DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::OffsetDateTime;
@@ -56,6 +57,131 @@ enum Command {
     Models(ModelsCommand),
     /// Probe RAM and decide whether a synthetic `MemEstimate` would load.
     MemCheck(MemCheckArgs),
+    /// Self-update operations (read-only `--check` in this phase).
+    SelfUpdate(SelfUpdateArgs),
+}
+
+/// Arguments for `stratum self-update`.
+///
+/// This phase exposes only the read-only `--check` action: fetch (or read) an
+/// [`UpdateManifest`], compare against the running version, and print the
+/// resulting [`UpdateDecision`]. The actual atomic binary swap lands in a
+/// later PR.
+#[derive(Debug, Args)]
+struct SelfUpdateArgs {
+    /// Check for an available update and print the decision. Required in this
+    /// phase — no other actions are exposed yet.
+    #[arg(long)]
+    check: bool,
+    /// HTTPS URL of the channel manifest. Defaults to
+    /// `https://updates.stratum.dev/<channel>.json`. Mutually exclusive with
+    /// `--manifest-file`.
+    #[arg(long, value_name = "URL", conflicts_with = "manifest_file")]
+    manifest_url: Option<String>,
+    /// Local manifest fixture path (used for offline runs / tests). Mutually
+    /// exclusive with `--manifest-url`.
+    #[arg(long, value_name = "PATH", conflicts_with = "manifest_url")]
+    manifest_file: Option<PathBuf>,
+    /// Release channel.
+    #[arg(long, value_enum, default_value_t = ChannelArg::Stable)]
+    channel: ChannelArg,
+    /// Override the currently-running version. Defaults to
+    /// `CARGO_PKG_VERSION`.
+    #[arg(long, value_name = "VERSION")]
+    current: Option<String>,
+    /// Override the target platform (defaults to autodetect from
+    /// `std::env::consts::OS` + `std::env::consts::ARCH`).
+    #[arg(long, value_enum)]
+    platform: Option<PlatformArg>,
+}
+
+/// Clap-friendly mirror of [`UpdateChannel`].
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ChannelArg {
+    /// Stable release line.
+    Stable,
+    /// Beta line.
+    Beta,
+    /// Nightly line.
+    Nightly,
+}
+
+impl ChannelArg {
+    const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+            Self::Nightly => "nightly",
+        }
+    }
+}
+
+impl From<ChannelArg> for UpdateChannel {
+    fn from(value: ChannelArg) -> Self {
+        match value {
+            ChannelArg::Stable => Self::Stable,
+            ChannelArg::Beta => Self::Beta,
+            ChannelArg::Nightly => Self::Nightly,
+        }
+    }
+}
+
+/// Clap-friendly mirror of [`PlatformTag`].
+///
+/// The clap value names use the friendlier `macos_*` / `linux_*` /
+/// `windows_*` form requested by the brief; the on-the-wire serde encoding
+/// of [`PlatformTag`] itself is independent.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[clap(rename_all = "snake_case")]
+enum PlatformArg {
+    /// macOS on Apple Silicon.
+    MacosAarch64,
+    /// macOS on `x86_64`.
+    MacosX86_64,
+    /// Linux on aarch64.
+    LinuxAarch64,
+    /// Linux on `x86_64`.
+    LinuxX86_64,
+    /// Windows on `x86_64`.
+    WindowsX86_64,
+}
+
+impl PlatformArg {
+    /// User-facing CLI / JSON form (matches the `--platform` value name).
+    const fn as_wire(self) -> &'static str {
+        match self {
+            Self::MacosAarch64 => "macos_aarch64",
+            Self::MacosX86_64 => "macos_x86_64",
+            Self::LinuxAarch64 => "linux_aarch64",
+            Self::LinuxX86_64 => "linux_x86_64",
+            Self::WindowsX86_64 => "windows_x86_64",
+        }
+    }
+
+    /// Best-effort detection of the host platform. Returns `None` when the
+    /// running OS/ARCH pair isn't on the supported matrix.
+    fn detect() -> Option<Self> {
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => Some(Self::MacosAarch64),
+            ("macos", "x86_64") => Some(Self::MacosX86_64),
+            ("linux", "aarch64") => Some(Self::LinuxAarch64),
+            ("linux", "x86_64") => Some(Self::LinuxX86_64),
+            ("windows", "x86_64") => Some(Self::WindowsX86_64),
+            _ => None,
+        }
+    }
+}
+
+impl From<PlatformArg> for PlatformTag {
+    fn from(value: PlatformArg) -> Self {
+        match value {
+            PlatformArg::MacosAarch64 => Self::MacOsAarch64,
+            PlatformArg::MacosX86_64 => Self::MacOsX86_64,
+            PlatformArg::LinuxAarch64 => Self::LinuxAarch64,
+            PlatformArg::LinuxX86_64 => Self::LinuxX86_64,
+            PlatformArg::WindowsX86_64 => Self::WindowsX86_64,
+        }
+    }
 }
 
 /// Arguments for `stratum mem-check`. The values describe the model that
@@ -342,6 +468,7 @@ where
             models_install_file(cli.json, &paths, &inst_args, out, err)
         }
         Some(Command::MemCheck(mem_args)) => mem_check(cli.json, &mem_args, out, err),
+        Some(Command::SelfUpdate(su_args)) => self_update(cli.json, &su_args, out, err),
     }
 }
 
@@ -1046,6 +1173,252 @@ fn render_block(out: &mut dyn Write, block: &Block) -> std::io::Result<()> {
         Block::ToolCall { tool, .. } => writeln!(out, "(tool_call: {tool})"),
         Block::ToolResult { id, .. } => writeln!(out, "(tool_result: {id})"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// self-update --check
+// ---------------------------------------------------------------------------
+
+/// `--json` payload for the artifact slot of a [`SelfUpdateReport`].
+#[derive(Debug, Serialize)]
+struct SelfUpdateArtifact<'a> {
+    url: &'a str,
+    sha256: &'a str,
+    bytes: u64,
+}
+
+/// `--json` payload emitted by `stratum self-update --check`.
+#[derive(Debug, Serialize)]
+struct SelfUpdateReport<'a> {
+    decision: &'static str,
+    from: Option<String>,
+    to: Option<String>,
+    channel: &'static str,
+    platform: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact: Option<SelfUpdateArtifact<'a>>,
+}
+
+fn self_update(
+    json: bool,
+    args: &SelfUpdateArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if !args.check {
+        let _ = writeln!(
+            err,
+            "stratum self-update: --check is required (no other actions in this phase)"
+        );
+        return ExitCode::from(64);
+    }
+
+    let current = match resolve_current_version(args.current.as_deref(), err) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let platform_arg = match resolve_platform(args.platform, err) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let channel_arg = args.channel;
+
+    let manifest = match load_self_update_manifest(args, channel_arg, err) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+
+    let decision = evaluate_update(&manifest, &current);
+    let artifact = manifest.pick_artifact(platform_arg.into());
+
+    let render_result = if json {
+        render_self_update_json(
+            out,
+            &decision,
+            &current,
+            channel_arg,
+            platform_arg,
+            artifact,
+        )
+    } else {
+        render_self_update_prose(out, &decision, &current, channel_arg, artifact)
+    };
+    if let Err(code) = render_result {
+        return code;
+    }
+
+    match decision {
+        UpdateDecision::UpToDate | UpdateDecision::Upgrade { .. } => ExitCode::SUCCESS,
+        UpdateDecision::BlockedSchemaTooOld { .. } => ExitCode::from(64),
+    }
+}
+
+fn resolve_current_version(
+    override_value: Option<&str>,
+    err: &mut dyn Write,
+) -> Result<ReleaseVersion, ExitCode> {
+    let raw = override_value.unwrap_or(env!("CARGO_PKG_VERSION"));
+    ReleaseVersion::parse(raw).map_err(|e| {
+        let _ = writeln!(err, "invalid --current {raw:?}: {e}");
+        ExitCode::from(2)
+    })
+}
+
+fn resolve_platform(
+    override_value: Option<PlatformArg>,
+    err: &mut dyn Write,
+) -> Result<PlatformArg, ExitCode> {
+    if let Some(p) = override_value {
+        return Ok(p);
+    }
+    PlatformArg::detect().ok_or_else(|| {
+        let _ = writeln!(
+            err,
+            "could not auto-detect platform (os={}, arch={}); pass --platform",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        ExitCode::from(2)
+    })
+}
+
+fn load_self_update_manifest(
+    args: &SelfUpdateArgs,
+    channel_arg: ChannelArg,
+    err: &mut dyn Write,
+) -> Result<UpdateManifest, ExitCode> {
+    match (&args.manifest_file, &args.manifest_url) {
+        (Some(path), None) => UpdateManifest::load(path).map_err(|e| {
+            let _ = writeln!(err, "STRAT-E1001 {e}");
+            ExitCode::from(1)
+        }),
+        (None, url_opt) => {
+            let url = url_opt.clone().unwrap_or_else(|| {
+                format!("https://updates.stratum.dev/{}.json", channel_arg.as_wire())
+            });
+            fetch_manifest_https(&url).map_err(|e| {
+                let _ = writeln!(err, "STRAT-E1001 {e}");
+                ExitCode::from(1)
+            })
+        }
+        (Some(_), Some(_)) => {
+            // Clap's `conflicts_with` should have caught this; defensive
+            // fallthrough preserves exit-code shape for handcrafted argv.
+            let _ = writeln!(
+                err,
+                "--manifest-url and --manifest-file are mutually exclusive"
+            );
+            Err(ExitCode::from(64))
+        }
+    }
+}
+
+fn render_self_update_json(
+    out: &mut dyn Write,
+    decision: &UpdateDecision,
+    current: &ReleaseVersion,
+    channel_arg: ChannelArg,
+    platform_arg: PlatformArg,
+    artifact: Option<&stratum_runtime::UpdateArtifactRef>,
+) -> Result<(), ExitCode> {
+    let (decision_tag, from, to) = match decision {
+        UpdateDecision::UpToDate => ("UpToDate", Some(current.to_string()), None),
+        UpdateDecision::Upgrade { from, to } => {
+            ("Upgrade", Some(from.to_string()), Some(to.to_string()))
+        }
+        UpdateDecision::BlockedSchemaTooOld {
+            current: cur,
+            min_supported,
+        } => (
+            "BlockedSchemaTooOld",
+            Some(cur.to_string()),
+            Some(min_supported.to_string()),
+        ),
+    };
+    let payload = SelfUpdateReport {
+        decision: decision_tag,
+        from,
+        to,
+        channel: channel_arg.as_wire(),
+        platform: platform_arg.as_wire(),
+        artifact: artifact.map(|a| SelfUpdateArtifact {
+            url: &a.url,
+            sha256: &a.sha256,
+            bytes: a.bytes,
+        }),
+    };
+    #[allow(
+        clippy::expect_used,
+        reason = "SelfUpdateReport serialization is infallible (primitives only)"
+    )]
+    let rendered = serde_json::to_string_pretty(&payload)
+        .expect("SelfUpdateReport serialization is infallible");
+    if writeln!(out, "{rendered}").is_err() {
+        return Err(ExitCode::from(74));
+    }
+    Ok(())
+}
+
+fn render_self_update_prose(
+    out: &mut dyn Write,
+    decision: &UpdateDecision,
+    current: &ReleaseVersion,
+    channel_arg: ChannelArg,
+    artifact: Option<&stratum_runtime::UpdateArtifactRef>,
+) -> Result<(), ExitCode> {
+    let channel = channel_arg.as_wire();
+    let write_res = match decision {
+        UpdateDecision::UpToDate => {
+            writeln!(out, "stratum is up to date ({current} on {channel})")
+        }
+        UpdateDecision::Upgrade { from, to } => {
+            writeln!(out, "upgrade available: {from} → {to} ({channel})").and_then(|()| {
+                artifact.map_or(Ok(()), |a| {
+                    writeln!(
+                        out,
+                        "  artifact: {} ({} bytes, sha256={})",
+                        a.url, a.bytes, a.sha256
+                    )
+                })
+            })
+        }
+        UpdateDecision::BlockedSchemaTooOld {
+            current: cur,
+            min_supported,
+        } => writeln!(
+            out,
+            "current version {cur} is below min-supported {min_supported}; full reinstall required"
+        ),
+    };
+    write_res.map_err(|_| ExitCode::from(74))
+}
+
+/// Fetch and parse an [`UpdateManifest`] from an HTTPS URL.
+///
+/// Rejects non-HTTPS URLs and any non-200 response.
+fn fetch_manifest_https(url: &str) -> Result<UpdateManifest, String> {
+    if !url.starts_with("https://") {
+        return Err(format!("manifest URL must be https://: got {url:?}"));
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(10))
+        .build();
+    let resp = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("manifest fetch failed: {e}"))?;
+    let status = resp.status();
+    if status != 200 {
+        return Err(format!("manifest fetch returned HTTP {status}"));
+    }
+    let body = resp
+        .into_string()
+        .map_err(|e| format!("manifest body read failed: {e}"))?;
+    let parsed: UpdateManifest = serde_json::from_str(&body).map_err(|e| {
+        let err: ManifestError = ManifestError::Serialize(e);
+        format!("{err}")
+    })?;
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -2627,5 +3000,354 @@ mod tests {
             sha256: None,
         };
         assert_eq!(default_filename_for(&args), "model.bin");
+    }
+
+    // ---- self-update --check coverage ----
+
+    /// Minimal valid manifest fixture with one release at `version`, no
+    /// `min_supported_from`, single `linux_x86_64` artifact. Returns the path.
+    fn write_self_update_fixture(dir: &Path, version: &str) -> PathBuf {
+        let mut iter = version.split('.');
+        let major: u16 = iter.next().unwrap().parse().unwrap();
+        let minor: u16 = iter.next().unwrap().parse().unwrap();
+        let patch: u16 = iter.next().unwrap().parse().unwrap();
+        let body = format!(
+            r#"{{
+                "schema_version": 1,
+                "channel": "stable",
+                "latest": {{
+                    "version": {{ "major": {major}, "minor": {minor}, "patch": {patch}, "pre": null }},
+                    "released_at": {{ "secs_since_epoch": 1700000000, "nanos_since_epoch": 0 }},
+                    "binary": {{
+                        "url": "https://dl.stratum.dev/v{version}/stratum-linux_x86_64.tar.gz",
+                        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "bytes": 1024,
+                        "platform": "linux_x86_64"
+                    }},
+                    "min_supported_from": null,
+                    "release_notes_url": "https://stratum.dev/releases/{version}"
+                }},
+                "history": [
+                    {{
+                        "version": {{ "major": {major}, "minor": {minor}, "patch": {patch}, "pre": null }},
+                        "released_at": {{ "secs_since_epoch": 1700000000, "nanos_since_epoch": 0 }},
+                        "binary": {{
+                            "url": "https://dl.stratum.dev/v{version}/stratum-linux_x86_64.tar.gz",
+                            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                            "bytes": 1024,
+                            "platform": "linux_x86_64"
+                        }},
+                        "min_supported_from": null,
+                        "release_notes_url": "https://stratum.dev/releases/{version}"
+                    }}
+                ]
+            }}"#
+        );
+        let fixture_path = dir.join("manifest.json");
+        std::fs::write(&fixture_path, body).unwrap();
+        fixture_path
+    }
+
+    #[test]
+    fn self_update_missing_check_flag_exits_64() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(&["self-update"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(64)));
+        assert!(err.contains("--check is required"));
+    }
+
+    #[test]
+    fn self_update_invalid_current_exits_2() {
+        let tmp = TempDir::new().unwrap();
+        let fixture = write_self_update_fixture(tmp.path(), "1.0.0");
+        let (code, _out, err) = drive_under(
+            &[
+                "self-update",
+                "--check",
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "not-a-version",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
+        assert!(err.contains("invalid --current"));
+    }
+
+    #[test]
+    fn self_update_check_up_to_date_prose_exits_0() {
+        let tmp = TempDir::new().unwrap();
+        let fixture = write_self_update_fixture(tmp.path(), "1.0.0");
+        let (code, out, _err) = drive_under(
+            &[
+                "self-update",
+                "--check",
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.0.0",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(out.contains("up to date"));
+    }
+
+    #[test]
+    fn self_update_check_upgrade_prose_includes_artifact() {
+        let tmp = TempDir::new().unwrap();
+        let fixture = write_self_update_fixture(tmp.path(), "1.5.0");
+        let (code, out, _err) = drive_under(
+            &[
+                "self-update",
+                "--check",
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(out.contains("upgrade available"));
+        assert!(out.contains("artifact:"));
+        assert!(out.contains("1.4.7"));
+        assert!(out.contains("1.5.0"));
+    }
+
+    #[test]
+    fn self_update_check_upgrade_prose_omits_artifact_on_platform_miss() {
+        let tmp = TempDir::new().unwrap();
+        let fixture = write_self_update_fixture(tmp.path(), "1.5.0");
+        let (code, out, _err) = drive_under(
+            &[
+                "self-update",
+                "--check",
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "windows_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(out.contains("upgrade available"));
+        assert!(!out.contains("artifact:"));
+    }
+
+    #[test]
+    fn self_update_check_json_emits_decision_tag() {
+        let tmp = TempDir::new().unwrap();
+        let fixture = write_self_update_fixture(tmp.path(), "1.0.0");
+        let (code, out, _err) = drive_under(
+            &[
+                "--json",
+                "self-update",
+                "--check",
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.0.0",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["decision"], "UpToDate");
+        assert_eq!(v["channel"], "stable");
+        assert_eq!(v["platform"], "linux_x86_64");
+    }
+
+    #[test]
+    fn self_update_check_prose_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let fixture = write_self_update_fixture(tmp.path(), "1.0.0");
+        let code = drive_with_failing_out(
+            &[
+                "self-update",
+                "--check",
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.0.0",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn self_update_check_json_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let fixture = write_self_update_fixture(tmp.path(), "1.0.0");
+        let code = drive_with_failing_out(
+            &[
+                "--json",
+                "self-update",
+                "--check",
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.0.0",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn self_update_check_upgrade_prose_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let fixture = write_self_update_fixture(tmp.path(), "1.5.0");
+        let code = drive_with_failing_out(
+            &[
+                "self-update",
+                "--check",
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn self_update_check_blocked_prose_io_failure_returns_74() {
+        // Build a fixture with min_supported_from to force a Blocked decision.
+        let tmp = TempDir::new().unwrap();
+        let body = r#"{
+            "schema_version": 1,
+            "channel": "stable",
+            "latest": {
+                "version": { "major": 1, "minor": 5, "patch": 0, "pre": null },
+                "released_at": { "secs_since_epoch": 1700000000, "nanos_since_epoch": 0 },
+                "binary": {
+                    "url": "https://dl.stratum.dev/v1.5.0/stratum-linux_x86_64.tar.gz",
+                    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "bytes": 1024,
+                    "platform": "linux_x86_64"
+                },
+                "min_supported_from": { "major": 1, "minor": 3, "patch": 0, "pre": null },
+                "release_notes_url": "https://stratum.dev/releases/1.5.0"
+            },
+            "history": [
+                {
+                    "version": { "major": 1, "minor": 5, "patch": 0, "pre": null },
+                    "released_at": { "secs_since_epoch": 1700000000, "nanos_since_epoch": 0 },
+                    "binary": {
+                        "url": "https://dl.stratum.dev/v1.5.0/stratum-linux_x86_64.tar.gz",
+                        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "bytes": 1024,
+                        "platform": "linux_x86_64"
+                    },
+                    "min_supported_from": { "major": 1, "minor": 3, "patch": 0, "pre": null },
+                    "release_notes_url": "https://stratum.dev/releases/1.5.0"
+                }
+            ]
+        }"#;
+        let path = tmp.path().join("manifest.json");
+        std::fs::write(&path, body).unwrap();
+        let code = drive_with_failing_out(
+            &[
+                "self-update",
+                "--check",
+                "--manifest-file",
+                path.to_str().unwrap(),
+                "--current",
+                "1.0.0",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn self_update_check_https_url_rejected_non_https() {
+        // The URL fetch helper rejects non-https before calling ureq.
+        let err = fetch_manifest_https("http://example.com/manifest.json").unwrap_err();
+        assert!(err.contains("must be https"), "err: {err}");
+    }
+
+    #[test]
+    fn channel_arg_wire_forms() {
+        assert_eq!(ChannelArg::Stable.as_wire(), "stable");
+        assert_eq!(ChannelArg::Beta.as_wire(), "beta");
+        assert_eq!(ChannelArg::Nightly.as_wire(), "nightly");
+    }
+
+    #[test]
+    fn channel_arg_into_update_channel() {
+        assert_eq!(
+            UpdateChannel::from(ChannelArg::Stable),
+            UpdateChannel::Stable
+        );
+        assert_eq!(UpdateChannel::from(ChannelArg::Beta), UpdateChannel::Beta);
+        assert_eq!(
+            UpdateChannel::from(ChannelArg::Nightly),
+            UpdateChannel::Nightly
+        );
+    }
+
+    #[test]
+    fn platform_arg_wire_forms() {
+        assert_eq!(PlatformArg::MacosAarch64.as_wire(), "macos_aarch64");
+        assert_eq!(PlatformArg::MacosX86_64.as_wire(), "macos_x86_64");
+        assert_eq!(PlatformArg::LinuxAarch64.as_wire(), "linux_aarch64");
+        assert_eq!(PlatformArg::LinuxX86_64.as_wire(), "linux_x86_64");
+        assert_eq!(PlatformArg::WindowsX86_64.as_wire(), "windows_x86_64");
+    }
+
+    #[test]
+    fn platform_arg_into_platform_tag() {
+        assert_eq!(
+            PlatformTag::from(PlatformArg::MacosAarch64),
+            PlatformTag::MacOsAarch64
+        );
+        assert_eq!(
+            PlatformTag::from(PlatformArg::MacosX86_64),
+            PlatformTag::MacOsX86_64
+        );
+        assert_eq!(
+            PlatformTag::from(PlatformArg::LinuxAarch64),
+            PlatformTag::LinuxAarch64
+        );
+        assert_eq!(
+            PlatformTag::from(PlatformArg::LinuxX86_64),
+            PlatformTag::LinuxX86_64
+        );
+        assert_eq!(
+            PlatformTag::from(PlatformArg::WindowsX86_64),
+            PlatformTag::WindowsX86_64
+        );
+    }
+
+    #[test]
+    fn platform_arg_detect_returns_some_on_supported_host() {
+        // CI matrix only runs on macOS / Linux on x86_64 or aarch64. Detect()
+        // returns None for unknown OS/ARCH pairs; on any supported host this
+        // must be Some.
+        let detected = PlatformArg::detect();
+        assert!(detected.is_some(), "detect() returned None on host");
     }
 }
