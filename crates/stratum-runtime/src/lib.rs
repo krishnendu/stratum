@@ -101,6 +101,8 @@ pub mod secrets;
 pub mod telemetry;
 /// Composite tier classifier (low / medium / high).
 pub mod tier;
+/// Tool invocation data shape + dispatcher trait (Phase 3 scaffold).
+pub mod tool_invocation;
 /// Per-tool-call timeout policy + RAII timer guard.
 pub mod tool_timeout;
 /// Tool registry and capability matrix.
@@ -214,6 +216,10 @@ pub use telemetry::{
     TELEMETRY_SCHEMA_VERSION,
 };
 pub use tier::Tier;
+pub use tool_invocation::{
+    quick_dispatch, DenyDispatcher, DispatchError, EchoDispatcher, RegistryDispatcher,
+    ToolDispatcher, ToolInvocation, ToolResult,
+};
 pub use tool_timeout::{
     record_outcome, run_with_timeout, ToolTimeoutError, ToolTimeoutGuard, ToolTimeoutPolicy,
 };
