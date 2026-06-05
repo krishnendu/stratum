@@ -67,6 +67,15 @@ jobs:
       - name: cargo test --test doctor_schema
         run: cargo test --package stratum-cli --test doctor_schema -- --include-ignored
 
+  xtask-check-error-codes:
+    name: xtask check-error-codes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p xtask -- check-error-codes
+
   coverage:
     name: 100% line coverage (Linux)
     runs-on: ubuntu-latest

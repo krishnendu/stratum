@@ -6,6 +6,7 @@ members = [
     "crates/stratum-runtime",
     "crates/stratum-cli",
     "crates/stratum-eval",
+    "crates/xtask",
 ]
 
 [workspace.package]

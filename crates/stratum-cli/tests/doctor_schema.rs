@@ -1,5 +1,7 @@
 //! `stratum doctor --json` schema invariant test.
 //!
+//! xtask-check-error-codes: ignore-file (test fixture references synthetic STRAT-E9999).
+//!
 //! Pins the on-the-wire shape of the doctor report against
 //! `docs/schemas/doctor.v1.json`. The fixture is the schema file itself,
 //! loaded at compile time via `include_str!`, so a drift in either the schema
