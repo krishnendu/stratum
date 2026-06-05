@@ -1,15 +1,17 @@
 //! The CLI behavior, factored out of `main` for testability.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use stratum_runtime::{
-    CancelToken, EchoProvider, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml,
-    LoadedModel, MemoryGate, ModelInstaller, Paths, Provider, SandboxReport, Tier,
+    ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, EchoProvider, GenerateRequest,
+    GpuBackend, HardwareProbe, InstalledToml, LoadedModel, MemoryGate, ModelCatalog, ModelEntry,
+    ModelInstaller, ModelSlug, ModelTask, ModelTier, Paths, Provider, SandboxReport, Tier,
     DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
@@ -89,16 +91,95 @@ struct MemCheckArgs {
 /// Subcommands under `stratum models`.
 #[derive(Debug, Subcommand)]
 enum ModelsCommand {
-    /// List installed model files in `<data>/stratum/models/`.
-    List,
-    /// Install a model file from a local source path.
+    /// List catalog entries from `<state>/models.json`.
+    List(ListArgs),
+    /// Add (or replace) a catalog entry.
     Add(AddArgs),
+    /// Remove a catalog entry by slug.
+    Remove(RemoveArgs),
+    /// Print the recommended slug for a `(tier, task)` pair.
+    Recommend(RecommendArgs),
+    /// Validate the on-disk catalog file.
+    Validate,
+    /// Legacy: install a model file from a local source path.
+    InstallFile(InstallFileArgs),
 }
 
-/// Arguments for `stratum models add`. Either `--from-file` or `--from-url`
-/// must be supplied (clap enforces the choice).
+/// Arguments for `stratum models list`.
+#[derive(Debug, Args)]
+struct ListArgs {
+    /// Filter by tier.
+    #[arg(long)]
+    tier: Option<TierArg>,
+    /// Filter by task.
+    #[arg(long)]
+    task: Option<TaskArg>,
+}
+
+/// Arguments for `stratum models add` (catalog entry).
 #[derive(Debug, Args)]
 struct AddArgs {
+    /// Stable slug used as the catalog key.
+    #[arg(long)]
+    slug: String,
+    /// Upstream model family / lineage (e.g. "llama").
+    #[arg(long)]
+    family: String,
+    /// Human-friendly display name shown in the installer UI.
+    #[arg(long = "display-name")]
+    display_name: String,
+    /// Coarse tier bucket.
+    #[arg(long)]
+    tier: TierArg,
+    /// Comma-separated task tags (`chat`, `code`, `embedding`, `tool_use`,
+    /// `vision`, `cavemanish`, `polisher`).
+    #[arg(long)]
+    task: String,
+    /// Total artifact size, in MiB.
+    #[arg(long = "size-mib")]
+    size_mib: u64,
+    /// Quantization tag, e.g. `Q4_K_M`.
+    #[arg(long)]
+    quantization: String,
+    /// HTTPS download URL for the artifact.
+    #[arg(long)]
+    url: String,
+    /// Lowercase hex SHA-256 of the artifact (64 chars).
+    #[arg(long)]
+    sha256: String,
+    /// Expected byte size of the artifact (`> 0`).
+    #[arg(long)]
+    bytes: u64,
+    /// SPDX license identifier (e.g. "Apache-2.0").
+    #[arg(long)]
+    license: String,
+    /// Optional homepage / model card URL.
+    #[arg(long)]
+    homepage: Option<String>,
+}
+
+/// Arguments for `stratum models remove`.
+#[derive(Debug, Args)]
+struct RemoveArgs {
+    /// Slug to remove.
+    #[arg(long)]
+    slug: String,
+}
+
+/// Arguments for `stratum models recommend`.
+#[derive(Debug, Args)]
+struct RecommendArgs {
+    /// Tier budget.
+    #[arg(long)]
+    tier: TierArg,
+    /// Task tag.
+    #[arg(long)]
+    task: TaskArg,
+}
+
+/// Arguments for the legacy `stratum models install-file`.
+#[derive(Debug, Args)]
+struct InstallFileArgs {
     /// Local file to copy into the models directory.
     #[arg(long, conflicts_with = "from_url")]
     from_file: Option<PathBuf>,
@@ -111,6 +192,88 @@ struct AddArgs {
     /// Expected SHA-256 (lowercase hex). When set, the install verifies.
     #[arg(long)]
     sha256: Option<String>,
+}
+
+/// Clap-friendly mirror of [`ModelTier`].
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum TierArg {
+    /// Smallest models.
+    Low,
+    /// Mid-range.
+    Medium,
+    /// Large.
+    High,
+    /// Extra-large.
+    Xl,
+}
+
+impl From<TierArg> for ModelTier {
+    fn from(value: TierArg) -> Self {
+        match value {
+            TierArg::Low => Self::Low,
+            TierArg::Medium => Self::Medium,
+            TierArg::High => Self::High,
+            TierArg::Xl => Self::Xl,
+        }
+    }
+}
+
+/// Clap-friendly mirror of [`ModelTask`].
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum TaskArg {
+    /// General chat / instruction following.
+    Chat,
+    /// Code generation / completion.
+    Code,
+    /// Sentence-embedding model.
+    Embedding,
+    /// Tool / function calling.
+    ToolUse,
+    /// Multimodal vision.
+    Vision,
+    /// Caveman-ish rewriter.
+    Cavemanish,
+    /// Polisher role.
+    Polisher,
+}
+
+impl From<TaskArg> for ModelTask {
+    fn from(value: TaskArg) -> Self {
+        match value {
+            TaskArg::Chat => Self::Chat,
+            TaskArg::Code => Self::Code,
+            TaskArg::Embedding => Self::Embedding,
+            TaskArg::ToolUse => Self::ToolUse,
+            TaskArg::Vision => Self::Vision,
+            TaskArg::Cavemanish => Self::Cavemanish,
+            TaskArg::Polisher => Self::Polisher,
+        }
+    }
+}
+
+fn parse_task_csv(input: &str) -> Result<BTreeSet<ModelTask>, String> {
+    let mut out = BTreeSet::new();
+    for raw in input.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let task = match trimmed {
+            "chat" => ModelTask::Chat,
+            "code" => ModelTask::Code,
+            "embedding" => ModelTask::Embedding,
+            "tool_use" => ModelTask::ToolUse,
+            "vision" => ModelTask::Vision,
+            "cavemanish" => ModelTask::Cavemanish,
+            "polisher" => ModelTask::Polisher,
+            other => return Err(format!("unknown task {other:?}")),
+        };
+        out.insert(task);
+    }
+    if out.is_empty() {
+        return Err("--task must list at least one task".to_owned());
+    }
+    Ok(out)
 }
 
 /// Run the CLI against the provided argv (excluding argv[0]).
@@ -162,9 +325,21 @@ where
         Some(Command::Init) => init(cli.json, &paths, out, err),
         Some(Command::Echo { prompt, max_blocks }) => echo(cli.json, &prompt, max_blocks, out),
         Some(Command::Chat) => chat_command(&paths, err),
-        Some(Command::Models(ModelsCommand::List)) => models_list(cli.json, &paths, out, err),
+        Some(Command::Models(ModelsCommand::List(list_args))) => {
+            models_list(cli.json, &paths, &list_args, out, err)
+        }
         Some(Command::Models(ModelsCommand::Add(add_args))) => {
             models_add(cli.json, &paths, &add_args, out, err)
+        }
+        Some(Command::Models(ModelsCommand::Remove(rm_args))) => {
+            models_remove(&paths, &rm_args, out, err)
+        }
+        Some(Command::Models(ModelsCommand::Recommend(rec_args))) => {
+            models_recommend(cli.json, &paths, &rec_args, out, err)
+        }
+        Some(Command::Models(ModelsCommand::Validate)) => models_validate(&paths, out, err),
+        Some(Command::Models(ModelsCommand::InstallFile(inst_args))) => {
+            models_install_file(cli.json, &paths, &inst_args, out, err)
         }
         Some(Command::MemCheck(mem_args)) => mem_check(cli.json, &mem_args, out, err),
     }
@@ -174,53 +349,98 @@ fn models_dir(paths: &Paths) -> PathBuf {
     paths.data.join("models")
 }
 
-#[derive(Debug, Serialize)]
-struct ModelEntry {
-    name: String,
-    bytes: u64,
+fn catalog_path(paths: &Paths) -> PathBuf {
+    paths.state.join("models.json")
 }
 
-fn models_list(json: bool, paths: &Paths, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    let dir = models_dir(paths);
-    let mut entries: Vec<ModelEntry> = Vec::new();
-    match std::fs::read_dir(&dir) {
-        Ok(iter) => {
-            for entry in iter.flatten() {
-                if !entry.file_type().is_ok_and(|t| t.is_file()) {
-                    continue;
-                }
-                let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                entries.push(ModelEntry {
-                    name: entry.file_name().to_string_lossy().to_string(),
-                    bytes,
-                });
-            }
+fn load_catalog_or_empty(path: &Path, err: &mut dyn Write) -> Result<ModelCatalog, ExitCode> {
+    match ModelCatalog::load(path) {
+        Ok(c) => Ok(c),
+        Err(CatalogError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ModelCatalog::default())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            let _ = writeln!(err, "STRAT-E1001 read {}: {}", dir.display(), e);
-            return ExitCode::from(74);
+            let _ = writeln!(err, "STRAT-E1001 {e}");
+            Err(ExitCode::from(1))
         }
     }
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
+}
+
+fn ensure_state_dir(paths: &Paths, err: &mut dyn Write) -> Result<(), ExitCode> {
+    if let Err(e) = std::fs::create_dir_all(&paths.state) {
+        let _ = writeln!(
+            err,
+            "STRAT-E1001 cannot create {}: {e}",
+            paths.state.display()
+        );
+        return Err(ExitCode::from(1));
+    }
+    Ok(())
+}
+
+fn models_list(
+    json: bool,
+    paths: &Paths,
+    args: &ListArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let path = catalog_path(paths);
+    let catalog = match load_catalog_or_empty(&path, err) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+
+    let mut filtered: Vec<&ModelEntry> = catalog.entries.values().collect();
+    if let Some(t) = args.tier {
+        let tier: ModelTier = t.into();
+        filtered.retain(|e| e.tier == tier);
+    }
+    if let Some(t) = args.task {
+        let task: ModelTask = t.into();
+        filtered.retain(|e| e.task.contains(&task));
+    }
 
     if json {
-        #[allow(
-            clippy::expect_used,
-            reason = "ModelEntry serialization is infallible (primitives only)"
-        )]
-        let rendered =
-            serde_json::to_string_pretty(&entries).expect("ModelEntry serialization is infallible");
+        #[allow(clippy::expect_used, reason = "ModelEntry serialization is infallible")]
+        let rendered = serde_json::to_string_pretty(&filtered)
+            .expect("ModelEntry serialization is infallible");
         if writeln!(out, "{rendered}").is_err() {
             return ExitCode::from(74);
         }
-    } else if entries.is_empty() {
-        if writeln!(out, "(no models installed)").is_err() {
+    } else if filtered.is_empty() {
+        if writeln!(out, "(no catalog entries)").is_err() {
             return ExitCode::from(74);
         }
     } else {
-        for entry in &entries {
-            if writeln!(out, "{:>12} bytes  {}", entry.bytes, entry.name).is_err() {
+        if writeln!(
+            out,
+            "{:<24} {:<10} {:<10} {:>8}  DISPLAY_NAME",
+            "SLUG", "TIER", "TASKS", "SIZE_MIB"
+        )
+        .is_err()
+        {
+            return ExitCode::from(74);
+        }
+        for entry in &filtered {
+            let tasks = entry
+                .task
+                .iter()
+                .map(|t| format!("{}", serde_json::to_value(t).unwrap_or_default()))
+                .collect::<Vec<_>>()
+                .join(",");
+            let tier_str = format!("{}", serde_json::to_value(entry.tier).unwrap_or_default());
+            if writeln!(
+                out,
+                "{:<24} {:<10} {:<10} {:>8}  {}",
+                entry.slug.as_str(),
+                tier_str.trim_matches('"'),
+                tasks.replace('"', ""),
+                entry.size_mib,
+                entry.display_name
+            )
+            .is_err()
+            {
                 return ExitCode::from(74);
             }
         }
@@ -232,6 +452,180 @@ fn models_add(
     json: bool,
     paths: &Paths,
     args: &AddArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if let Err(code) = ensure_state_dir(paths, err) {
+        return code;
+    }
+    let path = catalog_path(paths);
+
+    let slug: ModelSlug = match args.slug.parse() {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(err, "invalid --slug: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let artifact = match ModelArtifactRef::new(args.url.clone(), args.sha256.clone(), args.bytes) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = writeln!(err, "invalid artifact: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let tasks = match parse_task_csv(&args.task) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = writeln!(err, "invalid --task: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    if args.size_mib == 0 {
+        let _ = writeln!(err, "invalid --size-mib: must be > 0");
+        return ExitCode::from(2);
+    }
+    if args.family.trim().is_empty() {
+        let _ = writeln!(err, "invalid --family: must not be empty");
+        return ExitCode::from(2);
+    }
+
+    let mut catalog = match load_catalog_or_empty(&path, err) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+
+    let entry = ModelEntry {
+        slug: slug.clone(),
+        family: args.family.clone(),
+        display_name: args.display_name.clone(),
+        tier: args.tier.into(),
+        task: tasks,
+        size_mib: args.size_mib,
+        quantization: args.quantization.clone(),
+        artifact,
+        license: args.license.clone(),
+        homepage: args.homepage.clone(),
+    };
+    catalog.insert(entry.clone());
+
+    if let Err(e) = catalog.save_atomic(&path) {
+        let _ = writeln!(err, "STRAT-E1001 {e}");
+        return ExitCode::from(1);
+    }
+
+    if json {
+        #[allow(clippy::expect_used, reason = "ModelEntry serialization is infallible")]
+        let rendered =
+            serde_json::to_string_pretty(&entry).expect("ModelEntry serialization is infallible");
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+    } else if writeln!(
+        out,
+        "added · {} · tier={:?} · size={} MiB",
+        slug.as_str(),
+        entry.tier,
+        entry.size_mib
+    )
+    .is_err()
+    {
+        return ExitCode::from(74);
+    }
+    ExitCode::SUCCESS
+}
+
+fn models_remove(
+    paths: &Paths,
+    args: &RemoveArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let slug: ModelSlug = match args.slug.parse() {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(err, "invalid --slug: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let path = catalog_path(paths);
+    let mut catalog = match load_catalog_or_empty(&path, err) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    if catalog.entries.remove(&slug).is_none() {
+        let _ = writeln!(err, "no such slug: {}", slug.as_str());
+        return ExitCode::from(1);
+    }
+    if let Err(e) = catalog.save_atomic(&path) {
+        let _ = writeln!(err, "STRAT-E1001 {e}");
+        return ExitCode::from(1);
+    }
+    if writeln!(out, "removed · {}", slug.as_str()).is_err() {
+        return ExitCode::from(74);
+    }
+    ExitCode::SUCCESS
+}
+
+fn models_recommend(
+    json: bool,
+    paths: &Paths,
+    args: &RecommendArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let path = catalog_path(paths);
+    let catalog = match load_catalog_or_empty(&path, err) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let tier: ModelTier = args.tier.into();
+    let task: ModelTask = args.task.into();
+    if let Some(entry) = catalog.recommend_for(tier, task) {
+        if json {
+            #[allow(clippy::expect_used, reason = "ModelEntry serialization is infallible")]
+            let rendered = serde_json::to_string_pretty(entry)
+                .expect("ModelEntry serialization is infallible");
+            if writeln!(out, "{rendered}").is_err() {
+                return ExitCode::from(74);
+            }
+        } else if writeln!(out, "{} · {}", entry.slug.as_str(), entry.display_name).is_err() {
+            return ExitCode::from(74);
+        }
+        ExitCode::SUCCESS
+    } else {
+        let _ = writeln!(err, "no model fits the requested tier/task");
+        ExitCode::from(1)
+    }
+}
+
+fn models_validate(paths: &Paths, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let path = catalog_path(paths);
+    let catalog = match load_catalog_or_empty(&path, err) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    match catalog.validate() {
+        Ok(()) => {
+            if writeln!(out, "ok · {} entries", catalog.entries.len()).is_err() {
+                return ExitCode::from(74);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn models_install_file(
+    json: bool,
+    paths: &Paths,
+    args: &InstallFileArgs,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -289,7 +683,7 @@ fn models_add(
     ExitCode::SUCCESS
 }
 
-fn default_filename_for(args: &AddArgs) -> String {
+fn default_filename_for(args: &InstallFileArgs) -> String {
     if let Some(p) = args.from_file.as_deref() {
         return p.file_name().map_or_else(
             || "model.bin".to_string(),
@@ -858,11 +1252,45 @@ mod tests {
         assert!(fail.flush().is_err());
     }
 
+    const GOOD_SHA: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    fn seed_one(root: &Path, slug: &str) {
+        let _ = drive_under(
+            &[
+                "models",
+                "add",
+                "--slug",
+                slug,
+                "--family",
+                "llama",
+                "--display-name",
+                "Display",
+                "--tier",
+                "low",
+                "--task",
+                "chat",
+                "--size-mib",
+                "100",
+                "--quantization",
+                "Q4_K_M",
+                "--url",
+                "https://example.com/m.gguf",
+                "--sha256",
+                GOOD_SHA,
+                "--bytes",
+                "1024",
+                "--license",
+                "Apache-2.0",
+            ],
+            root,
+        );
+    }
+
     #[test]
     fn models_list_empty_emits_message() {
         let tmp = TempDir::new().unwrap();
         let (_code, out, _err) = drive_under(&["models", "list"], tmp.path());
-        assert!(out.contains("no models installed"));
+        assert!(out.contains("no catalog entries"));
     }
 
     #[test]
@@ -876,19 +1304,114 @@ mod tests {
     #[test]
     fn models_add_then_list() {
         let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("src.bin");
-        std::fs::write(&src, b"hello").unwrap();
-        let (_code, _out, _err) = drive_under(
-            &["models", "add", "--from-file", src.to_str().unwrap()],
-            tmp.path(),
-        );
+        seed_one(tmp.path(), "tiny-chat");
         let (_code, out, _err) = drive_under(&["models", "list"], tmp.path());
-        assert!(out.contains("src.bin"));
-        assert!(out.contains("5 bytes"));
+        assert!(out.contains("tiny-chat"));
+        assert!(out.contains("Display"));
     }
 
     #[test]
-    fn models_add_json_emits_install_report() {
+    fn models_add_json_emits_entry() {
+        let tmp = TempDir::new().unwrap();
+        let (_code, out, _err) = drive_under(
+            &[
+                "--json",
+                "models",
+                "add",
+                "--slug",
+                "alpha",
+                "--family",
+                "llama",
+                "--display-name",
+                "Alpha",
+                "--tier",
+                "medium",
+                "--task",
+                "chat,code",
+                "--size-mib",
+                "200",
+                "--quantization",
+                "Q5",
+                "--url",
+                "https://example.com/a.gguf",
+                "--sha256",
+                GOOD_SHA,
+                "--bytes",
+                "2048",
+                "--license",
+                "MIT",
+                "--homepage",
+                "https://example.com/alpha",
+            ],
+            tmp.path(),
+        );
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["slug"], "alpha");
+        assert_eq!(v["tier"], "medium");
+        assert!(v["task"].as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn models_list_json_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let code = drive_with_failing_out(&["--json", "models", "list"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn install_file_default_filename_from_url() {
+        let args = InstallFileArgs {
+            from_file: None,
+            from_url: Some("https://example.com/x/y/weights.gguf".into()),
+            name: None,
+            sha256: None,
+        };
+        assert_eq!(default_filename_for(&args), "weights.gguf");
+    }
+
+    #[test]
+    fn install_file_default_filename_falls_back_when_empty() {
+        let args = InstallFileArgs {
+            from_file: None,
+            from_url: Some("https://example.com/".into()),
+            name: None,
+            sha256: None,
+        };
+        assert_eq!(default_filename_for(&args), "model.bin");
+    }
+
+    #[test]
+    fn install_file_default_filename_falls_back_when_no_source() {
+        let args = InstallFileArgs {
+            from_file: None,
+            from_url: None,
+            name: None,
+            sha256: None,
+        };
+        assert_eq!(default_filename_for(&args), "model.bin");
+    }
+
+    #[test]
+    fn install_file_from_local() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        std::fs::write(&src, b"hello").unwrap();
+        let (_code, _out, _err) = drive_under(
+            &[
+                "models",
+                "install-file",
+                "--from-file",
+                src.to_str().unwrap(),
+            ],
+            tmp.path(),
+        );
+        // file copied into <root>/data/models/
+        let dest = tmp.path().join("data").join("models").join("src.bin");
+        assert!(dest.exists());
+    }
+
+    #[test]
+    fn install_file_json_emits_report() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("src.bin");
         std::fs::write(&src, b"hello").unwrap();
@@ -896,7 +1419,7 @@ mod tests {
             &[
                 "--json",
                 "models",
-                "add",
+                "install-file",
                 "--from-file",
                 src.to_str().unwrap(),
                 "--name",
@@ -909,18 +1432,17 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["verified"], true);
         assert_eq!(v["bytes"], 5);
-        assert!(v["dest"].as_str().unwrap().ends_with("renamed.bin"));
     }
 
     #[test]
-    fn models_add_mismatch_exits_73() {
+    fn install_file_mismatch_exits_73() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("src.bin");
         std::fs::write(&src, b"hello").unwrap();
         let (code, _out, err) = drive_under(
             &[
                 "models",
-                "add",
+                "install-file",
                 "--from-file",
                 src.to_str().unwrap(),
                 "--sha256",
@@ -933,59 +1455,22 @@ mod tests {
     }
 
     #[test]
-    fn models_add_prose_uses_source_filename_when_name_absent() {
+    fn install_file_neither_source_exits_64() {
         let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("auto.bin");
-        std::fs::write(&src, b"hi").unwrap();
-        let (_code, out, _err) = drive_under(
-            &["models", "add", "--from-file", src.to_str().unwrap()],
-            tmp.path(),
-        );
-        assert!(out.contains("auto.bin"));
+        let (code, _out, err) = drive_under(&["models", "install-file"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(64)));
+        assert!(!err.is_empty());
     }
 
     #[test]
-    fn models_list_io_failure_returns_74() {
-        let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("src.bin");
-        std::fs::write(&src, b"hi").unwrap();
-        let _ = drive_under(
-            &["models", "add", "--from-file", src.to_str().unwrap()],
-            tmp.path(),
-        );
-        let code = drive_with_failing_out(&["models", "list"], tmp.path());
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
-    }
-
-    #[test]
-    fn models_list_json_io_failure_returns_74() {
-        let tmp = TempDir::new().unwrap();
-        let code = drive_with_failing_out(&["--json", "models", "list"], tmp.path());
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
-    }
-
-    #[test]
-    fn models_add_prose_io_failure_returns_74() {
-        let tmp = TempDir::new().unwrap();
-        let src = tmp.path().join("src.bin");
-        std::fs::write(&src, b"hi").unwrap();
-        let code = drive_with_failing_out(
-            &["models", "add", "--from-file", src.to_str().unwrap()],
-            tmp.path(),
-        );
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
-    }
-
-    #[test]
-    fn models_add_json_io_failure_returns_74() {
+    fn install_file_io_failure_returns_74() {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("src.bin");
         std::fs::write(&src, b"hi").unwrap();
         let code = drive_with_failing_out(
             &[
-                "--json",
                 "models",
-                "add",
+                "install-file",
                 "--from-file",
                 src.to_str().unwrap(),
             ],
@@ -995,46 +1480,153 @@ mod tests {
     }
 
     #[test]
-    fn models_add_neither_source_exits_64() {
+    fn install_file_json_io_failure_returns_74() {
         let tmp = TempDir::new().unwrap();
-        let (code, _out, err) = drive_under(&["models", "add"], tmp.path());
-        // clap allows --from-file/--from-url as optional but we reject missing
-        // sources ourselves with exit 64.
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(64)));
-        assert!(!err.is_empty());
+        let src = tmp.path().join("src.bin");
+        std::fs::write(&src, b"hi").unwrap();
+        let code = drive_with_failing_out(
+            &[
+                "--json",
+                "models",
+                "install-file",
+                "--from-file",
+                src.to_str().unwrap(),
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
     }
 
     #[test]
-    fn default_filename_from_url_uses_last_segment() {
-        let args = AddArgs {
-            from_file: None,
-            from_url: Some("https://example.com/x/y/weights.gguf".into()),
-            name: None,
-            sha256: None,
-        };
-        assert_eq!(default_filename_for(&args), "weights.gguf");
+    fn models_remove_then_list_empty() {
+        let tmp = TempDir::new().unwrap();
+        seed_one(tmp.path(), "removable");
+        let (code, _out, _err) =
+            drive_under(&["models", "remove", "--slug", "removable"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        let (_code, out, _err) = drive_under(&["models", "list"], tmp.path());
+        assert!(out.contains("no catalog entries"));
     }
 
     #[test]
-    fn default_filename_falls_back_when_url_empty_after_slash() {
-        let args = AddArgs {
-            from_file: None,
-            from_url: Some("https://example.com/".into()),
-            name: None,
-            sha256: None,
-        };
-        assert_eq!(default_filename_for(&args), "model.bin");
+    fn models_remove_missing_exits_1() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(&["models", "remove", "--slug", "ghost"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("no such slug"));
     }
 
     #[test]
-    fn default_filename_falls_back_when_no_source() {
-        let args = AddArgs {
-            from_file: None,
-            from_url: None,
-            name: None,
-            sha256: None,
-        };
-        assert_eq!(default_filename_for(&args), "model.bin");
+    fn models_remove_invalid_slug_exits_2() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(&["models", "remove", "--slug", "BAD"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
+        assert!(err.contains("invalid --slug"));
+    }
+
+    #[test]
+    fn models_recommend_after_seed() {
+        let tmp = TempDir::new().unwrap();
+        seed_one(tmp.path(), "tiny");
+        let (code, out, _err) = drive_under(
+            &["models", "recommend", "--tier", "low", "--task", "chat"],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(out.contains("tiny"));
+    }
+
+    #[test]
+    fn models_recommend_empty_exits_1() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(
+            &["models", "recommend", "--tier", "low", "--task", "chat"],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("no model fits"));
+    }
+
+    #[test]
+    fn models_validate_empty_ok() {
+        let tmp = TempDir::new().unwrap();
+        let (code, out, _err) = drive_under(&["models", "validate"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(out.contains("ok · 0 entries"));
+    }
+
+    #[test]
+    fn models_add_invalid_sha_exits_2() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "models",
+                "add",
+                "--slug",
+                "x",
+                "--family",
+                "llama",
+                "--display-name",
+                "X",
+                "--tier",
+                "low",
+                "--task",
+                "chat",
+                "--size-mib",
+                "1",
+                "--quantization",
+                "Q",
+                "--url",
+                "https://example.com/x",
+                "--sha256",
+                "deadbeef",
+                "--bytes",
+                "1",
+                "--license",
+                "MIT",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
+        assert!(err.contains("invalid artifact"));
+    }
+
+    #[test]
+    fn parse_task_csv_rejects_unknown() {
+        let err = parse_task_csv("chat,nope").unwrap_err();
+        assert!(err.contains("nope"));
+    }
+
+    #[test]
+    fn parse_task_csv_rejects_empty() {
+        let err = parse_task_csv(", ,").unwrap_err();
+        assert!(err.contains("at least one"));
+    }
+
+    #[test]
+    fn parse_task_csv_all_variants() {
+        let set =
+            parse_task_csv("chat,code,embedding,tool_use,vision,cavemanish,polisher").unwrap();
+        assert_eq!(set.len(), 7);
+    }
+
+    #[test]
+    fn tier_arg_into_model_tier() {
+        assert_eq!(ModelTier::from(TierArg::Low), ModelTier::Low);
+        assert_eq!(ModelTier::from(TierArg::Medium), ModelTier::Medium);
+        assert_eq!(ModelTier::from(TierArg::High), ModelTier::High);
+        assert_eq!(ModelTier::from(TierArg::Xl), ModelTier::Xl);
+    }
+
+    #[test]
+    fn task_arg_into_model_task() {
+        assert_eq!(ModelTask::from(TaskArg::Chat), ModelTask::Chat);
+        assert_eq!(ModelTask::from(TaskArg::Code), ModelTask::Code);
+        assert_eq!(ModelTask::from(TaskArg::Embedding), ModelTask::Embedding);
+        assert_eq!(ModelTask::from(TaskArg::ToolUse), ModelTask::ToolUse);
+        assert_eq!(ModelTask::from(TaskArg::Vision), ModelTask::Vision);
+        assert_eq!(ModelTask::from(TaskArg::Cavemanish), ModelTask::Cavemanish);
+        assert_eq!(ModelTask::from(TaskArg::Polisher), ModelTask::Polisher);
     }
 
     #[test]
@@ -1534,5 +2126,506 @@ mod tests {
         let (code, _out, err) = drive_under(&["init"], tmp.path());
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(73)));
         assert!(!err.is_empty());
+    }
+
+    // ---- New models catalog branch coverage tests ----
+
+    fn write_bad_catalog(root: &Path, body: &str) {
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("models.json"), body).unwrap();
+    }
+
+    #[test]
+    fn models_list_bad_catalog_exits_1() {
+        let tmp = TempDir::new().unwrap();
+        write_bad_catalog(tmp.path(), "{not json");
+        let (code, _out, err) = drive_under(&["models", "list"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("STRAT-E1001"));
+    }
+
+    #[test]
+    fn models_add_bad_catalog_exits_1() {
+        let tmp = TempDir::new().unwrap();
+        write_bad_catalog(tmp.path(), "{not json");
+        let (code, _out, err) = drive_under(
+            &[
+                "models",
+                "add",
+                "--slug",
+                "x",
+                "--family",
+                "llama",
+                "--display-name",
+                "X",
+                "--tier",
+                "low",
+                "--task",
+                "chat",
+                "--size-mib",
+                "1",
+                "--quantization",
+                "Q",
+                "--url",
+                "https://example.com/x",
+                "--sha256",
+                GOOD_SHA,
+                "--bytes",
+                "1",
+                "--license",
+                "MIT",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("STRAT-E1001"));
+    }
+
+    #[test]
+    fn models_remove_bad_catalog_exits_1() {
+        let tmp = TempDir::new().unwrap();
+        write_bad_catalog(tmp.path(), "{not json");
+        let (code, _out, err) =
+            drive_under(&["models", "remove", "--slug", "anything"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("STRAT-E1001"));
+    }
+
+    #[test]
+    fn models_recommend_bad_catalog_exits_1() {
+        let tmp = TempDir::new().unwrap();
+        write_bad_catalog(tmp.path(), "{not json");
+        let (code, _out, err) = drive_under(
+            &["models", "recommend", "--tier", "low", "--task", "chat"],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("STRAT-E1001"));
+    }
+
+    #[test]
+    fn models_validate_bad_catalog_exits_1() {
+        let tmp = TempDir::new().unwrap();
+        write_bad_catalog(tmp.path(), "{not json");
+        let (code, _out, err) = drive_under(&["models", "validate"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("STRAT-E1001"));
+    }
+
+    #[test]
+    fn models_add_bad_slug_exits_2() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "models",
+                "add",
+                "--slug",
+                "BAD",
+                "--family",
+                "llama",
+                "--display-name",
+                "X",
+                "--tier",
+                "low",
+                "--task",
+                "chat",
+                "--size-mib",
+                "1",
+                "--quantization",
+                "Q",
+                "--url",
+                "https://example.com/x",
+                "--sha256",
+                GOOD_SHA,
+                "--bytes",
+                "1",
+                "--license",
+                "MIT",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
+        assert!(err.contains("invalid --slug"));
+    }
+
+    #[test]
+    fn models_add_bad_task_exits_2() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "models",
+                "add",
+                "--slug",
+                "x",
+                "--family",
+                "llama",
+                "--display-name",
+                "X",
+                "--tier",
+                "low",
+                "--task",
+                "nope",
+                "--size-mib",
+                "1",
+                "--quantization",
+                "Q",
+                "--url",
+                "https://example.com/x",
+                "--sha256",
+                GOOD_SHA,
+                "--bytes",
+                "1",
+                "--license",
+                "MIT",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
+        assert!(err.contains("invalid --task"));
+    }
+
+    #[test]
+    fn models_add_zero_size_exits_2() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "models",
+                "add",
+                "--slug",
+                "x",
+                "--family",
+                "llama",
+                "--display-name",
+                "X",
+                "--tier",
+                "low",
+                "--task",
+                "chat",
+                "--size-mib",
+                "0",
+                "--quantization",
+                "Q",
+                "--url",
+                "https://example.com/x",
+                "--sha256",
+                GOOD_SHA,
+                "--bytes",
+                "1",
+                "--license",
+                "MIT",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
+        assert!(err.contains("invalid --size-mib"));
+    }
+
+    #[test]
+    fn models_add_empty_family_exits_2() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "models",
+                "add",
+                "--slug",
+                "x",
+                "--family",
+                "   ",
+                "--display-name",
+                "X",
+                "--tier",
+                "low",
+                "--task",
+                "chat",
+                "--size-mib",
+                "1",
+                "--quantization",
+                "Q",
+                "--url",
+                "https://example.com/x",
+                "--sha256",
+                GOOD_SHA,
+                "--bytes",
+                "1",
+                "--license",
+                "MIT",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(2)));
+        assert!(err.contains("invalid --family"));
+    }
+
+    #[test]
+    fn models_list_prose_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        seed_one(tmp.path(), "x");
+        let code = drive_with_failing_out(&["models", "list"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn models_list_empty_prose_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let code = drive_with_failing_out(&["models", "list"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn models_add_prose_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let code = drive_with_failing_out(
+            &[
+                "models",
+                "add",
+                "--slug",
+                "x",
+                "--family",
+                "llama",
+                "--display-name",
+                "X",
+                "--tier",
+                "low",
+                "--task",
+                "chat",
+                "--size-mib",
+                "1",
+                "--quantization",
+                "Q",
+                "--url",
+                "https://example.com/x",
+                "--sha256",
+                GOOD_SHA,
+                "--bytes",
+                "1",
+                "--license",
+                "MIT",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn models_add_json_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let code = drive_with_failing_out(
+            &[
+                "--json",
+                "models",
+                "add",
+                "--slug",
+                "x",
+                "--family",
+                "llama",
+                "--display-name",
+                "X",
+                "--tier",
+                "low",
+                "--task",
+                "chat",
+                "--size-mib",
+                "1",
+                "--quantization",
+                "Q",
+                "--url",
+                "https://example.com/x",
+                "--sha256",
+                GOOD_SHA,
+                "--bytes",
+                "1",
+                "--license",
+                "MIT",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn models_remove_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        seed_one(tmp.path(), "removable");
+        let code = drive_with_failing_out(&["models", "remove", "--slug", "removable"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn models_recommend_prose_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        seed_one(tmp.path(), "tiny");
+        let code = drive_with_failing_out(
+            &["models", "recommend", "--tier", "low", "--task", "chat"],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn models_recommend_json_emits_entry() {
+        let tmp = TempDir::new().unwrap();
+        seed_one(tmp.path(), "tiny");
+        let (code, out, _err) = drive_under(
+            &[
+                "--json",
+                "models",
+                "recommend",
+                "--tier",
+                "low",
+                "--task",
+                "chat",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["slug"], "tiny");
+    }
+
+    #[test]
+    fn models_recommend_json_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        seed_one(tmp.path(), "tiny");
+        let code = drive_with_failing_out(
+            &[
+                "--json",
+                "models",
+                "recommend",
+                "--tier",
+                "low",
+                "--task",
+                "chat",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn models_validate_prose_io_failure_returns_74() {
+        let tmp = TempDir::new().unwrap();
+        let code = drive_with_failing_out(&["models", "validate"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn models_add_save_failure_exits_1() {
+        // Pre-create the tmp file path as a directory so save_atomic fails.
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let tmp_path = state_dir.join("models.json.tmp");
+        std::fs::create_dir(&tmp_path).unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "models",
+                "add",
+                "--slug",
+                "x",
+                "--family",
+                "llama",
+                "--display-name",
+                "X",
+                "--tier",
+                "low",
+                "--task",
+                "chat",
+                "--size-mib",
+                "1",
+                "--quantization",
+                "Q",
+                "--url",
+                "https://example.com/x",
+                "--sha256",
+                GOOD_SHA,
+                "--bytes",
+                "1",
+                "--license",
+                "MIT",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("STRAT-E1001"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn models_remove_save_failure_exits_1() {
+        let tmp = TempDir::new().unwrap();
+        seed_one(tmp.path(), "removeme");
+        // Replace tmp staging path with a directory to block save.
+        let state_dir = tmp.path().join("state");
+        let tmp_path = state_dir.join("models.json.tmp");
+        std::fs::create_dir(&tmp_path).unwrap();
+        let (code, _out, err) =
+            drive_under(&["models", "remove", "--slug", "removeme"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("STRAT-E1001"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn models_add_ensure_state_dir_failure_exits_1() {
+        // Use a regular file at the state path so create_dir_all fails.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("state"), b"blocker").unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "models",
+                "add",
+                "--slug",
+                "x",
+                "--family",
+                "llama",
+                "--display-name",
+                "X",
+                "--tier",
+                "low",
+                "--task",
+                "chat",
+                "--size-mib",
+                "1",
+                "--quantization",
+                "Q",
+                "--url",
+                "https://example.com/x",
+                "--sha256",
+                GOOD_SHA,
+                "--bytes",
+                "1",
+                "--license",
+                "MIT",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("STRAT-E1001"));
+    }
+
+    #[test]
+    fn install_file_from_url_default_filename_with_colon() {
+        // A URL whose last segment contains ':' falls back to model.bin.
+        let args = InstallFileArgs {
+            from_file: None,
+            from_url: Some("https://example.com/foo:bar".into()),
+            name: None,
+            sha256: None,
+        };
+        assert_eq!(default_filename_for(&args), "model.bin");
+    }
+
+    #[test]
+    fn install_file_default_filename_from_file_no_name() {
+        // file with no filename (only root)
+        let args = InstallFileArgs {
+            from_file: Some(PathBuf::from("/")),
+            from_url: None,
+            name: None,
+            sha256: None,
+        };
+        assert_eq!(default_filename_for(&args), "model.bin");
     }
 }
