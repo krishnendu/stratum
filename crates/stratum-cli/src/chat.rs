@@ -33,7 +33,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as TuiBlock, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
-use stratum_runtime::{CancelToken, EchoProvider, GenerateRequest, Paths, Provider, Tier};
+use stratum_runtime::{
+    format_tokens_per_second, CancelToken, EchoProvider, GenerateRequest, Paths, Provider,
+    RoleTimer, Tier, TurnId, TurnMetrics, TurnRecorder,
+};
 use stratum_types::{Block, ModelId, StratumResult};
 
 use crate::palette::{self, Palette};
@@ -62,6 +65,10 @@ pub struct ChatState {
     quit: bool,
     status: String,
     palette: Option<Palette>,
+    /// Monotonic turn counter; the next submitted turn gets this id.
+    next_turn_id: u64,
+    /// Metrics from the most recently completed turn (renders in status bar).
+    last_metrics: Option<TurnMetrics>,
 }
 
 impl ChatState {
@@ -77,7 +84,16 @@ impl ChatState {
             quit: false,
             status,
             palette: None,
+            next_turn_id: 0,
+            last_metrics: None,
         }
+    }
+
+    /// Borrow the last recorded turn metrics, if any. Used by tests.
+    #[must_use]
+    #[cfg(test)]
+    const fn last_metrics(&self) -> Option<&TurnMetrics> {
+        self.last_metrics.as_ref()
     }
 
     /// Is the slash-command palette currently visible?
@@ -161,7 +177,16 @@ impl ChatState {
             prompt: prompt.clone(),
             max_blocks: 64,
         };
+        let turn_id = TurnId(self.next_turn_id);
+        self.next_turn_id = self.next_turn_id.saturating_add(1);
+        let role_timer = RoleTimer::start();
+        let mut recorder = TurnRecorder::new(turn_id);
         let blocks = self.provider.generate(&request, &self.cancel);
+        for block in &blocks {
+            recorder.record_block(block);
+        }
+        recorder.record_step("generate", role_timer.stop_ms());
+        self.last_metrics = Some(recorder.finish());
         self.transcript.push(Turn::User(prompt));
         self.transcript.push(Turn::Assistant(blocks));
     }
@@ -178,15 +203,32 @@ impl ChatState {
             ])
             .split(area);
 
-        let status = Paragraph::new(Line::from(vec![
+        let mut status_spans = vec![
             Span::styled("stratum", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" · "),
             Span::raw(format!("tier={}", self.tier)),
             Span::raw(" · "),
             Span::raw(&self.status),
-            Span::raw(" · "),
-            Span::raw("Esc/Ctrl-C exit"),
-        ]));
+        ];
+        if let Some(metrics) = self.last_metrics.as_ref() {
+            let role_ms = metrics
+                .role_steps
+                .iter()
+                .map(|step| step.duration_ms)
+                .fold(0_u32, u32::saturating_add);
+            let tps = format_tokens_per_second(metrics.completion_tokens, role_ms);
+            status_spans.push(Span::raw(" · "));
+            status_spans.push(Span::styled(
+                format!(
+                    "turn {} · prompt:{} compl:{} · {tps:.1} tok/s",
+                    metrics.turn_id.0, metrics.prompt_tokens, metrics.completion_tokens,
+                ),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        status_spans.push(Span::raw(" · "));
+        status_spans.push(Span::raw("Esc/Ctrl-C exit"));
+        let status = Paragraph::new(Line::from(status_spans));
         ratatui::widgets::Widget::render(status, chunks[0], buf);
 
         let mut lines: Vec<Line<'_>> = Vec::new();
@@ -526,6 +568,49 @@ mod tests {
         assert!(text.contains("you:"));
         assert!(text.contains("hi"));
         assert!(text.contains("echo: hi"));
+    }
+
+    #[test]
+    fn submit_records_turn_metrics() {
+        let mut s = state();
+        for c in "hi".chars() {
+            s.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let metrics = s.last_metrics().expect("metrics recorded");
+        assert_eq!(metrics.turn_id.0, 0);
+        assert!(metrics.total_blocks >= 1);
+        assert_eq!(metrics.role_steps.len(), 1);
+        assert_eq!(metrics.role_steps[0].name, "generate");
+    }
+
+    #[test]
+    fn turn_ids_increment_per_submit() {
+        let mut s = state();
+        for c in "hi".chars() {
+            s.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        for c in "bye".chars() {
+            s.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let metrics = s.last_metrics().expect("metrics recorded");
+        assert_eq!(metrics.turn_id.0, 1);
+    }
+
+    #[test]
+    fn render_shows_token_meter_after_submit() {
+        let mut s = state();
+        for c in "hi".chars() {
+            s.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let text = rendered_text(&s, 100, 12);
+        assert!(text.contains("turn 0"));
+        assert!(text.contains("prompt:"));
+        assert!(text.contains("compl:"));
+        assert!(text.contains("tok/s"));
     }
 
     #[test]
