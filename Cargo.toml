@@ -74,6 +74,9 @@ zeroize         = { version = "1", features = ["derive"] }
 # on `stratum-runtime` (and transitively on `stratum-cli`). Off by default
 # so per-PR CI does not pay the multi-minute llama.cpp build cost.
 llama-cpp-2     = { version = "0.1", default-features = false }
+# Used to UTF-8-decode per-token byte pieces returned from llama.cpp.
+# Only pulled in alongside `llama-cpp-2` via the `provider-llama-cpp` feature.
+encoding_rs     = { version = "0.8" }
 
 [profile.release]
 lto             = "thin"
