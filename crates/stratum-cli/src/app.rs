@@ -5,15 +5,19 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::SystemTime;
 
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use stratum_runtime::{
-    evaluate as evaluate_update, ArtifactRef as ModelArtifactRef, CancelToken, CatalogError,
-    EchoProvider, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadedModel,
-    ManifestError, MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask,
-    ModelTier, Paths, PlatformTag, Provider, ReleaseVersion, SandboxReport, Tier, UpdateChannel,
-    UpdateDecision, UpdateManifest, DEFAULT_MARGIN_MIB,
+    build_payload as build_telemetry_payload, evaluate as evaluate_update,
+    payload_is_allowlisted as telemetry_payload_is_allowlisted, AnonInstallId,
+    ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CpuArchTag, EchoProvider,
+    GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadedModel, ManifestError,
+    MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag,
+    Paths, PlatformTag, Provider, ReleaseChannel, ReleaseVersion, SandboxReport, TelemetryConfig,
+    TelemetryEventKind, TelemetryPayload, Tier, UpdateChannel, UpdateDecision, UpdateManifest,
+    DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::OffsetDateTime;
@@ -39,7 +43,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Probe the host and print a tier report.
-    Doctor,
+    Doctor(DoctorArgs),
     /// First-run install: probe, classify, write `installed.toml`.
     Init,
     /// Smoke-test the chat loop against the `EchoProvider`.
@@ -59,6 +63,57 @@ enum Command {
     MemCheck(MemCheckArgs),
     /// Self-update operations (read-only `--check` in this phase).
     SelfUpdate(SelfUpdateArgs),
+}
+
+/// Arguments for `stratum doctor`.
+///
+/// The base report has been stable since v1; this struct adds opt-in
+/// telemetry-payload preview. Real wire emission lands in a later PR — for
+/// now we only assemble the [`TelemetryPayload`] and print it via stdout so
+/// the schema can be reviewed by hand.
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Also assemble and print the telemetry payload. Honors the
+    /// `<state>/telemetry.json` opt-out file: when `enabled` is `false`,
+    /// payload assembly is skipped and the output indicates `disabled`.
+    #[arg(long)]
+    telemetry: bool,
+    /// Override which telemetry event-kind to assemble. Default is
+    /// `daily_active` because the doctor command itself is a stand-in for
+    /// the once-per-UTC-day liveness beacon.
+    #[arg(long, value_enum, default_value_t = TelemetryEventArg::DailyActive)]
+    telemetry_event: TelemetryEventArg,
+}
+
+/// Clap-friendly mirror of [`TelemetryEventKind`].
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[clap(rename_all = "snake_case")]
+enum TelemetryEventArg {
+    /// First-run install beacon.
+    Install,
+    /// Self-update completed.
+    Update,
+    /// Once-per-UTC-day liveness beacon (default).
+    DailyActive,
+    /// First user-initiated chat turn.
+    FirstChatTurn,
+    /// User opted in to crash reports.
+    CrashOptIn,
+    /// Uninstall beacon (best-effort).
+    Uninstall,
+}
+
+impl From<TelemetryEventArg> for TelemetryEventKind {
+    fn from(value: TelemetryEventArg) -> Self {
+        match value {
+            TelemetryEventArg::Install => Self::Install,
+            TelemetryEventArg::Update => Self::Update,
+            TelemetryEventArg::DailyActive => Self::DailyActive,
+            TelemetryEventArg::FirstChatTurn => Self::FirstChatTurn,
+            TelemetryEventArg::CrashOptIn => Self::CrashOptIn,
+            TelemetryEventArg::Uninstall => Self::Uninstall,
+        }
+    }
 }
 
 /// Arguments for `stratum self-update`.
@@ -447,7 +502,7 @@ where
 
     match cli.command {
         None => print_greeting(&paths, out),
-        Some(Command::Doctor) => doctor(cli.json, &paths, out, err),
+        Some(Command::Doctor(doc_args)) => doctor(cli.json, &doc_args, &paths, out, err),
         Some(Command::Init) => init(cli.json, &paths, out, err),
         Some(Command::Echo { prompt, max_blocks }) => echo(cli.json, &prompt, max_blocks, out),
         Some(Command::Chat) => chat_command(&paths, err),
@@ -1032,6 +1087,12 @@ struct DoctorReport<'a> {
     sandbox: &'a SandboxReport,
     installed: bool,
     issues: Vec<DoctorIssue>,
+    /// Telemetry payload preview. `Some(_)` when `--telemetry` was passed
+    /// and the opt-out file did not disable telemetry; `None` when
+    /// `--telemetry` was omitted or the user disabled it via
+    /// `<state>/telemetry.json`. Serialized as the literal JSON `null` in the
+    /// `disabled`/omitted case so consumers see a stable key.
+    telemetry: Option<TelemetryPayload>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1041,7 +1102,13 @@ struct DoctorIssue {
     message: String,
 }
 
-fn doctor(json: bool, paths: &Paths, out: &mut dyn Write, _err: &mut dyn Write) -> ExitCode {
+fn doctor(
+    json: bool,
+    args: &DoctorArgs,
+    paths: &Paths,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     let probe = HardwareProbe::run();
     let tier = Tier::classify(&probe);
     let sandbox = SandboxReport::run();
@@ -1054,6 +1121,29 @@ fn doctor(json: bool, paths: &Paths, out: &mut dyn Write, _err: &mut dyn Write) 
             message: "no installed.toml found; run `stratum init`".into(),
         });
     }
+
+    // Telemetry assembly: only when --telemetry was requested. The opt-out
+    // file lives at <state>/telemetry.json. If telemetry is disabled, we
+    // skip assembly entirely (no install-id persistence either). If enabled
+    // (default when file is missing or malformed), we read or generate the
+    // anon install id and build the payload via the runtime helper.
+    let (telemetry, telemetry_disabled) = if args.telemetry {
+        let cfg = load_telemetry_config(paths);
+        if cfg.enabled {
+            match assemble_telemetry_payload(paths, args.telemetry_event.into(), tier, probe.gpu) {
+                Ok(payload) => (Some(payload), false),
+                Err(diag) => {
+                    let _ = writeln!(err, "{diag}");
+                    return ExitCode::from(1);
+                }
+            }
+        } else {
+            (None, true)
+        }
+    } else {
+        (None, false)
+    };
+
     let report = DoctorReport {
         schema_version: 1,
         stratum_version: env!("CARGO_PKG_VERSION"),
@@ -1063,6 +1153,7 @@ fn doctor(json: bool, paths: &Paths, out: &mut dyn Write, _err: &mut dyn Write) 
         sandbox: &sandbox,
         installed,
         issues,
+        telemetry: telemetry.clone(),
     };
 
     if json {
@@ -1075,22 +1166,174 @@ fn doctor(json: bool, paths: &Paths, out: &mut dyn Write, _err: &mut dyn Write) 
         if writeln!(out, "{rendered}").is_err() {
             return ExitCode::from(74);
         }
-    } else if writeln!(
-        out,
-        "stratum {} · tier={} · gpu={} · sandbox={} · ram={} MiB · cores={} · installed={}",
-        report.stratum_version,
-        tier,
-        probe.gpu,
-        sandbox.preferred(),
-        probe.ram_total_mib,
-        probe.cpu_cores,
-        installed
-    )
-    .is_err()
-    {
-        return ExitCode::from(74);
+    } else {
+        if writeln!(
+            out,
+            "stratum {} · tier={} · gpu={} · sandbox={} · ram={} MiB · cores={} · installed={}",
+            report.stratum_version,
+            tier,
+            probe.gpu,
+            sandbox.preferred(),
+            probe.ram_total_mib,
+            probe.cpu_cores,
+            installed
+        )
+        .is_err()
+        {
+            return ExitCode::from(74);
+        }
+        if args.telemetry {
+            if telemetry_disabled {
+                if writeln!(out, "--- telemetry: disabled ---").is_err() {
+                    return ExitCode::from(74);
+                }
+            } else if let Some(payload) = telemetry.as_ref() {
+                #[allow(
+                    clippy::expect_used,
+                    reason = "TelemetryPayload serialization is infallible (primitives only)"
+                )]
+                let rendered = serde_json::to_string_pretty(payload)
+                    .expect("TelemetryPayload serialization is infallible");
+                if writeln!(out, "--- telemetry ---\n{rendered}").is_err() {
+                    return ExitCode::from(74);
+                }
+            }
+        }
     }
     ExitCode::SUCCESS
+}
+
+/// Minimal on-disk shape of `<state>/telemetry.json` — the brief documents
+/// `{"enabled": bool}` as the user-facing schema. The runtime
+/// [`TelemetryConfig`] carries additional fields (endpoint, channel), but we
+/// only persist the opt-out bit; the rest is hard-coded for this PR.
+#[derive(serde::Deserialize)]
+struct TelemetryToggle {
+    enabled: bool,
+}
+
+/// Read `<state>/telemetry.json` if present and parse it; on missing-file or
+/// parse failure return the runtime default (enabled = true). Parse errors
+/// are logged at `warn` via tracing so an operator notices them in the log
+/// stream, but the command continues — telemetry is opt-out, not
+/// fail-closed.
+fn load_telemetry_config(paths: &Paths) -> TelemetryConfig {
+    let path = paths.state.join("telemetry.json");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TelemetryConfig::default(),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "telemetry config read failed; falling back to enabled=true",
+            );
+            return TelemetryConfig::default();
+        }
+    };
+    match serde_json::from_str::<TelemetryToggle>(&body) {
+        Ok(toggle) => TelemetryConfig {
+            enabled: toggle.enabled,
+            ..TelemetryConfig::default()
+        },
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "telemetry config parse failed; falling back to enabled=true",
+            );
+            TelemetryConfig::default()
+        }
+    }
+}
+
+/// Load or create the persistent anonymous install id at
+/// `<state>/anon_install_id`. A missing or malformed file is replaced with a
+/// freshly generated id, written atomically (`<path>.tmp` + rename).
+fn load_or_create_anon_install_id(paths: &Paths) -> Result<AnonInstallId, String> {
+    if let Err(e) = std::fs::create_dir_all(&paths.state) {
+        return Err(format!(
+            "STRAT-E1001 cannot create {}: {e}",
+            paths.state.display()
+        ));
+    }
+    let path = paths.state.join("anon_install_id");
+    match std::fs::read_to_string(&path) {
+        Ok(body) => {
+            let trimmed = body.trim();
+            match AnonInstallId::from_str(trimmed) {
+                Ok(id) => Ok(id),
+                Err(parse_err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %parse_err,
+                        "anon install id parse failed; regenerating",
+                    );
+                    let fresh = AnonInstallId::new_random();
+                    write_anon_install_id(&path, &fresh)?;
+                    Ok(fresh)
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let fresh = AnonInstallId::new_random();
+            write_anon_install_id(&path, &fresh)?;
+            Ok(fresh)
+        }
+        Err(e) => Err(format!("STRAT-E1001 cannot read {}: {e}", path.display())),
+    }
+}
+
+fn write_anon_install_id(path: &Path, id: &AnonInstallId) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, id.as_str())
+        .map_err(|e| format!("STRAT-E1001 cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("STRAT-E1001 cannot rename {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Assemble the telemetry payload for the doctor command. Caller has already
+/// verified that telemetry is enabled.
+fn assemble_telemetry_payload(
+    paths: &Paths,
+    event: TelemetryEventKind,
+    tier: Tier,
+    gpu: GpuBackend,
+) -> Result<TelemetryPayload, String> {
+    let install_id = load_or_create_anon_install_id(paths)?;
+    let cfg = TelemetryConfig {
+        channel: ReleaseChannel::Stable,
+        ..TelemetryConfig::default()
+    };
+    let os = match std::env::consts::OS {
+        "macos" => OsTag::MacOS,
+        "linux" => OsTag::Linux,
+        "windows" => OsTag::Windows,
+        _ => OsTag::Other,
+    };
+    let cpu_arch = match std::env::consts::ARCH {
+        "x86_64" => CpuArchTag::X86_64,
+        "aarch64" => CpuArchTag::Aarch64,
+        _ => CpuArchTag::Other,
+    };
+    let tier_str = tier.to_string();
+    let gpu_str = gpu.to_string();
+    let payload = build_telemetry_payload(
+        &cfg,
+        &install_id,
+        env!("CARGO_PKG_VERSION"),
+        event,
+        &tier_str,
+        &gpu_str,
+        os,
+        cpu_arch,
+        SystemTime::now(),
+    );
+    // Defense-in-depth: a future field expansion must touch the allowlist.
+    // If it doesn't, fail loudly here rather than silently leak data.
+    telemetry_payload_is_allowlisted(&payload).map_err(|e| format!("STRAT-E1001 {e}"))?;
+    Ok(payload)
 }
 
 fn init(json: bool, paths: &Paths, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
