@@ -1,0 +1,70 @@
+name: provider-llama-cpp
+
+# Off the per-PR critical path. Exercises the heavy llama.cpp build only
+# when a maintainer asks for it, on a nightly cron, or right before a
+# release tag is published.
+on:
+  workflow_dispatch:
+  schedule:
+    # 06:00 UTC nightly.
+    - cron: '0 6 * * *'
+  release:
+    types: [created]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build + test (${{ matrix.os }})
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            features: provider-llama-cpp
+          - os: ubuntu-latest
+            features: provider-llama-cpp
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Cold cache for this workflow is multi-minute; partition by
+          # OS so the macOS + Linux runs do not stomp each other.
+          key: ${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install build deps (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install cmake
+
+      - name: Install build deps (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+
+      - name: cargo build
+        run: cargo build --workspace --features ${{ matrix.features }}
+
+      - name: cargo test
+        run: cargo test --workspace --features ${{ matrix.features }} --no-fail-fast
+
+      - name: Smoke check — feature-gated module is wired
+        # Belt-and-braces sanity check that the scaffold module compiled
+        # into the rlib. If this ever fails the CI escape hatch has
+        # silently regressed.
+        run: |
+          cargo rustc --package stratum-runtime --features ${{ matrix.features }} --lib -- --emit=dep-info
+          test -f target/debug/deps/stratum_runtime.d || (echo "stratum-runtime build artifact missing" && exit 1)

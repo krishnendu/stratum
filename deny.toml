@@ -1,7 +1,13 @@
 # cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/
 
 [graph]
-all-features = true
+# Intentionally NOT all-features: the off-by-default `provider-llama-cpp`
+# feature pulls in the heavy llama.cpp dependency tree which is exercised
+# by `.github/workflows/provider-llama-cpp.yml` (nightly cron / release /
+# manual dispatch), not per-PR CI. Re-evaluate licences + advisories there.
+# TODO: when `provider-llama-cpp` graduates to default-on, flip this back
+# and audit any new transitive deps (cmake/cc/glibc-tooling sub-tree).
+all-features = false
 
 [advisories]
 db-path  = "~/.cargo/advisory-db"

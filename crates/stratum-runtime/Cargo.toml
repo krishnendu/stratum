@@ -15,8 +15,17 @@ categories   = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+default = []
+# Pulls in the optional `llama-cpp-2` crate and compiles the
+# `LlamaCppProvider` scaffold. Off by default; the heavy llama.cpp build
+# is exercised by the `provider-llama-cpp` workflow (nightly cron, release
+# tag, manual dispatch) — not per-PR CI.
+provider-llama-cpp = ["dep:llama-cpp-2"]
+
 [dependencies]
 stratum-types      = { path = "../stratum-types" }
+llama-cpp-2        = { workspace = true, optional = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 toml_edit          = { workspace = true, features = ["serde"] }

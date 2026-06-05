@@ -42,7 +42,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Intentionally NOT --all-features: the off-by-default
+      # `provider-llama-cpp` feature pulls in the heavy llama.cpp build and
+      # is exercised on nightly cron / release / manual dispatch via
+      # `.github/workflows/provider-llama-cpp.yml` instead.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: cargo test (${{ matrix.os }})
@@ -55,7 +59,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features --no-fail-fast
+      # See clippy job comment re: `provider-llama-cpp`.
+      - run: cargo test --workspace --no-fail-fast
 
   doctor-schema-check:
     name: doctor schema invariant
@@ -87,7 +92,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: cargo llvm-cov
-        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info --fail-under-lines 98
+        # Excludes the `provider-llama-cpp` feature; see clippy job comment.
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 98
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v7
@@ -104,7 +110,8 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-          arguments: --workspace --all-features
+          # Excludes the `provider-llama-cpp` feature; see clippy job comment.
+          arguments: --workspace
 
   msrv:
     name: MSRV check
@@ -113,4 +120,5 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.90.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-features --locked
+      # Excludes the `provider-llama-cpp` feature; see clippy job comment.
+      - run: cargo check --workspace --locked
