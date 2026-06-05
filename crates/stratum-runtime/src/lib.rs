@@ -52,7 +52,7 @@ pub mod workspace;
 pub use agents::{AgentBudget, AgentDef, AgentLoader};
 pub use cancel::CancelToken;
 pub use download::{InstallReport, ModelInstaller};
-pub use gate::{MemoryGate, DEFAULT_MARGIN_MIB};
+pub use gate::{LoadedModel, MemoryGate, DEFAULT_MARGIN_MIB};
 pub use injection::{fence, is_suspicious, suspicion_score, FenceSource, SUSPICION_THRESHOLD};
 pub use install::{InstalledToml, TierInputs};
 pub use paths::Paths;
