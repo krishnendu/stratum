@@ -18,8 +18,13 @@
     clippy::redundant_pub_crate,
     reason = "internal API kept pub for documentation; module itself is private"
 )]
+#![allow(
+    dead_code,
+    reason = "EventEmitter wiring is exposed for the upcoming JSONL CLI path and TUI events panel; kept pub even though the bin build does not yet consume it"
+)]
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -34,8 +39,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as TuiBlock, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use stratum_runtime::{
-    format_tokens_per_second, CancelToken, EchoProvider, GenerateRequest, Paths, Provider,
-    RoleTimer, Tier, TurnId, TurnMetrics, TurnRecorder,
+    format_tokens_per_second, CancelToken, EchoProvider, Event as RtEvent, EventEmitter,
+    EventRecord, GenerateRequest, MemoryEventSink, Paths, Provider, RoleTimer, Tier, TurnId,
+    TurnMetrics, TurnRecorder,
 };
 use stratum_types::{Block, ModelId, StratumResult};
 
@@ -69,12 +75,31 @@ pub struct ChatState {
     next_turn_id: u64,
     /// Metrics from the most recently completed turn (renders in status bar).
     last_metrics: Option<TurnMetrics>,
+    /// Structured-event emitter wired into each completed turn.
+    ///
+    /// Defaults to an in-process [`MemoryEventSink`]; the CLI binary may
+    /// inject a JSONL-backed sink via [`ChatState::with_events`].
+    pub events: Arc<EventEmitter>,
+    /// In-memory sink handle, when the emitter is backed by [`MemoryEventSink`].
+    ///
+    /// `None` after [`ChatState::with_events`] is called with a non-memory
+    /// emitter — the emitter's sink is opaque (no `Any` bound on the trait),
+    /// so we track the typed handle alongside it for snapshotting.
+    memory_sink: Option<Arc<MemoryEventSink>>,
+}
+
+impl Default for ChatState {
+    fn default() -> Self {
+        Self::new(EchoProvider::default(), Tier::High, String::new())
+    }
 }
 
 impl ChatState {
     /// Build a fresh state with the given header (status bar) and tier.
     #[must_use]
     pub fn new(provider: EchoProvider, tier: Tier, status: String) -> Self {
+        let sink = Arc::new(MemoryEventSink::new());
+        let events = Arc::new(EventEmitter::new(sink.clone()));
         Self {
             transcript: Vec::new(),
             input: String::new(),
@@ -86,7 +111,31 @@ impl ChatState {
             palette: None,
             next_turn_id: 0,
             last_metrics: None,
+            events,
+            memory_sink: Some(sink),
         }
+    }
+
+    /// Replace the structured-event emitter (e.g. with a JSONL-backed one).
+    ///
+    /// The default [`MemoryEventSink`] handle is dropped; calls to
+    /// [`Self::events_snapshot`] will return `None` afterwards.
+    #[must_use]
+    pub fn with_events(mut self, events: Arc<EventEmitter>) -> Self {
+        self.events = events;
+        self.memory_sink = None;
+        self
+    }
+
+    /// Snapshot the in-memory event log if the emitter is backed by a
+    /// [`MemoryEventSink`].
+    ///
+    /// Returns `None` when [`Self::with_events`] swapped in an opaque sink
+    /// (the trait does not carry an `Any` bound, so the runtime sink type is
+    /// not recoverable from the emitter alone).
+    #[must_use]
+    pub fn events_snapshot(&self) -> Option<Vec<EventRecord>> {
+        self.memory_sink.as_ref().map(|sink| sink.snapshot())
     }
 
     /// Borrow the last recorded turn metrics, if any. Used by tests.
@@ -177,16 +226,54 @@ impl ChatState {
             prompt: prompt.clone(),
             max_blocks: 64,
         };
+        let role_timer = RoleTimer::start();
+        let blocks = self.provider.generate(&request, &self.cancel);
+        let step_ms = role_timer.stop_ms();
+        let provider_id = self.provider.id().to_string();
+        self.finish_turn(prompt, blocks, &provider_id, step_ms);
+    }
+
+    /// Record a completed turn: emit structured events for the generated
+    /// blocks, update metrics, and append the user / assistant transcript
+    /// entries.
+    ///
+    /// Factored out of [`Self::submit`] so tests can drive the event-emission
+    /// path with synthetic block streams.
+    fn finish_turn(&mut self, prompt: String, blocks: Vec<Block>, provider_id: &str, step_ms: u32) {
         let turn_id = TurnId(self.next_turn_id);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
-        let role_timer = RoleTimer::start();
         let mut recorder = TurnRecorder::new(turn_id);
-        let blocks = self.provider.generate(&request, &self.cancel);
         for block in &blocks {
             recorder.record_block(block);
         }
-        recorder.record_step("generate", role_timer.stop_ms());
+        recorder.record_step("generate", step_ms);
         self.last_metrics = Some(recorder.finish());
+
+        // No blocks at all on a non-empty prompt = provider failure.
+        if blocks.is_empty() {
+            self.events.emit(
+                RtEvent::ProviderError {
+                    provider: provider_id.to_string(),
+                    code: "E_NO_BLOCKS".to_string(),
+                    message: "provider returned no blocks".to_string(),
+                },
+                Some(turn_id.0),
+            );
+        } else {
+            for block in &blocks {
+                if let Block::ToolCall { id, .. } = block {
+                    self.events.emit(
+                        RtEvent::ToolCall {
+                            tool_id: id.clone(),
+                            ok: true,
+                            duration_ms: u64::from(step_ms),
+                        },
+                        Some(turn_id.0),
+                    );
+                }
+            }
+        }
+
         self.transcript.push(Turn::User(prompt));
         self.transcript.push(Turn::Assistant(blocks));
     }
@@ -371,9 +458,13 @@ fn map_io_error(err: io::Error) -> stratum_types::StratumError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::thread;
+
     use crossterm::event::KeyCode;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use stratum_runtime::EventSink;
 
     use super::*;
 
@@ -749,5 +840,177 @@ mod tests {
         step(&mut terminal, &mut s, Some(&evt)).unwrap();
         assert_eq!(s.input(), "");
         assert!(!s.should_quit());
+    }
+
+    // ---------- structured-event instrumentation ----------
+
+    /// Drop-in `EventSink` for the "opaque sink" `with_events` test.
+    #[derive(Debug, Default)]
+    struct NullSink;
+    impl EventSink for NullSink {
+        fn write(&self, _record: EventRecord) {}
+    }
+
+    #[test]
+    fn default_state_has_memory_event_emitter() {
+        let s = ChatState::default();
+        // Default sink is memory-backed -> snapshot is observable and empty.
+        let snap = s.events_snapshot().expect("memory snapshot available");
+        assert!(snap.is_empty());
+    }
+
+    #[test]
+    fn echo_submit_emits_no_events() {
+        let mut s = state();
+        for c in "hello world".chars() {
+            s.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        // EchoProvider returns Text + Usage + Done only — none of which
+        // generate ToolCall events, and the block list is non-empty so no
+        // ProviderError either.
+        let snap = s.events_snapshot().expect("memory snapshot");
+        assert!(snap.is_empty(), "got events: {snap:?}");
+    }
+
+    #[test]
+    fn submit_with_zero_blocks_emits_provider_error() {
+        let mut s = state();
+        s.finish_turn("hi".to_string(), Vec::new(), "echo", 0);
+        let snap = s.events_snapshot().expect("memory snapshot");
+        assert_eq!(snap.len(), 1);
+        let RtEvent::ProviderError {
+            provider,
+            code,
+            message,
+        } = &snap[0].event
+        else {
+            panic!("expected ProviderError, got {:?}", snap[0].event);
+        };
+        assert_eq!(provider, "echo");
+        assert_eq!(code, "E_NO_BLOCKS");
+        assert!(!message.is_empty());
+    }
+
+    #[test]
+    fn tool_call_block_emits_tool_call_event() {
+        let mut s = state();
+        let blocks = vec![
+            Block::ToolCall {
+                id: "t1".into(),
+                tool: "fs.read".into(),
+                args: "{}".into(),
+            },
+            Block::Done,
+        ];
+        s.finish_turn("run".to_string(), blocks, "echo", 7);
+        let snap = s.events_snapshot().expect("memory snapshot");
+        assert_eq!(snap.len(), 1);
+        let RtEvent::ToolCall {
+            tool_id,
+            ok,
+            duration_ms,
+        } = &snap[0].event
+        else {
+            panic!("expected ToolCall, got {:?}", snap[0].event);
+        };
+        assert_eq!(tool_id, "t1");
+        assert!(*ok);
+        assert_eq!(*duration_ms, 7);
+        assert_eq!(snap[0].turn_id, Some(0));
+    }
+
+    #[test]
+    fn events_snapshot_aggregates_across_submits() {
+        let mut s = state();
+        // First turn: tool call.
+        s.finish_turn(
+            "a".to_string(),
+            vec![Block::ToolCall {
+                id: "t1".into(),
+                tool: "fs.read".into(),
+                args: "{}".into(),
+            }],
+            "echo",
+            1,
+        );
+        // Second turn: provider error (zero blocks).
+        s.finish_turn("b".to_string(), Vec::new(), "echo", 2);
+        // Third turn: clean text turn — no events.
+        s.finish_turn(
+            "c".to_string(),
+            vec![Block::Text { text: "ok".into() }],
+            "echo",
+            3,
+        );
+        let snap = s.events_snapshot().expect("memory snapshot");
+        assert_eq!(snap.len(), 2);
+        assert!(matches!(snap[0].event, RtEvent::ToolCall { .. }));
+        assert!(matches!(snap[1].event, RtEvent::ProviderError { .. }));
+        assert_eq!(snap[0].turn_id, Some(0));
+        assert_eq!(snap[1].turn_id, Some(1));
+    }
+
+    #[test]
+    fn with_events_non_memory_sink_yields_none_snapshot() {
+        let sink: Arc<dyn EventSink> = Arc::new(NullSink);
+        let emitter = Arc::new(EventEmitter::new(sink));
+        let s = state().with_events(emitter);
+        assert!(s.events_snapshot().is_none());
+    }
+
+    #[test]
+    fn with_events_swaps_emitter_target() {
+        // Build a memory sink we own and watch directly.
+        let sink = Arc::new(MemoryEventSink::new());
+        let sink_dyn: Arc<dyn EventSink> = sink.clone();
+        let emitter = Arc::new(EventEmitter::new(sink_dyn));
+        let mut s = state().with_events(emitter);
+        s.finish_turn("x".to_string(), Vec::new(), "echo", 0);
+        // ChatState no longer has its own MemoryEventSink handle.
+        assert!(s.events_snapshot().is_none());
+        // But the externally-owned sink received the event.
+        let external = sink.snapshot();
+        assert_eq!(external.len(), 1);
+        assert!(matches!(external[0].event, RtEvent::ProviderError { .. }));
+    }
+
+    #[test]
+    fn concurrent_submits_produce_monotonic_event_ids() {
+        // Drive the emitter directly from many threads through a shared
+        // ChatState-style emitter. We can't share &mut ChatState across
+        // threads, so exercise the emitter that backs it.
+        let sink = Arc::new(MemoryEventSink::new());
+        let sink_dyn: Arc<dyn EventSink> = sink.clone();
+        let emitter = Arc::new(EventEmitter::new(sink_dyn));
+        let mut handles = Vec::new();
+        for t in 0..4_u64 {
+            let em = emitter.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..50_u64 {
+                    em.emit(
+                        RtEvent::ProviderError {
+                            provider: "echo".to_string(),
+                            code: "E_NO_BLOCKS".to_string(),
+                            message: "x".to_string(),
+                        },
+                        Some(t),
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+        let snap = sink.snapshot();
+        assert_eq!(snap.len(), 200);
+        let mut ids: Vec<u64> = snap.iter().map(|r| r.id).collect();
+        ids.sort_unstable();
+        // Strictly monotonic, unique, starting at 1.
+        assert_eq!(*ids.first().expect("first"), 1);
+        assert_eq!(*ids.last().expect("last"), 200);
+        let mut dedup = ids.clone();
+        dedup.dedup();
+        assert_eq!(dedup.len(), ids.len());
     }
 }
