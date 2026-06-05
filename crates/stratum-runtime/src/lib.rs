@@ -70,6 +70,8 @@ pub mod telemetry;
 pub mod tier;
 /// Tool registry and capability matrix.
 pub mod tools;
+/// On-disk conversation-transcript shape + atomic JSON store.
+pub mod transcript;
 /// `stratum self-update` channel-manifest data shape (Phase 1 scaffold).
 pub mod update_manifest;
 /// Workspace / project discovery (`stratum.toml`, `.stratumignore`).
@@ -132,6 +134,10 @@ pub use telemetry::{
 };
 pub use tier::Tier;
 pub use tools::{CapabilityEntry, CapabilityMatrix};
+pub use transcript::{
+    redact_pii, SessionId, SessionIdError, Transcript, TranscriptBlock, TranscriptBlockKind,
+    TranscriptError, TranscriptStore, TranscriptTurn, TRANSCRIPT_SCHEMA_VERSION,
+};
 pub use update_manifest::{
     evaluate, ArtifactRef as UpdateArtifactRef, ArtifactRefError as UpdateArtifactRefError,
     ManifestError, PlatformTag, ReleaseEntry, ReleaseVersion, ReleaseVersionError, UpdateChannel,
