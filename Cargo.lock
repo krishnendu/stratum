@@ -1315,6 +1315,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "stratum-eval"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "stratum-runtime",
+ "stratum-types",
+ "tempfile",
+]
+
+[[package]]
 name = "stratum-runtime"
 version = "0.0.0"
 dependencies = [
