@@ -30,6 +30,8 @@ pub mod embedder;
 /// Refuses model loads when free RAM minus the would-be hot footprint falls
 /// below the configured margin.
 pub mod gate;
+/// Fluent-style i18n catalog + lookup (Phase 1 scaffold).
+pub mod i18n;
 /// Prompt-injection defense primitives.
 pub mod injection;
 /// First-run install record and atomic TOML writer.
@@ -106,6 +108,10 @@ pub use embedder::{
     InMemoryVectorStore,
 };
 pub use gate::{LoadedModel, MemoryGate, DEFAULT_MARGIN_MIB};
+pub use i18n::{
+    parse_simple_ftl, FluentArg, I18nBundle, I18nError, LocaleId, LocaleIdError, Message,
+    MessageCatalog, MessageId, MessageIdError,
+};
 pub use injection::{fence, is_suspicious, suspicion_score, FenceSource, SUSPICION_THRESHOLD};
 pub use install::{
     backup_path, load_with_migration, restore_backup, save_atomic, InstallIoError,
