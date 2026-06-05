@@ -28,6 +28,8 @@ pub mod injection;
 pub mod install;
 /// `tracing` subscriber initialization with env-filter + file output.
 pub mod logging;
+/// MCP client + server data shapes (Phase 3 data-only scaffold for Phase 6).
+pub mod mcp;
 /// Turn-level observability primitives: token meter, latency steps, tok/s.
 pub mod observability;
 /// Panic hook + crash report file writer.
@@ -62,6 +64,10 @@ pub use download::{InstallReport, ModelInstaller};
 pub use gate::{LoadedModel, MemoryGate, DEFAULT_MARGIN_MIB};
 pub use injection::{fence, is_suspicious, suspicion_score, FenceSource, SUSPICION_THRESHOLD};
 pub use install::{InstalledToml, TierInputs};
+pub use mcp::{
+    McpServeTransport, McpServerConfig, McpServerExpose, McpServerSet, McpServerStatus,
+    McpTransport,
+};
 pub use observability::{
     format_tokens_per_second, RoleStep, RoleTimer, TurnId, TurnIdGen, TurnMetrics, TurnRecorder,
 };
