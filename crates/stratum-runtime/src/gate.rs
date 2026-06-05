@@ -5,9 +5,23 @@
 //! [`HardwareProbe`] and a [`MemEstimate`]; it does no IO.
 
 use stratum_types::error::codes::E3007_MODEL_LOAD_REFUSED;
-use stratum_types::{MemEstimate, StratumError, StratumResult};
+use stratum_types::{MemEstimate, ModelId, StratumError, StratumResult};
 
 use crate::probe::HardwareProbe;
+
+/// A currently-resident model the gate may suggest unloading to free room for a
+/// candidate load. Carried by the runtime's "active set" bookkeeping; the gate
+/// itself never mutates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedModel {
+    /// Stable identifier of the resident model.
+    pub id: ModelId,
+    /// Memory estimate of the resident model.
+    pub estimate: MemEstimate,
+    /// Optional role hint (e.g. `"router"`, `"planner"`) the caller may render
+    /// alongside the unload suggestion. Not consumed by the gate itself.
+    pub role_hint: Option<String>,
+}
 
 /// Default safety margin in mebibytes (1 GiB).
 pub const DEFAULT_MARGIN_MIB: u32 = 1024;
@@ -88,6 +102,102 @@ impl MemoryGate {
         );
         Err(StratumError::new(E3007_MODEL_LOAD_REFUSED, message)
             .with_hint("free RAM or pick a smaller model"))
+    }
+
+    /// Suggest the smallest set of currently-loaded model ids whose unload
+    /// would free enough RAM for `candidate` (at `context_tokens` planned
+    /// length) plus the gate's margin.
+    ///
+    /// Strategy: sort `loaded` by `estimate.hot_ram_mib(0)` descending and
+    /// take from the head until the cumulative freed bytes plus the currently
+    /// available bytes meet `needed + margin`. The greedy traversal stops as
+    /// soon as the condition is met.
+    ///
+    /// Returns an empty `Vec` when no subset (including the full list) can
+    /// satisfy the requirement — callers must not interpret an empty result
+    /// as a partial suggestion.
+    #[must_use]
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "matches `check`/`would_fit` so callers hold a single &MemoryGate"
+    )]
+    pub fn suggest_unloads(
+        &self,
+        probe: &HardwareProbe,
+        candidate: &MemEstimate,
+        context_tokens: u32,
+        loaded: &[LoadedModel],
+    ) -> Vec<ModelId> {
+        let needed_mib = candidate.hot_ram_mib(context_tokens);
+        let required_mib = u64::from(needed_mib).saturating_add(u64::from(self.margin_mib));
+        let available_mib = u64::from(probe.ram_available_mib);
+        // Already fits — nothing to suggest.
+        if available_mib >= required_mib {
+            return Vec::new();
+        }
+        let deficit_mib = required_mib.saturating_sub(available_mib);
+
+        // Sort by hot footprint (at zero context) descending.
+        let mut ordered: Vec<&LoadedModel> = loaded.iter().collect();
+        ordered.sort_by(|a, b| {
+            b.estimate
+                .hot_ram_mib(0)
+                .cmp(&a.estimate.hot_ram_mib(0))
+                .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+        });
+
+        let mut freed: u64 = 0;
+        let mut picks: Vec<ModelId> = Vec::new();
+        for entry in ordered {
+            freed = freed.saturating_add(u64::from(entry.estimate.hot_ram_mib(0)));
+            picks.push(entry.id.clone());
+            if freed >= deficit_mib {
+                return picks;
+            }
+        }
+        // Even unloading everything isn't enough.
+        Vec::new()
+    }
+
+    /// Like [`Self::check`], but consults the active set so the refusal error
+    /// can include an "unload X, Y" hint when a feasible suggestion exists.
+    ///
+    /// When `suggest_unloads` returns a non-empty list, the message ends with
+    /// a `hint: unload <ids>` line embedded inline. When it returns empty, the
+    /// error carries the same `"free RAM or pick a smaller model"` static hint
+    /// as [`Self::check`].
+    ///
+    /// # Errors
+    /// Returns `Err(STRAT-E3007)` when `available - needed < margin`.
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "matches `check`/`would_fit` so callers hold a single &MemoryGate"
+    )]
+    pub fn check_with(
+        &self,
+        probe: &HardwareProbe,
+        candidate: &MemEstimate,
+        context_tokens: u32,
+        loaded: &[LoadedModel],
+    ) -> StratumResult<()> {
+        if self.would_fit(probe, candidate, context_tokens) {
+            return Ok(());
+        }
+        let needed_mib = candidate.hot_ram_mib(context_tokens);
+        let free_gb = mib_to_gb_one_decimal(probe.ram_available_mib);
+        let needed_gb = mib_to_gb_one_decimal(needed_mib);
+        let margin_gb = mib_to_gb_one_decimal(self.margin_mib);
+        let base = format!(
+            "free {free_gb} GB, would need {needed_gb} GB hot, {margin_gb} GB margin required"
+        );
+        let suggestion = self.suggest_unloads(probe, candidate, context_tokens, loaded);
+        if suggestion.is_empty() {
+            return Err(StratumError::new(E3007_MODEL_LOAD_REFUSED, base)
+                .with_hint("free RAM or pick a smaller model"));
+        }
+        let ids: Vec<&str> = suggestion.iter().map(ModelId::as_str).collect();
+        let message = format!("{base}\nhint: unload {}", ids.join(", "));
+        Err(StratumError::new(E3007_MODEL_LOAD_REFUSED, message))
     }
 }
 
@@ -253,5 +363,185 @@ mod tests {
         let a = MemoryGate::new(512);
         let b = a;
         assert_eq!(a, b);
+    }
+
+    fn loaded(id: &str, weight: u32) -> LoadedModel {
+        LoadedModel {
+            id: ModelId::from(id),
+            estimate: estimate(weight, 0, 0),
+            role_hint: None,
+        }
+    }
+
+    #[test]
+    fn suggest_unloads_empty_when_already_fits() {
+        // Already fits — suggestion is empty regardless of loaded set.
+        let gate = MemoryGate::default();
+        let probe = probe_with(8_000);
+        let est = estimate(3_000, 0, 0);
+        let resident = vec![loaded("router", 1000), loaded("polisher", 500)];
+        let picks = gate.suggest_unloads(&probe, &est, 0, &resident);
+        assert!(picks.is_empty());
+    }
+
+    #[test]
+    fn suggest_unloads_empty_loaded_returns_empty() {
+        // No room and nothing to free → empty (don't return a partial).
+        let gate = MemoryGate::default();
+        let probe = probe_with(500);
+        let est = estimate(3_000, 0, 0);
+        let picks = gate.suggest_unloads(&probe, &est, 0, &[]);
+        assert!(picks.is_empty());
+    }
+
+    #[test]
+    fn suggest_unloads_single_large_model_suffices() {
+        // free 1.5 GiB, need 2 GiB + 1 GiB margin = 3 GiB → deficit 1.5 GiB.
+        // The 2 GiB model alone covers it.
+        let gate = MemoryGate::default();
+        let probe = probe_with(1_536);
+        let est = estimate(2_048, 0, 0);
+        let resident = vec![loaded("planner", 2_048), loaded("router", 256)];
+        let picks = gate.suggest_unloads(&probe, &est, 0, &resident);
+        assert_eq!(picks, vec![ModelId::from("planner")]);
+    }
+
+    #[test]
+    fn suggest_unloads_two_small_models_needed() {
+        // free 0, need 2 GiB + 1 GiB margin = 3 GiB → deficit 3 GiB.
+        // Largest is 2 GiB, then 1 GiB → both required.
+        let gate = MemoryGate::default();
+        let probe = probe_with(0);
+        let est = estimate(2_048, 0, 0);
+        let resident = vec![
+            loaded("planner", 1_024),
+            loaded("polisher", 2_048),
+            loaded("router", 256),
+        ];
+        let picks = gate.suggest_unloads(&probe, &est, 0, &resident);
+        // Largest first: polisher (2048), then planner (1024) — cumulative 3072 >= 3072.
+        assert_eq!(
+            picks,
+            vec![ModelId::from("polisher"), ModelId::from("planner")]
+        );
+    }
+
+    #[test]
+    fn suggest_unloads_no_combination_possible_returns_empty() {
+        // free 0, need 8 GiB + 1 GiB margin = 9 GiB. Resident pool is 1 GiB total.
+        let gate = MemoryGate::default();
+        let probe = probe_with(0);
+        let est = estimate(8_192, 0, 0);
+        let resident = vec![loaded("planner", 512), loaded("router", 512)];
+        let picks = gate.suggest_unloads(&probe, &est, 0, &resident);
+        assert!(picks.is_empty(), "got: {picks:?}");
+    }
+
+    #[test]
+    fn suggest_unloads_orders_largest_first() {
+        // Three residents; only the largest is needed.
+        let gate = MemoryGate::default();
+        let probe = probe_with(0);
+        let est = estimate(2_000, 0, 0);
+        let resident = vec![
+            loaded("small", 100),
+            loaded("medium", 1_000),
+            loaded("big", 3_500),
+        ];
+        let picks = gate.suggest_unloads(&probe, &est, 0, &resident);
+        assert_eq!(picks, vec![ModelId::from("big")]);
+    }
+
+    #[test]
+    fn suggest_unloads_context_tokens_increase_pressure() {
+        // At ctx=0 the candidate fits; at huge ctx it doesn't and we need
+        // to suggest an unload.
+        let gate = MemoryGate::default();
+        let probe = probe_with(4_000);
+        let est = estimate(2_000, 4096, 0);
+        // Big enough resident that unloading it always satisfies the deficit.
+        let resident = vec![loaded("planner", 8_192)];
+        // At ctx=0: needed=2000, +margin 1024 → 3024 < 4000 avail → fits → no suggestion.
+        assert!(gate.suggest_unloads(&probe, &est, 0, &resident).is_empty());
+        // At 1M tokens, KV ≈ 3906 MiB → needed ≈ 5906 → deficit ≈ 2930 → planner covers.
+        let picks = gate.suggest_unloads(&probe, &est, 1_000_000, &resident);
+        assert_eq!(picks, vec![ModelId::from("planner")]);
+    }
+
+    #[test]
+    fn suggest_unloads_respects_custom_margin() {
+        // Lax margin → no unload needed; strict margin → unload needed.
+        let lax = MemoryGate::new(0);
+        let strict = MemoryGate::new(4_096);
+        let probe = probe_with(4_500);
+        let est = estimate(3_000, 0, 0);
+        // Strict: required = 3000 + 4096 = 7096, avail 4500 → deficit 2596.
+        // A 3000 MiB resident covers it; lax case fits outright.
+        let resident = vec![loaded("router", 3_000)];
+        assert!(lax.suggest_unloads(&probe, &est, 0, &resident).is_empty());
+        let picks = strict.suggest_unloads(&probe, &est, 0, &resident);
+        assert_eq!(picks, vec![ModelId::from("router")]);
+    }
+
+    #[test]
+    fn check_with_ok_path_when_fits() {
+        let gate = MemoryGate::default();
+        let probe = probe_with(8_000);
+        let est = estimate(2_000, 0, 0);
+        let resident = vec![loaded("router", 500)];
+        assert!(gate.check_with(&probe, &est, 0, &resident).is_ok());
+    }
+
+    #[test]
+    fn check_with_refused_includes_unload_hint() {
+        let gate = MemoryGate::default();
+        let probe = probe_with(1_536);
+        let est = estimate(2_048, 0, 0);
+        let resident = vec![loaded("planner", 2_048)];
+        let err = gate.check_with(&probe, &est, 0, &resident).unwrap_err();
+        assert_eq!(err.code().as_str(), "STRAT-E3007");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("hint: unload planner"), "{rendered}");
+    }
+
+    #[test]
+    fn check_with_refused_falls_back_to_static_hint_when_no_combination() {
+        let gate = MemoryGate::default();
+        let probe = probe_with(0);
+        let est = estimate(8_192, 0, 0);
+        let resident = vec![loaded("router", 64)];
+        let err = gate.check_with(&probe, &est, 0, &resident).unwrap_err();
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("free RAM or pick a smaller model"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("hint: unload"), "{rendered}");
+    }
+
+    #[test]
+    fn check_with_refused_empty_loaded_uses_static_hint() {
+        let gate = MemoryGate::default();
+        let probe = probe_with(400);
+        let est = estimate(3_000, 0, 0);
+        let err = gate.check_with(&probe, &est, 0, &[]).unwrap_err();
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("free RAM or pick a smaller model"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn loaded_model_round_trip_fields() {
+        let lm = LoadedModel {
+            id: ModelId::from("planner"),
+            estimate: estimate(2_048, 0, 0),
+            role_hint: Some("planner".into()),
+        };
+        assert_eq!(lm.id.as_str(), "planner");
+        assert_eq!(lm.role_hint.as_deref(), Some("planner"));
+        let cloned = lm.clone();
+        assert_eq!(lm, cloned);
     }
 }

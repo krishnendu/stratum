@@ -9,7 +9,8 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use stratum_runtime::{
     CancelToken, EchoProvider, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml,
-    MemoryGate, ModelInstaller, Paths, Provider, SandboxReport, Tier, DEFAULT_MARGIN_MIB,
+    LoadedModel, MemoryGate, ModelInstaller, Paths, Provider, SandboxReport, Tier,
+    DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::OffsetDateTime;
@@ -77,6 +78,12 @@ struct MemCheckArgs {
     /// Override the safety margin, in mebibytes.
     #[arg(long, default_value_t = DEFAULT_MARGIN_MIB)]
     margin: u32,
+    /// Currently-loaded model, repeatable. Each value is formatted
+    /// `model_id:weight_rss_mib:kv_per_token_bytes:context_tokens` (four
+    /// colon-separated fields). On refusal, the gate suggests which of these
+    /// to unload to free room. Pass the flag once per resident model.
+    #[arg(long = "loaded", value_name = "SPEC")]
+    loaded: Vec<String>,
 }
 
 /// Subcommands under `stratum models`.
@@ -318,6 +325,44 @@ struct MemCheckErr {
     free_mib: u32,
     needed_mib: u32,
     margin_mib: u32,
+    suggested_unloads: Vec<String>,
+}
+
+/// Parse a single `--loaded model_id:weight_rss_mib:kv_per_token_bytes:context_tokens`
+/// spec into a [`LoadedModel`] plus the planned context length that will be
+/// charged to the candidate (we use the max across resident specs to be
+/// conservative; the per-model context only feeds the gate's `hot_ram_mib`).
+fn parse_loaded_spec(spec: &str) -> Result<(LoadedModel, u32), String> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() != 4 {
+        return Err(format!(
+            "expected 4 colon-separated fields in --loaded \"{spec}\""
+        ));
+    }
+    let id = parts[0];
+    if id.is_empty() {
+        return Err(format!("empty model id in --loaded \"{spec}\""));
+    }
+    let weight: u32 = parts[1]
+        .parse()
+        .map_err(|e| format!("weight_rss_mib in --loaded \"{spec}\": {e}"))?;
+    let kv: u32 = parts[2]
+        .parse()
+        .map_err(|e| format!("kv_per_token_bytes in --loaded \"{spec}\": {e}"))?;
+    let ctx: u32 = parts[3]
+        .parse()
+        .map_err(|e| format!("context_tokens in --loaded \"{spec}\": {e}"))?;
+    let loaded = LoadedModel {
+        id: ModelId::from(id),
+        estimate: MemEstimate {
+            weight_rss_mib: weight,
+            kv_per_token_bytes: kv,
+            mmproj_mib: 0,
+            vram_mib: 0,
+        },
+        role_hint: None,
+    };
+    Ok((loaded, ctx))
 }
 
 fn mem_check(
@@ -337,7 +382,18 @@ fn mem_check(
     let needed_mib = estimate.hot_ram_mib(args.context);
     let free_mib = probe.ram_available_mib;
 
-    match gate.check(&probe, &estimate, args.context) {
+    let mut loaded: Vec<LoadedModel> = Vec::with_capacity(args.loaded.len());
+    for spec in &args.loaded {
+        match parse_loaded_spec(spec) {
+            Ok((lm, _ctx)) => loaded.push(lm),
+            Err(diag) => {
+                let _ = writeln!(err, "STRAT-E1001 {diag}");
+                return ExitCode::from(64);
+            }
+        }
+    }
+
+    match gate.check_with(&probe, &estimate, args.context, &loaded) {
         Ok(()) => {
             let leftover = free_mib.saturating_sub(needed_mib);
             if json {
@@ -366,6 +422,11 @@ fn mem_check(
             ExitCode::SUCCESS
         }
         Err(diag) => {
+            let suggested: Vec<String> = gate
+                .suggest_unloads(&probe, &estimate, args.context, &loaded)
+                .into_iter()
+                .map(|m| m.as_str().to_string())
+                .collect();
             if json {
                 let payload = MemCheckErr {
                     status: "refused",
@@ -374,6 +435,7 @@ fn mem_check(
                     free_mib,
                     needed_mib,
                     margin_mib: args.margin,
+                    suggested_unloads: suggested,
                 };
                 #[allow(
                     clippy::expect_used,
@@ -1302,6 +1364,162 @@ mod tests {
         assert_eq!(format_gb_one_decimal(0), "0.0");
         assert_eq!(format_gb_one_decimal(1024), "1.1");
         assert_eq!(format_gb_one_decimal(400), "0.4");
+    }
+
+    #[test]
+    fn mem_check_loaded_ok_prose_path() {
+        // OK path with a `--loaded` spec exercises the parser even when no
+        // refusal occurs.
+        let tmp = TempDir::new().unwrap();
+        let (code, out, err) = drive_under(
+            &[
+                "mem-check",
+                "--weight-rss",
+                "1",
+                "--kv-per-token",
+                "0",
+                "--context",
+                "0",
+                "--margin",
+                "0",
+                "--loaded",
+                "router:64:0:0",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(out.starts_with("ok: would leave "), "out was: {out}");
+        assert!(err.is_empty(), "err was: {err}");
+    }
+
+    #[test]
+    fn mem_check_refused_prose_with_loaded_emits_unload_hint() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "mem-check",
+                "--weight-rss",
+                "4000000",
+                "--kv-per-token",
+                "0",
+                "--context",
+                "0",
+                "--loaded",
+                "planner:5000000:0:0",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("STRAT-E3007"), "err was: {err}");
+        assert!(err.contains("hint: unload planner"), "err was: {err}");
+    }
+
+    #[test]
+    fn mem_check_refused_json_with_loaded_lists_suggested_unloads() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "--json",
+                "mem-check",
+                "--weight-rss",
+                "4000000",
+                "--kv-per-token",
+                "0",
+                "--context",
+                "0",
+                "--loaded",
+                "planner:5000000:0:0",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        let v: serde_json::Value = serde_json::from_str(err.trim()).unwrap();
+        assert_eq!(v["status"], "refused");
+        let arr = v["suggested_unloads"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0], "planner");
+    }
+
+    #[test]
+    fn mem_check_refused_json_without_loaded_has_empty_suggestions() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "--json",
+                "mem-check",
+                "--weight-rss",
+                "4000000",
+                "--kv-per-token",
+                "0",
+                "--context",
+                "0",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        let v: serde_json::Value = serde_json::from_str(err.trim()).unwrap();
+        assert_eq!(v["status"], "refused");
+        assert!(v["suggested_unloads"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mem_check_loaded_bad_spec_exits_64() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "mem-check",
+                "--weight-rss",
+                "1",
+                "--kv-per-token",
+                "0",
+                "--context",
+                "0",
+                "--margin",
+                "0",
+                "--loaded",
+                "only-two:fields",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(64)));
+        assert!(err.contains("STRAT-E1001"), "err was: {err}");
+        assert!(err.contains("4 colon-separated"), "err was: {err}");
+    }
+
+    #[test]
+    fn mem_check_loaded_bad_number_exits_64() {
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "mem-check",
+                "--weight-rss",
+                "1",
+                "--kv-per-token",
+                "0",
+                "--context",
+                "0",
+                "--loaded",
+                "router:notanumber:0:0",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(64)));
+        assert!(err.contains("weight_rss_mib"), "err was: {err}");
+    }
+
+    #[test]
+    fn parse_loaded_spec_rejects_empty_id() {
+        let err = parse_loaded_spec(":1:0:0").unwrap_err();
+        assert!(err.contains("empty model id"), "err was: {err}");
+    }
+
+    #[test]
+    fn parse_loaded_spec_happy() {
+        let (lm, ctx) = parse_loaded_spec("planner:2048:4096:8192").unwrap();
+        assert_eq!(lm.id.as_str(), "planner");
+        assert_eq!(lm.estimate.weight_rss_mib, 2048);
+        assert_eq!(lm.estimate.kv_per_token_bytes, 4096);
+        assert_eq!(ctx, 8192);
     }
 
     #[cfg(unix)]
