@@ -36,6 +36,8 @@ pub mod provider;
 pub mod registry;
 /// Sandbox backend detection.
 pub mod sandbox;
+/// Sandbox profile bodies (bwrap-*, macos-*, passthrough).
+pub mod sandbox_profile;
 /// Composite tier classifier (low / medium / high).
 pub mod tier;
 
@@ -49,4 +51,5 @@ pub use prompts::{system_prompt, PromptRole};
 pub use provider::{EchoProvider, GenerateRequest, Provider};
 pub use registry::Registry;
 pub use sandbox::{SandboxBackend, SandboxReport};
+pub use sandbox_profile::{Mount, NetPolicy, SandboxProfile};
 pub use tier::Tier;
