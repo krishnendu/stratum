@@ -177,16 +177,38 @@ impl From<TelemetryEventArg> for TelemetryEventKind {
 
 /// Arguments for `stratum self-update`.
 ///
-/// This phase exposes only the read-only `--check` action: fetch (or read) an
-/// [`UpdateManifest`], compare against the running version, and print the
-/// resulting [`UpdateDecision`]. The actual atomic binary swap lands in a
-/// later PR.
+/// Two top-level actions are exposed:
+///
+/// * `--check`: fetch (or read) an [`UpdateManifest`], compare against the
+///   running version, and print the resulting [`UpdateDecision`] without
+///   touching the binary on disk.
+/// * `--apply`: do the above, then download the matching artifact, verify
+///   its SHA-256 + byte count, and atomically swap the running binary on
+///   disk. The previous binary is preserved at `<exe>.bak` for rollback.
+///
+/// The two actions are mutually exclusive; exactly one must be passed.
 #[derive(Debug, Args)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "self-update args are intentionally a flat clap derive struct; \
+              the four bools (check / apply / dry_run / allow_insecure_url) \
+              correspond 1:1 with user-facing flags and folding them into a \
+              sub-enum would obscure the clap relationships"
+)]
 struct SelfUpdateArgs {
-    /// Check for an available update and print the decision. Required in this
-    /// phase — no other actions are exposed yet.
-    #[arg(long)]
+    /// Check for an available update and print the decision. Mutually
+    /// exclusive with `--apply`.
+    #[arg(long, conflicts_with = "apply")]
     check: bool,
+    /// Apply the latest update: download, verify SHA-256 + byte count, then
+    /// atomically swap the running binary. Mutually exclusive with `--check`.
+    #[arg(long, conflicts_with = "check")]
+    apply: bool,
+    /// Do everything for `--apply` except the final atomic rename. Only valid
+    /// together with `--apply` (rejected at runtime with exit 64 if combined
+    /// with `--check`). Exits 0 after the SHA verification step.
+    #[arg(long)]
+    dry_run: bool,
     /// HTTPS URL of the channel manifest. Defaults to
     /// `https://updates.stratum.dev/<channel>.json`. Mutually exclusive with
     /// `--manifest-file`.
@@ -207,6 +229,40 @@ struct SelfUpdateArgs {
     /// `std::env::consts::OS` + `std::env::consts::ARCH`).
     #[arg(long, value_enum)]
     platform: Option<PlatformArg>,
+    /// Hidden test-only override: write the swapped binary to `<path>`
+    /// instead of `std::env::current_exe()`. Gated by `cfg(debug_assertions)`
+    /// OR `STRATUM_ALLOW_INSECURE_URL=1`; production builds with the env var
+    /// unset reject this flag at runtime so an end-user cannot silently
+    /// redirect the swap. Required because `current_exe()` IS the CLI test
+    /// binary and must not be modified by tests.
+    #[arg(long, value_name = "PATH", hide = true)]
+    target: Option<PathBuf>,
+    /// Hidden test-only override: allow non-`https://` artifact URLs (e.g.
+    /// the in-process `http://127.0.0.1:<port>/…` server used by the apply
+    /// integration tests). Gated by `cfg(debug_assertions)` OR
+    /// `STRATUM_ALLOW_INSECURE_URL=1`. Production users on a release build
+    /// without the env var cannot silently disable TLS.
+    #[arg(long, hide = true)]
+    allow_insecure_url: bool,
+}
+
+/// Returns true iff the hidden test-only `--target` / `--allow-insecure-url`
+/// flags are permitted in this process. Allowed when either:
+///
+/// * the build is a debug build (`cfg(debug_assertions)`), or
+/// * the env var `STRATUM_ALLOW_INSECURE_URL=1` is set.
+///
+/// Release builds without the env var reject the flags, so a packaged binary
+/// shipped to end users cannot silently bypass TLS or redirect the on-disk
+/// swap target.
+fn insecure_flags_allowed() -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    matches!(
+        std::env::var("STRATUM_ALLOW_INSECURE_URL").as_deref(),
+        Ok("1")
+    )
 }
 
 /// Clap-friendly mirror of [`UpdateChannel`].
@@ -1722,10 +1778,11 @@ fn render_block(out: &mut dyn Write, block: &Block) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// self-update --check
+// self-update --check / --apply
 // ---------------------------------------------------------------------------
 
-/// `--json` payload for the artifact slot of a [`SelfUpdateReport`].
+/// `--json` payload for the artifact slot of a [`SelfUpdateReport`] /
+/// [`SelfUpdateApplyReport`].
 #[derive(Debug, Serialize)]
 struct SelfUpdateArtifact<'a> {
     url: &'a str,
@@ -1745,17 +1802,40 @@ struct SelfUpdateReport<'a> {
     artifact: Option<SelfUpdateArtifact<'a>>,
 }
 
+/// `--json` payload emitted by `stratum self-update --apply` on a successful
+/// swap. `backup_path` is the absolute path of the `<exe>.bak` rollback file
+/// left next to the new binary.
+#[derive(Debug, Serialize)]
+struct SelfUpdateApplyReport<'a> {
+    action: &'static str,
+    from: String,
+    to: String,
+    backup_path: String,
+    artifact: SelfUpdateArtifact<'a>,
+}
+
 fn self_update(
     json: bool,
     args: &SelfUpdateArgs,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    if !args.check {
+    // Exactly one of --check / --apply must be set. Clap's `conflicts_with`
+    // already enforces "not both" with exit 64; this branch handles the
+    // "neither" case the same way.
+    if !args.check && !args.apply {
         let _ = writeln!(
             err,
-            "stratum self-update: --check is required (no other actions in this phase)"
+            "stratum self-update: exactly one of --check or --apply must be set"
         );
+        return ExitCode::from(64);
+    }
+    // `--dry-run` is meaningless without `--apply`; reject the combo
+    // explicitly rather than silently treating `--check --dry-run` as a
+    // plain `--check`. Clap's `requires` doesn't fire on bool flags here, so
+    // we enforce it at runtime.
+    if args.dry_run && !args.apply {
+        let _ = writeln!(err, "stratum self-update: --dry-run requires --apply");
         return ExitCode::from(64);
     }
 
@@ -1773,6 +1853,10 @@ fn self_update(
         Ok(m) => m,
         Err(code) => return code,
     };
+
+    if args.apply {
+        return self_update_apply(json, args, &manifest, &current, platform_arg, out, err);
+    }
 
     let decision = evaluate_update(&manifest, &current);
     let artifact = manifest.pick_artifact(platform_arg.into());
@@ -1797,6 +1881,349 @@ fn self_update(
         UpdateDecision::UpToDate | UpdateDecision::Upgrade { .. } => ExitCode::SUCCESS,
         UpdateDecision::BlockedSchemaTooOld { .. } => ExitCode::from(64),
     }
+}
+
+/// Drives the `--apply` flow. The manifest has already been loaded and the
+/// platform / current version resolved by [`self_update`]. Decision logic:
+///
+/// * `UpToDate` — print "already up to date" and exit 0 without touching the
+///   filesystem.
+/// * `BlockedSchemaTooOld` — exit 64; apply cannot bridge the gap, the user
+///   must reinstall manually.
+/// * `Upgrade { from, to }` — look up the artifact for the requested
+///   platform, download it, verify SHA-256 + byte count, then atomically
+///   swap the on-disk binary (or stop after verification under `--dry-run`).
+///
+/// The swap target defaults to `std::env::current_exe()`. Tests pass the
+/// hidden `--target <path>` flag so they don't blow away the CLI test
+/// binary itself.
+fn self_update_apply(
+    json: bool,
+    args: &SelfUpdateArgs,
+    manifest: &UpdateManifest,
+    current: &ReleaseVersion,
+    platform_arg: PlatformArg,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    // Reject hidden test-only flags on production builds.
+    if (args.target.is_some() || args.allow_insecure_url) && !insecure_flags_allowed() {
+        let _ = writeln!(
+            err,
+            "STRAT-E1001 --target / --allow-insecure-url require a debug build or \
+             STRATUM_ALLOW_INSECURE_URL=1"
+        );
+        return ExitCode::from(64);
+    }
+
+    let (from_version, to_version) = match evaluate_update(manifest, current) {
+        UpdateDecision::UpToDate => {
+            return write_or_io_exit(
+                out,
+                format_args!("stratum is already up to date ({current})"),
+            );
+        }
+        UpdateDecision::BlockedSchemaTooOld {
+            current: cur,
+            min_supported,
+        } => {
+            let _ = writeln!(
+                err,
+                "STRAT-E1001 cannot apply: current {cur} is below min-supported \
+                 {min_supported}; reinstall stratum manually"
+            );
+            return ExitCode::from(64);
+        }
+        UpdateDecision::Upgrade { from, to } => (from, to),
+    };
+
+    let Some(artifact) = manifest.pick_artifact(platform_arg.into()) else {
+        let _ = writeln!(
+            err,
+            "STRAT-E1001 no artifact for platform {} in manifest",
+            platform_arg.as_wire()
+        );
+        return ExitCode::from(1);
+    };
+
+    apply_upgrade_with_artifact(json, args, artifact, &from_version, &to_version, out, err)
+}
+
+/// Resolve the swap target, download + verify the artifact, and either stop
+/// (dry-run) or perform the atomic swap. Split out of [`self_update_apply`]
+/// to keep both functions below the per-function line limit.
+fn apply_upgrade_with_artifact(
+    json: bool,
+    args: &SelfUpdateArgs,
+    artifact: &stratum_runtime::UpdateArtifactRef,
+    from_version: &ReleaseVersion,
+    to_version: &ReleaseVersion,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let target_exe = match resolve_swap_target(args, err) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let new_tmp = sibling_with_suffix(&target_exe, ".new.tmp");
+    let bak_path = sibling_with_suffix(&target_exe, ".bak");
+
+    let (digest, bytes_written) =
+        match download_and_verify(&artifact.url, &new_tmp, args.allow_insecure_url) {
+            Ok(t) => t,
+            Err(msg) => {
+                let _ = std::fs::remove_file(&new_tmp);
+                let _ = writeln!(err, "STRAT-E1001 {msg}");
+                return ExitCode::from(1);
+            }
+        };
+
+    if !sha256_eq(&digest, &artifact.sha256) {
+        let _ = std::fs::remove_file(&new_tmp);
+        let _ = writeln!(
+            err,
+            "STRAT-E1001 sha256 mismatch: manifest={} got={}",
+            artifact.sha256, digest
+        );
+        return ExitCode::from(1);
+    }
+    if bytes_written != artifact.bytes {
+        let _ = std::fs::remove_file(&new_tmp);
+        let _ = writeln!(
+            err,
+            "STRAT-E1001 byte count mismatch: manifest={} got={}",
+            artifact.bytes, bytes_written
+        );
+        return ExitCode::from(1);
+    }
+
+    if args.dry_run {
+        let _ = std::fs::remove_file(&new_tmp);
+        return write_or_io_exit(
+            out,
+            format_args!(
+                "dry-run: would swap {} with {}",
+                target_exe.display(),
+                new_tmp.display()
+            ),
+        );
+    }
+
+    if let Err(msg) = make_executable(&new_tmp) {
+        let _ = std::fs::remove_file(&new_tmp);
+        let _ = writeln!(err, "STRAT-E1001 {msg}");
+        return ExitCode::from(1);
+    }
+    if let Err(msg) = atomic_swap(&target_exe, &new_tmp, &bak_path) {
+        let _ = std::fs::remove_file(&new_tmp);
+        let _ = writeln!(err, "STRAT-E1001 {msg}");
+        return ExitCode::from(1);
+    }
+
+    let render = if json {
+        render_self_update_apply_json(out, from_version, to_version, &bak_path, artifact)
+    } else {
+        let write_res = writeln!(
+            out,
+            "upgraded {from_version} → {to_version}; previous binary kept at {}",
+            bak_path.display()
+        );
+        write_res.map_err(|_| ExitCode::from(74))
+    };
+    match render {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(code) => code,
+    }
+}
+
+/// Resolve the on-disk path the new binary should overwrite. Production
+/// callers pass `--apply` without `--target`; tests pass the hidden
+/// `--target <path>` (gated by [`insecure_flags_allowed`]) to avoid
+/// stomping on the CLI test binary itself.
+fn resolve_swap_target(args: &SelfUpdateArgs, err: &mut dyn Write) -> Result<PathBuf, ExitCode> {
+    if let Some(p) = args.target.clone() {
+        return Ok(p);
+    }
+    std::env::current_exe().map_err(|e| {
+        let _ = writeln!(err, "STRAT-E1001 cannot resolve current_exe(): {e}");
+        ExitCode::from(1)
+    })
+}
+
+/// Return `<base><suffix>` as a sibling of `base`. Falls back to the suffix
+/// alone if `base` somehow has no filename, which can't happen for an
+/// absolute exe path but keeps the function total.
+fn sibling_with_suffix(base: &Path, suffix: &str) -> PathBuf {
+    let parent = base.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut name = base
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_default();
+    name.push(suffix);
+    parent.join(name)
+}
+
+/// Download `url` to `dest`, returning the computed SHA-256 hex digest and
+/// the number of bytes written. The transport is `ureq` HTTPS for production
+/// URLs; HTTP is permitted only when `allow_insecure` is `true` AND the
+/// process is allowed to use insecure flags (see [`insecure_flags_allowed`]).
+fn download_and_verify(
+    url: &str,
+    dest: &Path,
+    allow_insecure: bool,
+) -> Result<(String, u64), String> {
+    let is_https = url.starts_with("https://");
+    let is_http = url.starts_with("http://");
+    if !is_https {
+        if !is_http {
+            return Err(format!("artifact url must be http(s): {url:?}"));
+        }
+        if !(allow_insecure && insecure_flags_allowed()) {
+            return Err(format!("artifact url must be https://: {url:?}"));
+        }
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    let resp = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("artifact fetch failed: {e}"))?;
+    let status = resp.status();
+    if status != 200 {
+        return Err(format!("artifact fetch returned HTTP {status}"));
+    }
+    let reader = resp.into_reader();
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(dest)
+        .map_err(|e| format!("cannot open {}: {e}", dest.display()))?;
+    let mut buf = std::io::BufWriter::new(file);
+    let (digest, written) = stratum_runtime::download::hash_and_copy(reader, &mut buf)
+        .map_err(|e| format!("artifact write failed: {e}"))?;
+    let inner = buf
+        .into_inner()
+        .map_err(|e| format!("artifact flush failed: {e}"))?;
+    inner
+        .sync_all()
+        .map_err(|e| format!("artifact fsync failed: {e}"))?;
+    Ok((digest, written))
+}
+
+/// Constant-time-ish lower-case hex comparison. Both inputs are already
+/// lower-case (manifest validation enforces it on one side, our hex writer
+/// emits lower-case on the other), but normalise defensively.
+const fn sha256_eq(lhs: &str, rhs: &str) -> bool {
+    // `str::eq_ignore_ascii_case` isn't const yet on stable; compare the raw
+    // bytes manually. The inputs are 64-char hex strings, so the cost is a
+    // tight loop over 64 bytes.
+    let lhs = lhs.as_bytes();
+    let rhs = rhs.as_bytes();
+    if lhs.len() != rhs.len() {
+        return false;
+    }
+    let mut idx = 0;
+    while idx < lhs.len() {
+        let mut left = lhs[idx];
+        let mut right = rhs[idx];
+        if left.is_ascii_uppercase() {
+            left = left.to_ascii_lowercase();
+        }
+        if right.is_ascii_uppercase() {
+            right = right.to_ascii_lowercase();
+        }
+        if left != right {
+            return false;
+        }
+        idx += 1;
+    }
+    true
+}
+
+/// Write a single line to `out` and map the IO outcome to a process exit
+/// code: success ⇒ `ExitCode::SUCCESS`, IO failure ⇒ `ExitCode::from(74)`.
+/// Lets `self_update_apply` and friends keep the success / dry-run paths
+/// short without re-implementing the same `map_or` chain.
+fn write_or_io_exit(out: &mut dyn Write, args: std::fmt::Arguments<'_>) -> ExitCode {
+    if writeln!(out, "{args}").is_err() {
+        ExitCode::from(74)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// `chmod 0755` on Unix; no-op on Windows.
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o755);
+    std::fs::set_permissions(path, perms)
+        .map_err(|e| format!("cannot chmod 0755 {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Atomic-rename swap with rollback. Moves `exe → bak` (overwriting any
+/// existing `bak`), then `new_tmp → exe`. If the second rename fails after
+/// the first succeeded, we try to roll back by renaming `bak → exe`. The
+/// caller is responsible for cleaning up `new_tmp` on any error path.
+fn atomic_swap(exe: &Path, new_tmp: &Path, bak: &Path) -> Result<(), String> {
+    // Drop any stale .bak so the next rename can succeed on platforms that
+    // refuse to overwrite an existing target.
+    if bak.exists() {
+        std::fs::remove_file(bak)
+            .map_err(|e| format!("cannot remove stale {}: {e}", bak.display()))?;
+    }
+    std::fs::rename(exe, bak)
+        .map_err(|e| format!("cannot move {} → {}: {e}", exe.display(), bak.display()))?;
+    if let Err(e) = std::fs::rename(new_tmp, exe) {
+        // Attempt rollback. Best-effort: if it fails we leave the .bak in
+        // place and surface the original error.
+        let _ = std::fs::rename(bak, exe);
+        return Err(format!(
+            "cannot move {} → {}: {e}",
+            new_tmp.display(),
+            exe.display()
+        ));
+    }
+    Ok(())
+}
+
+fn render_self_update_apply_json(
+    out: &mut dyn Write,
+    from: &ReleaseVersion,
+    to: &ReleaseVersion,
+    backup_path: &Path,
+    artifact: &stratum_runtime::UpdateArtifactRef,
+) -> Result<(), ExitCode> {
+    let payload = SelfUpdateApplyReport {
+        action: "applied",
+        from: from.to_string(),
+        to: to.to_string(),
+        backup_path: backup_path.display().to_string(),
+        artifact: SelfUpdateArtifact {
+            url: &artifact.url,
+            sha256: &artifact.sha256,
+            bytes: artifact.bytes,
+        },
+    };
+    #[allow(
+        clippy::expect_used,
+        reason = "SelfUpdateApplyReport serialization is infallible (primitives only)"
+    )]
+    let rendered = serde_json::to_string_pretty(&payload)
+        .expect("SelfUpdateApplyReport serialization is infallible");
+    if writeln!(out, "{rendered}").is_err() {
+        return Err(ExitCode::from(74));
+    }
+    Ok(())
 }
 
 fn resolve_current_version(
@@ -3803,7 +4230,889 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (code, _out, err) = drive_under(&["self-update"], tmp.path());
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(64)));
-        assert!(err.contains("--check is required"));
+        assert!(err.contains("--check or --apply"));
+    }
+
+    #[test]
+    fn self_update_check_and_apply_mutually_exclusive_exits_64() {
+        let tmp = TempDir::new().unwrap();
+        let fixture = write_self_update_fixture(tmp.path(), "1.0.0");
+        let (code, _out, _err) = drive_under(
+            &[
+                "self-update",
+                "--check",
+                "--apply",
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.0.0",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        // Clap's `conflicts_with` rejects the combo with exit 64.
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(64)));
+    }
+
+    #[test]
+    fn self_update_apply_up_to_date_short_circuits() {
+        let tmp = TempDir::new().unwrap();
+        let fixture = write_self_update_fixture(tmp.path(), "1.0.0");
+        let (code, out, _err) = drive_under(
+            &[
+                "self-update",
+                "--apply",
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.0.0",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(out.contains("already up to date"));
+    }
+
+    #[test]
+    fn self_update_apply_blocked_exits_64() {
+        let tmp = TempDir::new().unwrap();
+        let body = r#"{
+            "schema_version": 1,
+            "channel": "stable",
+            "latest": {
+                "version": { "major": 1, "minor": 5, "patch": 0, "pre": null },
+                "released_at": { "secs_since_epoch": 1700000000, "nanos_since_epoch": 0 },
+                "binary": {
+                    "url": "https://dl.stratum.dev/v1.5.0/stratum-linux_x86_64.tar.gz",
+                    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "bytes": 1024,
+                    "platform": "linux_x86_64"
+                },
+                "min_supported_from": { "major": 1, "minor": 3, "patch": 0, "pre": null },
+                "release_notes_url": "https://stratum.dev/releases/1.5.0"
+            },
+            "history": [
+                {
+                    "version": { "major": 1, "minor": 5, "patch": 0, "pre": null },
+                    "released_at": { "secs_since_epoch": 1700000000, "nanos_since_epoch": 0 },
+                    "binary": {
+                        "url": "https://dl.stratum.dev/v1.5.0/stratum-linux_x86_64.tar.gz",
+                        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        "bytes": 1024,
+                        "platform": "linux_x86_64"
+                    },
+                    "min_supported_from": { "major": 1, "minor": 3, "patch": 0, "pre": null },
+                    "release_notes_url": "https://stratum.dev/releases/1.5.0"
+                }
+            ]
+        }"#;
+        let path = tmp.path().join("manifest.json");
+        std::fs::write(&path, body).unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "self-update",
+                "--apply",
+                "--manifest-file",
+                path.to_str().unwrap(),
+                "--current",
+                "1.0.0",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(64)));
+        assert!(err.contains("STRAT-E1001"));
+        assert!(err.contains("reinstall"));
+    }
+
+    #[test]
+    fn self_update_apply_no_artifact_for_platform_exits_1() {
+        let tmp = TempDir::new().unwrap();
+        let fixture = write_self_update_fixture(tmp.path(), "1.5.0");
+        let (code, _out, err) = drive_under(
+            &[
+                "self-update",
+                "--apply",
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "windows_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("no artifact for platform"));
+    }
+
+    #[test]
+    fn self_update_apply_dry_run_requires_apply() {
+        // Clap's `requires = "apply"` rejects `--dry-run` without `--apply`.
+        let tmp = TempDir::new().unwrap();
+        let fixture = write_self_update_fixture(tmp.path(), "1.0.0");
+        let (code, _out, _err) = drive_under(
+            &[
+                "self-update",
+                "--check",
+                "--dry-run",
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.0.0",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(64)));
+    }
+
+    #[test]
+    fn sibling_with_suffix_appends_to_filename() {
+        let base = Path::new("/tmp/stratum");
+        let new_tmp = sibling_with_suffix(base, ".new.tmp");
+        assert_eq!(new_tmp, Path::new("/tmp/stratum.new.tmp"));
+        let bak = sibling_with_suffix(base, ".bak");
+        assert_eq!(bak, Path::new("/tmp/stratum.bak"));
+    }
+
+    #[test]
+    fn sha256_eq_is_case_insensitive() {
+        assert!(sha256_eq("abc", "ABC"));
+        assert!(!sha256_eq("abc", "abd"));
+    }
+
+    #[test]
+    fn insecure_flags_allowed_in_debug_build() {
+        // The cfg(debug_assertions) branch is always true under `cargo test`,
+        // which builds with debug profile by default.
+        assert!(insecure_flags_allowed());
+    }
+
+    #[test]
+    fn atomic_swap_moves_and_keeps_bak() {
+        let tmp = TempDir::new().unwrap();
+        let exe = tmp.path().join("exe");
+        let new_tmp = tmp.path().join("exe.new.tmp");
+        let bak = tmp.path().join("exe.bak");
+        std::fs::write(&exe, b"old").unwrap();
+        std::fs::write(&new_tmp, b"new").unwrap();
+        atomic_swap(&exe, &new_tmp, &bak).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+        assert_eq!(std::fs::read(&bak).unwrap(), b"old");
+        assert!(!new_tmp.exists());
+    }
+
+    #[test]
+    fn atomic_swap_overwrites_existing_bak() {
+        let tmp = TempDir::new().unwrap();
+        let exe = tmp.path().join("exe");
+        let new_tmp = tmp.path().join("exe.new.tmp");
+        let bak = tmp.path().join("exe.bak");
+        std::fs::write(&exe, b"old").unwrap();
+        std::fs::write(&new_tmp, b"new").unwrap();
+        std::fs::write(&bak, b"stale").unwrap();
+        atomic_swap(&exe, &new_tmp, &bak).unwrap();
+        assert_eq!(std::fs::read(&bak).unwrap(), b"old");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn make_executable_sets_0755() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("bin");
+        std::fs::write(&path, b"x").unwrap();
+        make_executable(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    // ----- in-process coverage for `self-update --apply` flows -----
+
+    /// Body bytes the in-process server returns for the happy-path apply
+    /// tests. Distinct from the integration-test body so unit and integration
+    /// failures stay attributable.
+    const APPLY_BODY: &[u8] = b"unit-apply-body";
+
+    /// Spawn a one-shot HTTP/1.0 server bound to 127.0.0.1 that answers a
+    /// single GET with `body` and exits. Returns `(url, join_handle)`.
+    fn spawn_unit_artifact_server(body: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let url = format!("http://127.0.0.1:{port}/artifact.bin");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf);
+                let header = format!(
+                    "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+        (url, handle)
+    }
+
+    /// Spawn a one-shot HTTP server that returns the given non-200 status.
+    fn spawn_unit_status_server(
+        status_line: &'static str,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let url = format!("http://127.0.0.1:{port}/x");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf);
+                let header = format!(
+                    "HTTP/1.0 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (url, handle)
+    }
+
+    /// Build a manifest fixture whose `latest` advertises one artifact.
+    fn write_apply_fixture(
+        dir: &Path,
+        version: &str,
+        artifact_url: &str,
+        sha256: &str,
+        bytes: u64,
+        min_supported_from: Option<&str>,
+    ) -> PathBuf {
+        let parts: Vec<u16> = version.split('.').map(|s| s.parse().unwrap()).collect();
+        let (maj, min, pat) = (parts[0], parts[1], parts[2]);
+        let min_block = min_supported_from.map_or_else(
+            || r#""min_supported_from": null,"#.to_owned(),
+            |s| {
+                let p: Vec<u16> = s.split('.').map(|x| x.parse().unwrap()).collect();
+                format!(
+                    r#""min_supported_from": {{ "major": {}, "minor": {}, "patch": {}, "pre": null }},"#,
+                    p[0], p[1], p[2],
+                )
+            },
+        );
+        let entry = format!(
+            r#"{{
+                "version": {{ "major": {maj}, "minor": {min}, "patch": {pat}, "pre": null }},
+                "released_at": {{ "secs_since_epoch": 1700000000, "nanos_since_epoch": 0 }},
+                "binary": {{
+                    "url": "{artifact_url}",
+                    "sha256": "{sha256}",
+                    "bytes": {bytes},
+                    "platform": "linux_x86_64"
+                }},
+                {min_block}
+                "release_notes_url": "https://stratum.dev/releases/{version}"
+            }}"#
+        );
+        let body = format!(
+            r#"{{ "schema_version": 1, "channel": "stable", "latest": {entry}, "history": [{entry}] }}"#
+        );
+        let path = dir.join("manifest.json");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn apply_happy_path_unit_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let sha = stratum_runtime::download::sha256_hex(APPLY_BODY);
+        let (url, handle) = spawn_unit_artifact_server(APPLY_BODY);
+        let fixture = write_apply_fixture(
+            tmp.path(),
+            "1.5.0",
+            &url,
+            &sha,
+            APPLY_BODY.len() as u64,
+            None,
+        );
+        let target = tmp.path().join("stratum-stub");
+        std::fs::write(&target, b"old-binary").unwrap();
+        let (code, out, err) = drive_under(
+            &[
+                "self-update",
+                "--apply",
+                "--allow-insecure-url",
+                "--target",
+                target.to_str().unwrap(),
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        let _ = handle.join();
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::SUCCESS),
+            "err={err}"
+        );
+        assert!(out.contains("upgraded"), "out: {out}");
+        assert!(out.contains("1.4.7"));
+        assert!(out.contains("1.5.0"));
+        assert_eq!(std::fs::read(&target).unwrap(), APPLY_BODY);
+        let bak = tmp.path().join("stratum-stub.bak");
+        assert_eq!(std::fs::read(&bak).unwrap(), b"old-binary");
+    }
+
+    #[test]
+    fn apply_json_unit_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let sha = stratum_runtime::download::sha256_hex(APPLY_BODY);
+        let (url, handle) = spawn_unit_artifact_server(APPLY_BODY);
+        let fixture = write_apply_fixture(
+            tmp.path(),
+            "1.5.0",
+            &url,
+            &sha,
+            APPLY_BODY.len() as u64,
+            None,
+        );
+        let target = tmp.path().join("stratum-stub");
+        std::fs::write(&target, b"old-binary").unwrap();
+        let (code, out, _err) = drive_under(
+            &[
+                "--json",
+                "self-update",
+                "--apply",
+                "--allow-insecure-url",
+                "--target",
+                target.to_str().unwrap(),
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        let _ = handle.join();
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["action"], "applied");
+        assert_eq!(v["from"], "1.4.7");
+        assert_eq!(v["to"], "1.5.0");
+        assert_eq!(v["artifact"]["sha256"], sha);
+    }
+
+    #[test]
+    fn apply_dry_run_unit_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let sha = stratum_runtime::download::sha256_hex(APPLY_BODY);
+        let (url, handle) = spawn_unit_artifact_server(APPLY_BODY);
+        let fixture = write_apply_fixture(
+            tmp.path(),
+            "1.5.0",
+            &url,
+            &sha,
+            APPLY_BODY.len() as u64,
+            None,
+        );
+        let target = tmp.path().join("stratum-stub");
+        std::fs::write(&target, b"orig").unwrap();
+        let (code, out, _err) = drive_under(
+            &[
+                "self-update",
+                "--apply",
+                "--dry-run",
+                "--allow-insecure-url",
+                "--target",
+                target.to_str().unwrap(),
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        let _ = handle.join();
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(out.contains("dry-run: would swap"), "out: {out}");
+        // Target untouched.
+        assert_eq!(std::fs::read(&target).unwrap(), b"orig");
+    }
+
+    #[test]
+    fn apply_sha_mismatch_unit_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let bogus = "0".repeat(64);
+        let (url, handle) = spawn_unit_artifact_server(APPLY_BODY);
+        let fixture = write_apply_fixture(
+            tmp.path(),
+            "1.5.0",
+            &url,
+            &bogus,
+            APPLY_BODY.len() as u64,
+            None,
+        );
+        let target = tmp.path().join("stratum-stub");
+        std::fs::write(&target, b"orig").unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "self-update",
+                "--apply",
+                "--allow-insecure-url",
+                "--target",
+                target.to_str().unwrap(),
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        let _ = handle.join();
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("sha256 mismatch"), "err: {err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"orig");
+    }
+
+    #[test]
+    fn apply_bytes_mismatch_unit_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let sha = stratum_runtime::download::sha256_hex(APPLY_BODY);
+        let (url, handle) = spawn_unit_artifact_server(APPLY_BODY);
+        // Declare an off-by-one byte count.
+        let fixture = write_apply_fixture(
+            tmp.path(),
+            "1.5.0",
+            &url,
+            &sha,
+            (APPLY_BODY.len() as u64) + 1,
+            None,
+        );
+        let target = tmp.path().join("stratum-stub");
+        std::fs::write(&target, b"orig").unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "self-update",
+                "--apply",
+                "--allow-insecure-url",
+                "--target",
+                target.to_str().unwrap(),
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        let _ = handle.join();
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("byte count mismatch"), "err: {err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"orig");
+    }
+
+    #[test]
+    fn apply_download_http_error_status_unit_coverage() {
+        let tmp = TempDir::new().unwrap();
+        let sha = stratum_runtime::download::sha256_hex(APPLY_BODY);
+        let (url, handle) = spawn_unit_status_server("500 Internal Server Error");
+        let fixture = write_apply_fixture(
+            tmp.path(),
+            "1.5.0",
+            &url,
+            &sha,
+            APPLY_BODY.len() as u64,
+            None,
+        );
+        let target = tmp.path().join("stratum-stub");
+        std::fs::write(&target, b"orig").unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "self-update",
+                "--apply",
+                "--allow-insecure-url",
+                "--target",
+                target.to_str().unwrap(),
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        let _ = handle.join();
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        // `ureq` surfaces the 500 as a transport error; either flavour is
+        // acceptable as long as the exit is 1.
+        assert!(err.contains("STRAT-E1001"), "err: {err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"orig");
+    }
+
+    #[test]
+    fn apply_rejects_http_without_allow_insecure_unit() {
+        // Without `--allow-insecure-url`, an http:// artifact URL is
+        // rejected before any network IO.
+        let tmp = TempDir::new().unwrap();
+        let sha = stratum_runtime::download::sha256_hex(APPLY_BODY);
+        let fixture = write_apply_fixture(
+            tmp.path(),
+            "1.5.0",
+            "http://127.0.0.1:1/never-fetched",
+            &sha,
+            APPLY_BODY.len() as u64,
+            None,
+        );
+        let target = tmp.path().join("stratum-stub");
+        std::fs::write(&target, b"orig").unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "self-update",
+                "--apply",
+                "--target",
+                target.to_str().unwrap(),
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("https"), "err: {err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"orig");
+    }
+
+    #[test]
+    fn apply_rejects_unknown_scheme_unit() {
+        let tmp = TempDir::new().unwrap();
+        let sha = stratum_runtime::download::sha256_hex(APPLY_BODY);
+        let fixture = write_apply_fixture(
+            tmp.path(),
+            "1.5.0",
+            "ftp://example.com/stratum",
+            &sha,
+            APPLY_BODY.len() as u64,
+            None,
+        );
+        let target = tmp.path().join("stratum-stub");
+        std::fs::write(&target, b"orig").unwrap();
+        let (code, _out, err) = drive_under(
+            &[
+                "self-update",
+                "--apply",
+                "--allow-insecure-url",
+                "--target",
+                target.to_str().unwrap(),
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        assert!(err.contains("http(s)"), "err: {err}");
+    }
+
+    #[test]
+    fn apply_io_failure_returns_74_on_up_to_date() {
+        let tmp = TempDir::new().unwrap();
+        let sha = stratum_runtime::download::sha256_hex(APPLY_BODY);
+        let fixture = write_apply_fixture(
+            tmp.path(),
+            "1.0.0",
+            "http://127.0.0.1:1/never-fetched",
+            &sha,
+            APPLY_BODY.len() as u64,
+            None,
+        );
+        let target = tmp.path().join("stratum-stub");
+        std::fs::write(&target, b"orig").unwrap();
+        let code = drive_with_failing_out(
+            &[
+                "self-update",
+                "--apply",
+                "--allow-insecure-url",
+                "--target",
+                target.to_str().unwrap(),
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.0.0",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn apply_io_failure_returns_74_on_dry_run() {
+        let tmp = TempDir::new().unwrap();
+        let sha = stratum_runtime::download::sha256_hex(APPLY_BODY);
+        let (url, handle) = spawn_unit_artifact_server(APPLY_BODY);
+        let fixture = write_apply_fixture(
+            tmp.path(),
+            "1.5.0",
+            &url,
+            &sha,
+            APPLY_BODY.len() as u64,
+            None,
+        );
+        let target = tmp.path().join("stratum-stub");
+        std::fs::write(&target, b"orig").unwrap();
+        let code = drive_with_failing_out(
+            &[
+                "self-update",
+                "--apply",
+                "--dry-run",
+                "--allow-insecure-url",
+                "--target",
+                target.to_str().unwrap(),
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        let _ = handle.join();
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn apply_io_failure_returns_74_on_apply() {
+        let tmp = TempDir::new().unwrap();
+        let sha = stratum_runtime::download::sha256_hex(APPLY_BODY);
+        let (url, handle) = spawn_unit_artifact_server(APPLY_BODY);
+        let fixture = write_apply_fixture(
+            tmp.path(),
+            "1.5.0",
+            &url,
+            &sha,
+            APPLY_BODY.len() as u64,
+            None,
+        );
+        let target = tmp.path().join("stratum-stub");
+        std::fs::write(&target, b"orig").unwrap();
+        let code = drive_with_failing_out(
+            &[
+                "self-update",
+                "--apply",
+                "--allow-insecure-url",
+                "--target",
+                target.to_str().unwrap(),
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        let _ = handle.join();
+        // Prose writer fails on stdout → 74, regardless of whether the swap
+        // already happened. The atomic swap still executed first.
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn apply_io_failure_returns_74_on_apply_json() {
+        let tmp = TempDir::new().unwrap();
+        let sha = stratum_runtime::download::sha256_hex(APPLY_BODY);
+        let (url, handle) = spawn_unit_artifact_server(APPLY_BODY);
+        let fixture = write_apply_fixture(
+            tmp.path(),
+            "1.5.0",
+            &url,
+            &sha,
+            APPLY_BODY.len() as u64,
+            None,
+        );
+        let target = tmp.path().join("stratum-stub");
+        std::fs::write(&target, b"orig").unwrap();
+        let code = drive_with_failing_out(
+            &[
+                "--json",
+                "self-update",
+                "--apply",
+                "--allow-insecure-url",
+                "--target",
+                target.to_str().unwrap(),
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.4.7",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        let _ = handle.join();
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn apply_dry_run_with_check_exits_64() {
+        // `--check --dry-run` triggers the runtime guard (`--dry-run` requires
+        // `--apply`). The "neither check nor apply" branch would otherwise
+        // shadow it.
+        let tmp = TempDir::new().unwrap();
+        let fixture = write_apply_fixture(
+            tmp.path(),
+            "1.0.0",
+            "https://dl.stratum.dev/v1.0.0/stratum-linux_x86_64.tar.gz",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            1024,
+            None,
+        );
+        let (code, _out, err) = drive_under(
+            &[
+                "self-update",
+                "--check",
+                "--dry-run",
+                "--manifest-file",
+                fixture.to_str().unwrap(),
+                "--current",
+                "1.0.0",
+                "--platform",
+                "linux_x86_64",
+            ],
+            tmp.path(),
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(64)));
+        assert!(err.contains("--dry-run requires --apply"), "err: {err}");
+    }
+
+    #[test]
+    fn atomic_swap_rolls_back_when_second_rename_fails() {
+        // Make `new_tmp` a missing path: the rename will fail; rollback
+        // should restore exe from bak.
+        let tmp = TempDir::new().unwrap();
+        let exe = tmp.path().join("exe");
+        let new_tmp = tmp.path().join("does-not-exist.tmp");
+        let bak = tmp.path().join("exe.bak");
+        std::fs::write(&exe, b"old").unwrap();
+        let res = atomic_swap(&exe, &new_tmp, &bak);
+        assert!(res.is_err(), "expected rename failure");
+        // Rollback restored exe.
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old");
+    }
+
+    #[test]
+    fn sha256_eq_handles_len_mismatch() {
+        assert!(!sha256_eq("abc", "ab"));
+        assert!(sha256_eq("", ""));
+    }
+
+    #[test]
+    fn download_and_verify_rejects_non_https_when_not_allowed() {
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("x");
+        let err = download_and_verify("http://127.0.0.1:1/x", &dest, false).unwrap_err();
+        assert!(err.contains("https"), "err: {err}");
+    }
+
+    #[test]
+    fn download_and_verify_rejects_unknown_scheme() {
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("x");
+        let err = download_and_verify("gopher://example.com/x", &dest, true).unwrap_err();
+        assert!(err.contains("http(s)"), "err: {err}");
+    }
+
+    #[test]
+    fn sibling_with_suffix_no_filename_returns_suffix_only() {
+        // `/` has no file_name component → join("/", suffix) = "/<suffix>".
+        let p = sibling_with_suffix(Path::new("/"), ".bak");
+        // On macOS / Linux Path::parent("/") is None, so parent is empty.
+        // The resulting path is just the suffix (".bak").
+        assert_eq!(p, Path::new(".bak"));
+    }
+
+    #[test]
+    fn write_or_io_exit_returns_success_on_ok() {
+        let mut buf = Vec::new();
+        let code = write_or_io_exit(&mut buf, format_args!("hi"));
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert_eq!(buf, b"hi\n");
+    }
+
+    #[test]
+    fn write_or_io_exit_returns_74_on_io_failure() {
+        let mut fail = FailingWriter;
+        let code = write_or_io_exit(&mut fail, format_args!("hi"));
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(74)));
+    }
+
+    #[test]
+    fn resolve_swap_target_returns_target_override() {
+        let args = SelfUpdateArgs {
+            check: false,
+            apply: true,
+            dry_run: false,
+            manifest_url: None,
+            manifest_file: None,
+            channel: ChannelArg::Stable,
+            current: None,
+            platform: None,
+            target: Some(PathBuf::from("/tmp/foo")),
+            allow_insecure_url: false,
+        };
+        let mut err = Vec::new();
+        let p = resolve_swap_target(&args, &mut err).unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/foo"));
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn resolve_swap_target_falls_back_to_current_exe() {
+        let args = SelfUpdateArgs {
+            check: false,
+            apply: true,
+            dry_run: false,
+            manifest_url: None,
+            manifest_file: None,
+            channel: ChannelArg::Stable,
+            current: None,
+            platform: None,
+            target: None,
+            allow_insecure_url: false,
+        };
+        let mut err = Vec::new();
+        // `std::env::current_exe()` always succeeds in test runs; we just
+        // want to drive the `Ok(path)` branch.
+        let p = resolve_swap_target(&args, &mut err).unwrap();
+        assert!(p.exists());
     }
 
     #[test]
