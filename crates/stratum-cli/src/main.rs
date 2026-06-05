@@ -5,6 +5,7 @@
 
 mod app;
 mod chat;
+mod palette;
 
 use std::process::ExitCode;
 
