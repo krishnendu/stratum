@@ -17,6 +17,8 @@ pub mod budget;
 pub mod cancel;
 /// Hierarchical cancellation cascade with reasons + RAII deadlines.
 pub mod cancel_cascade;
+/// Opt-in crash-report bundle + log redaction (Phase 4 scaffold).
+pub mod crash_report;
 /// Model-file install: SHA-256 verification, atomic copy with `.partial` swap.
 pub mod download;
 /// Memory-safety gate.
@@ -75,6 +77,10 @@ pub use agents::{AgentBudget, AgentDef, AgentLoader};
 pub use budget::{BudgetCheck, BudgetTracker};
 pub use cancel::CancelToken;
 pub use cancel_cascade::{CancelError, CancelReason, CascadeToken, DeadlineGuard};
+pub use crash_report::{
+    build_bundle, load_bundle, redact_log_lines, redact_path_user, write_bundle, CrashBundle,
+    CrashBundleConfig, CrashBundleError, CrashEnv, CRASH_BUNDLE_SCHEMA_VERSION,
+};
 pub use download::{InstallReport, ModelInstaller};
 pub use gate::{LoadedModel, MemoryGate, DEFAULT_MARGIN_MIB};
 pub use injection::{fence, is_suspicious, suspicion_score, FenceSource, SUSPICION_THRESHOLD};
