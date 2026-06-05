@@ -63,7 +63,10 @@ pub use cancel::CancelToken;
 pub use download::{InstallReport, ModelInstaller};
 pub use gate::{LoadedModel, MemoryGate, DEFAULT_MARGIN_MIB};
 pub use injection::{fence, is_suspicious, suspicion_score, FenceSource, SUSPICION_THRESHOLD};
-pub use install::{InstalledToml, TierInputs};
+pub use install::{
+    backup_path, load_with_migration, restore_backup, save_atomic, InstallIoError,
+    InstallLoadError, InstalledToml, TierInputs, CURRENT_SCHEMA_VERSION,
+};
 pub use mcp::{
     McpServeTransport, McpServerConfig, McpServerExpose, McpServerSet, McpServerStatus,
     McpTransport,
