@@ -54,6 +54,8 @@ pub mod registry;
 pub mod sandbox;
 /// Sandbox profile bodies (bwrap-*, macos-*, passthrough).
 pub mod sandbox_profile;
+/// Sandbox-profile resolver — combine profile + caps + workspace → launch spec.
+pub mod sandbox_resolve;
 /// Composite tier classifier (low / medium / high).
 pub mod tier;
 /// Tool registry and capability matrix.
@@ -91,6 +93,10 @@ pub use rate_limit::{
 pub use registry::Registry;
 pub use sandbox::{SandboxBackend, SandboxReport};
 pub use sandbox_profile::{Mount, NetPolicy, SandboxProfile};
+pub use sandbox_resolve::{
+    resolve, resolve_with_warnings, BackendChoice, MountMode, ResolveError, ResolvedMount,
+    ResolvedNet, SandboxLaunchSpec,
+};
 pub use tier::Tier;
 pub use tools::{CapabilityEntry, CapabilityMatrix};
 pub use workspace::{IgnoreRule, StratumIgnore, Workspace, WorkspaceConfig};
