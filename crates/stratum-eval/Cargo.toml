@@ -1,0 +1,30 @@
+[package]
+name         = "stratum-eval"
+description  = "Stratum evaluation harness (Phase 2 scaffold; full suite lands Phase 7)."
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+homepage     = { workspace = true }
+readme       = { workspace = true }
+keywords     = { workspace = true }
+categories   = { workspace = true }
+
+[[bin]]
+name = "stratum-eval"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+stratum-types   = { path = "../stratum-types" }
+stratum-runtime = { path = "../stratum-runtime" }
+clap            = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
