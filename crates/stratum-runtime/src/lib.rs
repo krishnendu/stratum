@@ -21,6 +21,8 @@ pub mod cancel_cascade;
 pub mod crash_report;
 /// Model-file install: SHA-256 verification, atomic copy with `.partial` swap.
 pub mod download;
+/// Embedding backend trait + deterministic `HashEmbedder` stub.
+pub mod embedder;
 /// Memory-safety gate.
 ///
 /// Refuses model loads when free RAM minus the would-be hot footprint falls
@@ -86,6 +88,10 @@ pub use crash_report::{
     CrashBundleConfig, CrashBundleError, CrashEnv, CRASH_BUNDLE_SCHEMA_VERSION,
 };
 pub use download::{InstallReport, ModelInstaller};
+pub use embedder::{
+    cosine_similarity, top_k, EmbedError, Embedder, EmbeddingDim, EmbeddingVector, HashEmbedder,
+    InMemoryVectorStore,
+};
 pub use gate::{LoadedModel, MemoryGate, DEFAULT_MARGIN_MIB};
 pub use injection::{fence, is_suspicious, suspicion_score, FenceSource, SUSPICION_THRESHOLD};
 pub use install::{
