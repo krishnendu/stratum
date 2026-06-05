@@ -9,6 +9,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// User-agent loader.
+pub mod agents;
 /// Cooperative cancellation token.
 pub mod cancel;
 /// Model-file install: SHA-256 verification, atomic copy with `.partial` swap.
@@ -45,6 +47,7 @@ pub mod tools;
 /// Workspace / project discovery (`stratum.toml`, `.stratumignore`).
 pub mod workspace;
 
+pub use agents::{AgentBudget, AgentDef, AgentLoader};
 pub use cancel::CancelToken;
 pub use download::{InstallReport, ModelInstaller};
 pub use gate::{MemoryGate, DEFAULT_MARGIN_MIB};
