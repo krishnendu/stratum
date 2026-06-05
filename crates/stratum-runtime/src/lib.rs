@@ -11,6 +11,8 @@
 
 /// User-agent loader.
 pub mod agents;
+/// Per-turn budget tracker layered over an `AgentBudget` + `CancelToken`.
+pub mod budget;
 /// Cooperative cancellation token.
 pub mod cancel;
 /// Model-file install: SHA-256 verification, atomic copy with `.partial` swap.
@@ -52,6 +54,7 @@ pub mod tools;
 pub mod workspace;
 
 pub use agents::{AgentBudget, AgentDef, AgentLoader};
+pub use budget::{BudgetCheck, BudgetTracker};
 pub use cancel::CancelToken;
 pub use download::{InstallReport, ModelInstaller};
 pub use gate::{LoadedModel, MemoryGate, DEFAULT_MARGIN_MIB};
