@@ -66,6 +66,8 @@ pub mod telemetry;
 pub mod tier;
 /// Tool registry and capability matrix.
 pub mod tools;
+/// `stratum self-update` channel-manifest data shape (Phase 1 scaffold).
+pub mod update_manifest;
 /// Workspace / project discovery (`stratum.toml`, `.stratumignore`).
 pub mod workspace;
 
@@ -118,4 +120,9 @@ pub use telemetry::{
 };
 pub use tier::Tier;
 pub use tools::{CapabilityEntry, CapabilityMatrix};
+pub use update_manifest::{
+    evaluate, ArtifactRef as UpdateArtifactRef, ArtifactRefError as UpdateArtifactRefError,
+    ManifestError, PlatformTag, ReleaseEntry, ReleaseVersion, ReleaseVersionError, UpdateChannel,
+    UpdateDecision, UpdateManifest, UPDATE_MANIFEST_SCHEMA_VERSION,
+};
 pub use workspace::{IgnoreRule, StratumIgnore, Workspace, WorkspaceConfig};
