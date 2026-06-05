@@ -32,6 +32,9 @@ pub mod gate;
 pub mod injection;
 /// First-run install record and atomic TOML writer.
 pub mod install;
+/// Llama.cpp-backed provider scaffold (feature-gated, off by default).
+#[cfg(feature = "provider-llama-cpp")]
+pub mod llama_provider;
 /// `tracing` subscriber initialization with env-filter + file output.
 pub mod logging;
 /// MCP client + server data shapes (Phase 3 data-only scaffold for Phase 6).
@@ -98,6 +101,8 @@ pub use install::{
     backup_path, load_with_migration, restore_backup, save_atomic, InstallIoError,
     InstallLoadError, InstalledToml, TierInputs, CURRENT_SCHEMA_VERSION,
 };
+#[cfg(feature = "provider-llama-cpp")]
+pub use llama_provider::LlamaCppProvider;
 pub use mcp::{
     McpServeTransport, McpServerConfig, McpServerExpose, McpServerSet, McpServerStatus,
     McpTransport,

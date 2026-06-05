@@ -19,6 +19,12 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Forwards to `stratum-runtime`'s `provider-llama-cpp` feature so the CLI
+# can opt into the llama.cpp-backed provider. Off by default.
+provider-llama-cpp = ["stratum-runtime/provider-llama-cpp"]
+
 [dependencies]
 stratum-types       = { path = "../stratum-types" }
 stratum-runtime     = { path = "../stratum-runtime" }

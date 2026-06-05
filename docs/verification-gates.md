@@ -6,7 +6,7 @@ Stratum's CI enforces 12 per-PR gates. Each is also documented in the project's 
 
 | # | Gate | Mechanism |
 |---|---|---|
-| **G1** | Builds clean on all CI targets | `cargo build --workspace --all-targets --all-features` on macOS arm64 + Linux x86_64 (Windows lands in Phase 4) |
+| **G1** | Builds clean on all CI targets | `cargo build --workspace --all-targets` on macOS arm64 + Linux x86_64 (Windows lands in Phase 4). The off-by-default `provider-llama-cpp` feature runs on nightly cron + release tag + manual dispatch via [`.github/workflows/provider-llama-cpp.yml`](../.github/workflows/provider-llama-cpp.yml); not gated on per-PR CI. See [`llama-cpp-build.md`](llama-cpp-build.md). |
 | **G2** | Tests pass | `cargo test --workspace --all-features` |
 | **G2.1** | **≥ 98% line coverage** | `cargo llvm-cov --workspace --all-features --fail-under-lines 98`. The 100% target lives in [`coverage-exclusions.md`](coverage-exclusions.md); the gap is a small set of documented carve-outs (infallible-by-our-shape serialization, TTY-bound TUI init paths, platform-conditional CPU-feature branches). |
 | **G2.2** | **Integration tests for every public surface** | `tests/` cover each CLI subcommand, each TUI flow (via `ratatui::backend::TestBackend`), each provider method, each tool, each sandbox profile, each `STRAT-Exxxx` error path. |
