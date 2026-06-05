@@ -11,15 +11,69 @@
 //! GGUF-fetch work; the contract (atomic + SHA-verified + interruption-safe)
 //! is identical, only the byte source changes.
 
+use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use stratum_types::error::codes::E1001_INSTALLED_SCHEMA_UNREADABLE;
 use stratum_types::{StratumError, StratumResult};
 
+use crate::retry::{
+    retry_with_clock_seeded, Clock, Jitter, RetryDecision, RetryError, RetryPolicy, SystemClock,
+};
+
 const COPY_CHUNK: usize = 64 * 1024;
+
+/// Default retry policy for HTTP installs.
+///
+/// Used by [`ModelInstaller::install_from_url`] for transient HTTP
+/// failures; mirrors the contract in `plan/32-cancellation-and-timeouts.md`
+/// §6: 4 attempts, 250ms→5s exponential backoff with full jitter.
+#[must_use]
+pub const fn default_install_retry_policy() -> RetryPolicy {
+    RetryPolicy {
+        max_attempts: 4,
+        initial_delay: Duration::from_millis(250),
+        max_delay: Duration::from_secs(5),
+        backoff_multiplier: 2.0,
+        jitter: Jitter::Full,
+    }
+}
+
+/// Error surface for retry-wrapped installs.
+///
+/// `Retryable` carries the outcome of the underlying [`crate::retry`] loop
+/// — either a [`RetryError::Fatal`] short-circuit or a
+/// [`RetryError::Exhausted`] failure after every attempt was used. The
+/// inner `String` is the short, classifier-friendly reason text
+/// (e.g. `"status 502"`, `"transport: timed out"`).
+///
+/// `NonRetryable` carries terminal errors that fall outside the retry loop:
+/// e.g. a SHA-256 mismatch detected after the body finishes streaming, or
+/// a local filesystem failure (creating the destination directory).
+#[derive(Debug)]
+pub enum InstallTransientError {
+    /// Transient-failure path: the underlying retry helper gave up.
+    Retryable(RetryError<String>),
+    /// Terminal failure, with a short human-readable reason.
+    NonRetryable(String),
+}
+
+impl fmt::Display for InstallTransientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Retryable(e) => write!(f, "install transient failure: {e}"),
+            Self::NonRetryable(s) => write!(f, "install terminal failure: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for InstallTransientError {}
 
 /// Outcome reported back from a model install.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +143,25 @@ fn io_err(message: impl Into<String>, cause: std::io::Error) -> StratumError {
     StratumError::new(E1001_INSTALLED_SCHEMA_UNREADABLE, message).with_cause(cause)
 }
 
+/// Project a transient-install error onto the `StratumResult` surface used
+/// by the public installer API.
+fn transient_to_stratum(url: &str, err: InstallTransientError) -> StratumError {
+    StratumError::new(E1001_INSTALLED_SCHEMA_UNREADABLE, format!("http get {url}")).with_cause(err)
+}
+
+/// Classifier shared by `install_from_url_with_retry` and tests.
+///
+/// `"status 4xx"` → fatal; everything else (`"status 5xx"`, `"transport:
+/// ..."`, partial-write failures the attempt promoted to transport-like)
+/// → retry.
+fn classify_http_reason(reason: &str) -> RetryDecision {
+    if reason.starts_with("status 4") {
+        RetryDecision::Fatal
+    } else {
+        RetryDecision::Retry
+    }
+}
+
 /// Predicate: does the server's `Content-Range` header begin at the offset
 /// the client requested (`bytes <start>-…/…`)? A missing or malformed
 /// header conservatively returns `false`, which forces a clean restart.
@@ -151,93 +224,148 @@ impl ModelInstaller<'_> {
     /// Returns [`E1001_INSTALLED_SCHEMA_UNREADABLE`] for HTTP, io, or
     /// digest-mismatch failures.
     pub fn install_from_url(&self, url: &str) -> StratumResult<InstallReport> {
+        self.install_from_url_with_retry(url, &default_install_retry_policy())
+    }
+
+    /// Like [`Self::install_from_url`] but with a caller-supplied retry
+    /// `policy`. Transient HTTP failures (5xx, transport errors, mid-body
+    /// connection drops) are retried with exponential backoff; on each
+    /// retry the request includes `Range: bytes=<n>-` so the new attempt
+    /// resumes from wherever the previous one left bytes on disk. Terminal
+    /// errors (4xx, SHA mismatch, local filesystem failures) short-circuit.
+    ///
+    /// # Errors
+    /// Same code as [`Self::install_from_url`]. The underlying
+    /// [`InstallTransientError`] is preserved in the `cause` chain.
+    pub fn install_from_url_with_retry(
+        &self,
+        url: &str,
+        policy: &RetryPolicy,
+    ) -> StratumResult<InstallReport> {
+        self.install_from_url_with_retry_and_clock(url, policy, &SystemClock)
+    }
+
+    /// Clock-injecting variant used by deterministic tests. Production code
+    /// always goes through [`Self::install_from_url_with_retry`] which uses
+    /// the real wall clock.
+    fn install_from_url_with_retry_and_clock<K: Clock + ?Sized>(
+        &self,
+        url: &str,
+        policy: &RetryPolicy,
+        clock: &K,
+    ) -> StratumResult<InstallReport> {
         std::fs::create_dir_all(self.dest_dir)
             .map_err(|e| io_err(format!("create {}", self.dest_dir.display()), e))?;
         let dest = self.dest_dir.join(self.dest_filename);
         let partial = partial_path(&dest);
-        let resume_from = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
 
+        // Deterministic seed: production jitter only needs to vary across
+        // attempts within a single install, not across processes.
+        let mut rng = SmallRng::seed_from_u64(0);
+        let classifier = |reason: &String| classify_http_reason(reason.as_str());
+        let mut op =
+            |_attempt: u32| -> Result<(), String> { Self::attempt_http_fetch(url, &partial) };
+        let retry_outcome = retry_with_clock_seeded(policy, &classifier, clock, &mut rng, &mut op);
+        match retry_outcome {
+            Ok(()) => {}
+            Err(e) => {
+                return Err(transient_to_stratum(
+                    url,
+                    InstallTransientError::Retryable(e),
+                ));
+            }
+        }
+
+        // Body fully on disk in `partial`. Hash, verify, rename.
+        self.finalize_partial(&dest, &partial)
+    }
+
+    /// Single HTTP attempt: read `partial.len()` off disk, build a request
+    /// (with `Range:` if we have a partial), and stream the response body
+    /// into `partial` (appending on 206, truncating on 200). Returns Ok
+    /// when the body completes, `Err(reason)` for any transient or fatal
+    /// failure — the classifier reads the reason prefix to decide.
+    fn attempt_http_fetch(url: &str, partial: &Path) -> Result<(), String> {
+        let resume_from = std::fs::metadata(partial).map(|m| m.len()).unwrap_or(0);
         let mut req = ureq::get(url);
         if resume_from > 0 {
             req = req.set("Range", &format!("bytes={resume_from}-"));
         }
-        let response = req.call().map_err(|e| {
-            StratumError::new(E1001_INSTALLED_SCHEMA_UNREADABLE, format!("http get {url}"))
-                .with_cause(e)
-        })?;
-
-        if resume_from > 0
-            && response.status() == 206
-            && content_range_starts_at(&response, resume_from)
-        {
-            self.finish_resumed_install(&dest, &partial, resume_from, response.into_reader())
-        } else {
-            // 200 OK (or 206 the client cannot trust): start over from byte 0.
-            if partial.exists() {
-                std::fs::remove_file(&partial)
-                    .map_err(|e| io_err(format!("clear stale partial {}", partial.display()), e))?;
+        let response = match req.call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, _)) => {
+                return Err(format!("status {code}"));
             }
-            self.install_from_reader(response.into_reader())
+            Err(ureq::Error::Transport(t)) => {
+                return Err(format!("transport: {t}"));
+            }
+        };
+
+        let resume_ok = resume_from > 0
+            && response.status() == 206
+            && content_range_starts_at(&response, resume_from);
+        let mut reader = response.into_reader();
+        let mut writer = if resume_ok {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(partial)
+                .map_err(|e| format!("open partial: {e}"))?
+        } else {
+            // 200 OK (or 206 we cannot trust): drop any stale partial and
+            // write from byte 0.
+            if partial.exists() {
+                std::fs::remove_file(partial).map_err(|e| format!("clear partial: {e}"))?;
+            }
+            std::fs::File::create(partial).map_err(|e| format!("create partial: {e}"))?
+        };
+
+        let mut buf = vec![0_u8; COPY_CHUNK];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => return Err(format!("transport: {e}")),
+            };
+            writer
+                .write_all(&buf[..n])
+                .map_err(|e| format!("write partial: {e}"))?;
         }
+        Ok(())
     }
 
-    /// Finish a `206 Partial Content` install by re-hashing the existing
-    /// `<dest>.partial` bytes off disk, then appending the streamed
-    /// remainder while updating the hash in lockstep.
-    fn finish_resumed_install<R: Read>(
-        &self,
-        dest: &Path,
-        partial: &Path,
-        resume_from: u64,
-        mut reader: R,
-    ) -> StratumResult<InstallReport> {
+    /// Hash the on-disk `partial`, verify the expected digest if any, and
+    /// rename to `dest`. SHA mismatch is treated as a terminal failure and
+    /// the partial is removed.
+    fn finalize_partial(&self, dest: &Path, partial: &Path) -> StratumResult<InstallReport> {
         let mut hasher = Sha256::new();
-        // Re-hash the on-disk prefix so the final digest covers the whole file.
-        let mut existing = std::fs::File::open(partial)
+        let mut total = 0_u64;
+        let mut file = std::fs::File::open(partial)
             .map_err(|e| io_err(format!("open partial {}", partial.display()), e))?;
         let mut buf = vec![0_u8; COPY_CHUNK];
         loop {
-            let n = existing
+            let n = file
                 .read(&mut buf)
-                .map_err(|e| io_err(format!("rehash partial {}", partial.display()), e))?;
+                .map_err(|e| io_err(format!("hash partial {}", partial.display()), e))?;
             if n == 0 {
                 break;
             }
             hasher.update(&buf[..n]);
+            total = total.saturating_add(n as u64);
         }
-        drop(existing);
-
-        let mut writer = std::fs::OpenOptions::new()
-            .append(true)
-            .open(partial)
-            .map_err(|e| io_err(format!("append partial {}", partial.display()), e))?;
-        let mut written = 0_u64;
-        loop {
-            let n = reader
-                .read(&mut buf)
-                .map_err(|e| io_err(format!("stream into {}", partial.display()), e))?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            writer
-                .write_all(&buf[..n])
-                .map_err(|e| io_err(format!("write partial {}", partial.display()), e))?;
-            written = written.saturating_add(n as u64);
-        }
+        drop(file);
         let actual = hex(&hasher.finalize());
-        let bytes = resume_from.saturating_add(written);
 
         let verified = if let Some(expected) = self.expected_sha256 {
             if !digest_matches(expected, &actual) {
                 let _ = std::fs::remove_file(partial);
-                return Err(StratumError::new(
-                    E1001_INSTALLED_SCHEMA_UNREADABLE,
-                    format!(
-                        "sha256 mismatch for {}: expected {expected}, got {actual}",
-                        dest.display()
-                    ),
-                ));
+                let reason = format!(
+                    "sha256 mismatch for {}: expected {expected}, got {actual}",
+                    dest.display()
+                );
+                return Err(
+                    StratumError::new(E1001_INSTALLED_SCHEMA_UNREADABLE, reason.clone())
+                        .with_cause(InstallTransientError::NonRetryable(reason)),
+                );
             }
             true
         } else {
@@ -247,7 +375,7 @@ impl ModelInstaller<'_> {
             .map_err(|e| io_err(format!("rename to {}", dest.display()), e))?;
         Ok(InstallReport {
             dest: dest.to_path_buf(),
-            bytes,
+            bytes: total,
             sha256: actual,
             verified,
         })
@@ -937,6 +1065,327 @@ mod tests {
         let url = spawn_range_server(b"hello".to_vec(), RangeMode::Ignore);
         let resp = ureq::get(&url).call().expect("plain 200");
         assert!(!content_range_starts_at(&resp, 0));
+    }
+
+    // ===== Retry-with-clock tests =====
+    //
+    // These exercise `install_from_url_with_retry_and_clock` against a
+    // `ManualClock`, so backoff sleeps are captured without blocking and the
+    // sequence of HTTP responses is fully scripted via a multi-connection
+    // test server.
+
+    use crate::retry::{ManualClock as RetryManualClock, RetryError};
+
+    /// One scripted response for the n-th inbound connection.
+    enum Step {
+        /// Reply with the given raw header bytes + payload, then close.
+        Reply { headers: String, payload: Vec<u8> },
+        /// Honor a `Range:` request — reply 206 with the suffix of `body`
+        /// starting at the requested offset, then close.
+        RangeFrom(Vec<u8>),
+        /// Reply with the first `prefix_bytes` of `body`, then drop the
+        /// connection (no Content-Length set, mid-stream close).
+        DropAfter { body: Vec<u8>, prefix_bytes: usize },
+        /// Close the connection immediately, before sending any bytes.
+        CloseImmediately,
+    }
+
+    fn spawn_scripted_server(steps: Vec<Step>) -> String {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conn_count = steps.len();
+        std::thread::spawn(move || {
+            let mut steps_iter = steps.into_iter();
+            for stream in listener.incoming().take(conn_count) {
+                let Ok(mut stream) = stream else { continue };
+                let Some(step) = steps_iter.next() else { break };
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
+                match step {
+                    Step::Reply { headers, payload } => {
+                        let _ = stream.write_all(headers.as_bytes());
+                        let _ = stream.write_all(&payload);
+                        let _ = stream.flush();
+                    }
+                    Step::RangeFrom(body) => {
+                        let total = body.len();
+                        let start = parse_range_start(request).unwrap_or(0);
+                        let start_usize = usize::try_from(start).unwrap_or(0);
+                        if start_usize >= total {
+                            let h = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            let _ = stream.write_all(h.as_bytes());
+                        } else if start_usize == 0 {
+                            let h = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                            );
+                            let _ = stream.write_all(h.as_bytes());
+                            let _ = stream.write_all(&body);
+                        } else {
+                            let slice = &body[start_usize..];
+                            let end = total - 1;
+                            let h = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{total}\r\nConnection: close\r\n\r\n",
+                                slice.len()
+                            );
+                            let _ = stream.write_all(h.as_bytes());
+                            let _ = stream.write_all(slice);
+                        }
+                        let _ = stream.flush();
+                    }
+                    Step::DropAfter { body, prefix_bytes } => {
+                        // Advertise the full length, then close after only
+                        // `prefix_bytes` bytes — ureq's reader surfaces the
+                        // short-read as a transport error which the retry
+                        // classifier sees as `transport: ...`.
+                        let total = body.len();
+                        let h = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(h.as_bytes());
+                        let _ = stream.write_all(&body[..prefix_bytes]);
+                        let _ = stream.flush();
+                        // Drop the stream while remaining bytes are still pending.
+                        drop(stream);
+                    }
+                    Step::CloseImmediately => {
+                        // Drop without sending anything — the client sees a
+                        // transport error (connection reset) before any
+                        // HTTP framing arrives.
+                        drop(stream);
+                    }
+                }
+            }
+        });
+        format!("http://{addr}/file")
+    }
+
+    fn fast_test_policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            initial_delay: Duration::from_millis(250),
+            max_delay: Duration::from_secs(5),
+            backoff_multiplier: 2.0,
+            jitter: Jitter::None,
+        }
+    }
+
+    #[test]
+    fn retry_happy_path_single_attempt_no_sleeps() {
+        let tmp = TempDir::new().unwrap();
+        let url = spawn_scripted_server(vec![Step::RangeFrom(b"hello".to_vec())]);
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some(HELLO_SHA),
+        };
+        let clock = RetryManualClock::new();
+        let report = installer
+            .install_from_url_with_retry_and_clock(&url, &fast_test_policy(4), &clock)
+            .unwrap();
+        assert_eq!(report.bytes, 5);
+        assert!(report.verified);
+        assert!(clock.sleeps().is_empty(), "no retry → no sleeps");
+    }
+
+    #[test]
+    fn retry_transient_502_then_200_records_one_sleep() {
+        let tmp = TempDir::new().unwrap();
+        let body = b"hello".to_vec();
+        let h502 = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string();
+        let url = spawn_scripted_server(vec![
+            Step::Reply {
+                headers: h502,
+                payload: Vec::new(),
+            },
+            Step::RangeFrom(body),
+        ]);
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some(HELLO_SHA),
+        };
+        let clock = RetryManualClock::new();
+        let report = installer
+            .install_from_url_with_retry_and_clock(&url, &fast_test_policy(4), &clock)
+            .unwrap();
+        assert_eq!(report.bytes, 5);
+        assert_eq!(report.sha256, HELLO_SHA);
+        assert_eq!(
+            clock.sleeps().len(),
+            1,
+            "exactly one inter-attempt sleep on the second attempt"
+        );
+    }
+
+    #[test]
+    fn retry_always_502_exhausts_with_three_sleeps() {
+        let tmp = TempDir::new().unwrap();
+        let h502 = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string();
+        let url = spawn_scripted_server(vec![
+            Step::Reply {
+                headers: h502.clone(),
+                payload: Vec::new(),
+            },
+            Step::Reply {
+                headers: h502.clone(),
+                payload: Vec::new(),
+            },
+            Step::Reply {
+                headers: h502.clone(),
+                payload: Vec::new(),
+            },
+            Step::Reply {
+                headers: h502,
+                payload: Vec::new(),
+            },
+        ]);
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some(HELLO_SHA),
+        };
+        let clock = RetryManualClock::new();
+        let err = installer
+            .install_from_url_with_retry_and_clock(&url, &fast_test_policy(4), &clock)
+            .unwrap_err();
+        assert_eq!(err.code(), &E1001_INSTALLED_SCHEMA_UNREADABLE);
+        // 4 attempts → 3 inter-attempt sleeps.
+        assert_eq!(clock.sleeps().len(), 3);
+    }
+
+    #[test]
+    fn retry_404_short_circuits_to_fatal() {
+        let tmp = TempDir::new().unwrap();
+        let h404 =
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+        let url = spawn_scripted_server(vec![Step::Reply {
+            headers: h404,
+            payload: Vec::new(),
+        }]);
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: None,
+        };
+        let clock = RetryManualClock::new();
+        let err = installer
+            .install_from_url_with_retry_and_clock(&url, &fast_test_policy(4), &clock)
+            .unwrap_err();
+        assert_eq!(err.code(), &E1001_INSTALLED_SCHEMA_UNREADABLE);
+        assert!(
+            clock.sleeps().is_empty(),
+            "fatal short-circuits before any sleep"
+        );
+    }
+
+    #[test]
+    fn retry_range_resume_after_mid_stream_drop() {
+        // 1 KiB deterministic body. First attempt: server sends the first
+        // 512 bytes then closes mid-stream. Client retries with
+        // `Range: bytes=512-` and receives the remaining 512 bytes.
+        let body: Vec<u8> = (0..1024_u16)
+            .map(|i| u8::try_from(i % 256).unwrap_or(0))
+            .collect();
+        let expected = sha256_hex(&body);
+
+        let tmp = TempDir::new().unwrap();
+        let url = spawn_scripted_server(vec![
+            Step::DropAfter {
+                body: body.clone(),
+                prefix_bytes: 512,
+            },
+            Step::RangeFrom(body.clone()),
+        ]);
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some(&expected),
+        };
+        let clock = RetryManualClock::new();
+        let report = installer
+            .install_from_url_with_retry_and_clock(&url, &fast_test_policy(4), &clock)
+            .unwrap();
+        assert_eq!(report.bytes, body.len() as u64);
+        assert_eq!(report.sha256, expected);
+        assert!(report.verified);
+        assert_eq!(std::fs::read(&report.dest).unwrap(), body);
+        assert_eq!(clock.sleeps().len(), 1, "one retry after the drop");
+    }
+
+    #[test]
+    fn retry_transport_close_then_success() {
+        // First connection: server closes without sending any HTTP framing.
+        // ureq surfaces this as `Transport(_)` which we classify as retryable.
+        // Second connection: clean 200.
+        let tmp = TempDir::new().unwrap();
+        let url = spawn_scripted_server(vec![
+            Step::CloseImmediately,
+            Step::RangeFrom(b"hello".to_vec()),
+        ]);
+        let installer = ModelInstaller {
+            dest_dir: tmp.path(),
+            dest_filename: "remote.bin",
+            expected_sha256: Some(HELLO_SHA),
+        };
+        let clock = RetryManualClock::new();
+        let report = installer
+            .install_from_url_with_retry_and_clock(&url, &fast_test_policy(4), &clock)
+            .unwrap();
+        assert_eq!(report.bytes, 5);
+        assert_eq!(clock.sleeps().len(), 1);
+    }
+
+    #[test]
+    fn install_transient_error_display_covers_both_variants() {
+        let retryable: InstallTransientError =
+            InstallTransientError::Retryable(RetryError::Exhausted {
+                attempts: 4,
+                last_error: "status 502".to_string(),
+            });
+        let nonretryable = InstallTransientError::NonRetryable("sha256 mismatch".to_string());
+        let rmsg = retryable.to_string();
+        let nmsg = nonretryable.to_string();
+        assert!(rmsg.contains("502"));
+        assert!(rmsg.contains("transient"));
+        assert!(nmsg.contains("mismatch"));
+        assert!(nmsg.contains("terminal"));
+        // Trigger the Debug impl too so the derive is covered.
+        let _ = format!("{retryable:?}");
+        let _ = format!("{nonretryable:?}");
+    }
+
+    #[test]
+    fn install_transient_error_implements_error_trait() {
+        fn assert_error<E: std::error::Error>() {}
+        assert_error::<InstallTransientError>();
+    }
+
+    #[test]
+    fn default_install_retry_policy_matches_spec() {
+        let p = default_install_retry_policy();
+        assert_eq!(p.max_attempts, 4);
+        assert_eq!(p.initial_delay, Duration::from_millis(250));
+        assert_eq!(p.max_delay, Duration::from_secs(5));
+        assert!((p.backoff_multiplier - 2.0).abs() < f64::EPSILON);
+        assert_eq!(p.jitter, Jitter::Full);
+    }
+
+    #[test]
+    fn classify_http_reason_categorises_known_prefixes() {
+        assert_eq!(classify_http_reason("status 502"), RetryDecision::Retry);
+        assert_eq!(classify_http_reason("status 503"), RetryDecision::Retry);
+        assert_eq!(classify_http_reason("status 404"), RetryDecision::Fatal);
+        assert_eq!(classify_http_reason("status 403"), RetryDecision::Fatal);
+        assert_eq!(
+            classify_http_reason("transport: timed out"),
+            RetryDecision::Retry
+        );
     }
 
     #[test]
