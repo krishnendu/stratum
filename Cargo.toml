@@ -70,6 +70,7 @@ sha2            = "0.11"
 ureq            = { version = "2", default-features = false, features = ["tls"] }
 rand            = { version = "0.9", default-features = false, features = ["small_rng", "std", "std_rng"] }
 zeroize         = { version = "1", features = ["derive"] }
+regex           = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
 # Optional, only pulled in when the `provider-llama-cpp` feature is enabled
 # on `stratum-runtime` (and transitively on `stratum-cli`). Off by default
 # so per-PR CI does not pay the multi-minute llama.cpp build cost.
