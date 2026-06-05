@@ -40,6 +40,8 @@ pub mod sandbox;
 pub mod sandbox_profile;
 /// Composite tier classifier (low / medium / high).
 pub mod tier;
+/// Workspace / project discovery (`stratum.toml`, `.stratumignore`).
+pub mod workspace;
 
 pub use cancel::CancelToken;
 pub use download::{InstallReport, ModelInstaller};
@@ -53,3 +55,4 @@ pub use registry::Registry;
 pub use sandbox::{SandboxBackend, SandboxReport};
 pub use sandbox_profile::{Mount, NetPolicy, SandboxProfile};
 pub use tier::Tier;
+pub use workspace::{Workspace, WorkspaceConfig};
