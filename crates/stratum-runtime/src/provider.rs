@@ -1,14 +1,19 @@
 //! Provider primitives.
 //!
-//! Phase 1 v2 ships **concrete** providers only; the `Provider` trait
-//! abstraction lands in Phase 2 once a second consumer (the embedder)
-//! makes the seams visible. For now we have `EchoProvider`, a deterministic
-//! provider used by the chat-loop tests and by `stratum echo`.
+//! Phase 2 v2 extracts the `Provider` trait. `EchoProvider` becomes its
+//! first concrete implementation; future providers (`LlamaCppProvider`,
+//! `CandleProvider` embedder) will plug into the same surface so the
+//! orchestrator can fan out across them.
+//!
+//! The trait is intentionally minimal in this pass: synchronous `generate`
+//! returning a `Vec<Block>`. Asynchronous streaming and structured
+//! `transcribe` / `synthesize` / `embed` methods land when their
+//! consumers do.
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use stratum_types::{Block, ModelId};
+use stratum_types::{Block, Capability, ModelId};
 
 use crate::cancel::CancelToken;
 
@@ -21,6 +26,26 @@ pub struct GenerateRequest {
     pub prompt: String,
     /// Maximum number of `Block`s to emit (excluding `Done`/`Cancelled`).
     pub max_blocks: u32,
+}
+
+/// Trait every concrete provider implements.
+///
+/// The `'static + Send + Sync` bound lets the runtime hold providers behind
+/// `Arc<dyn Provider>` and share them across orchestrator tasks. The trait
+/// is object-safe by design — no generic methods, no `Self` in return
+/// position.
+pub trait Provider: std::fmt::Debug + Send + Sync + 'static {
+    /// Stable identifier used by the registry, e.g. `"echo"` or
+    /// `"llama-cpp-2/gemma-4-e4b-q4_k_m"`.
+    fn id(&self) -> &str;
+
+    /// Capabilities exposed by this provider. Used by the registry to
+    /// answer "who can serve role X?" queries.
+    fn capabilities(&self) -> &'static [Capability];
+
+    /// Run a synchronous generation. The provider polls `cancel` between
+    /// tokens and emits `Block::Cancelled` if it fires before completion.
+    fn generate(&self, request: &GenerateRequest, cancel: &CancelToken) -> Vec<Block>;
 }
 
 /// Deterministic echo provider for end-to-end loop tests.
@@ -41,13 +66,27 @@ impl EchoProvider {
             prefix: Arc::new(prefix.into()),
         }
     }
+}
+
+impl Provider for EchoProvider {
+    #[allow(
+        clippy::unnecessary_literal_bound,
+        reason = "trait signature returns &str so impls returning borrowed strings (e.g. NamedEcho) compile too"
+    )]
+    fn id(&self) -> &str {
+        "echo"
+    }
+
+    fn capabilities(&self) -> &'static [Capability] {
+        const CAPS: &[Capability] = &[Capability::Generate];
+        CAPS
+    }
 
     /// Run the request synchronously, returning the captured stream.
     ///
     /// The provider polls `cancel` between words and emits `Block::Cancelled`
     /// when the token fires.
-    #[must_use]
-    pub fn generate(&self, request: &GenerateRequest, cancel: &CancelToken) -> Vec<Block> {
+    fn generate(&self, request: &GenerateRequest, cancel: &CancelToken) -> Vec<Block> {
         let mut out = Vec::new();
         let mut emitted = 0_u32;
         let mut prompt_tokens = 0_u32;
