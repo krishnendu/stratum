@@ -34,6 +34,8 @@ pub mod install;
 pub mod logging;
 /// MCP client + server data shapes (Phase 3 data-only scaffold for Phase 6).
 pub mod mcp;
+/// Curated model catalog: structured index of installer-resolvable models.
+pub mod model_catalog;
 /// Turn-level observability primitives: token meter, latency steps, tok/s.
 pub mod observability;
 /// Panic hook + crash report file writer.
@@ -62,6 +64,8 @@ pub mod sandbox_profile;
 pub mod sandbox_resolve;
 /// Secrets / keyring data shape (Phase 1 scaffold; real OS backend lands later).
 pub mod secrets;
+/// Default-on opt-out telemetry payload shape + allowlist guard.
+pub mod telemetry;
 /// Composite tier classifier (low / medium / high).
 pub mod tier;
 /// Tool registry and capability matrix.
@@ -87,6 +91,10 @@ pub use install::{
 pub use mcp::{
     McpServeTransport, McpServerConfig, McpServerExpose, McpServerSet, McpServerStatus,
     McpTransport,
+};
+pub use model_catalog::{
+    ArtifactRef, ArtifactRefError, CatalogError, ModelCatalog, ModelEntry, ModelSlug,
+    ModelSlugError, ModelTask, ModelTier, MODEL_CATALOG_SCHEMA_VERSION,
 };
 pub use observability::{
     format_tokens_per_second, RoleStep, RoleTimer, TurnId, TurnIdGen, TurnMetrics, TurnRecorder,
@@ -114,6 +122,11 @@ pub use sandbox_resolve::{
 pub use secrets::{
     redact_for_log, InMemorySecretStore, ProjectId, SecretId, SecretIdError, SecretRef,
     SecretScope, SecretStore, SecretStoreError, SecretValue,
+};
+pub use telemetry::{
+    build_payload, payload_is_allowlisted, redact, AnonInstallId, AnonInstallIdError, CpuArchTag,
+    OsTag, ReleaseChannel, TelemetryConfig, TelemetryError, TelemetryEventKind, TelemetryPayload,
+    TELEMETRY_SCHEMA_VERSION,
 };
 pub use tier::Tier;
 pub use tools::{CapabilityEntry, CapabilityMatrix};
