@@ -36,6 +36,8 @@ use ratatui::Terminal;
 use stratum_runtime::{CancelToken, EchoProvider, GenerateRequest, Paths, Provider, Tier};
 use stratum_types::{Block, ModelId, StratumResult};
 
+use crate::palette::{self, Palette};
+
 /// One entry in the chat transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Turn {
@@ -45,6 +47,8 @@ pub enum Turn {
     Assistant(Vec<Block>),
     /// Cancellation marker (Ctrl-C mid-stream).
     Cancelled,
+    /// Slash command was invoked from the palette.
+    Command(String),
 }
 
 /// Pure TUI state. Driven by events; rendered into any [`Backend`].
@@ -57,6 +61,7 @@ pub struct ChatState {
     tier: Tier,
     quit: bool,
     status: String,
+    palette: Option<Palette>,
 }
 
 impl ChatState {
@@ -71,7 +76,15 @@ impl ChatState {
             tier,
             quit: false,
             status,
+            palette: None,
         }
+    }
+
+    /// Is the slash-command palette currently visible?
+    #[must_use]
+    #[cfg(test)]
+    const fn palette_open(&self) -> bool {
+        self.palette.is_some()
     }
 
     /// Has the user asked to quit?
@@ -96,6 +109,20 @@ impl ChatState {
 
     /// Apply a keyboard event.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // Palette mode owns the keyboard while open.
+        if let Some(palette) = self.palette.as_mut() {
+            match palette.handle_key(key) {
+                palette::Action::None => {}
+                palette::Action::Close => {
+                    self.palette = None;
+                }
+                palette::Action::Execute(name) => {
+                    self.palette = None;
+                    self.execute_command(&name);
+                }
+            }
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => self.quit = true,
@@ -104,6 +131,9 @@ impl ChatState {
                 self.transcript.push(Turn::Cancelled);
                 self.quit = true;
             }
+            KeyCode::Char('/') if self.input.is_empty() => {
+                self.palette = Some(Palette::new());
+            }
             KeyCode::Char(c) => self.input.push(c),
             KeyCode::Backspace => {
                 self.input.pop();
@@ -111,6 +141,13 @@ impl ChatState {
             KeyCode::Enter => self.submit(),
             _ => {}
         }
+    }
+
+    fn execute_command(&mut self, name: &str) {
+        if name == "quit" {
+            self.quit = true;
+        }
+        self.transcript.push(Turn::Command(name.to_string()));
     }
 
     /// Submit the current input to the provider and append the result.
@@ -131,12 +168,13 @@ impl ChatState {
 
     /// Render the entire TUI into the given frame.
     pub fn render(&self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        let palette_height = if self.palette.is_some() { 10 } else { 3 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Min(3),
-                Constraint::Length(3),
+                Constraint::Length(palette_height),
             ])
             .split(area);
 
@@ -169,6 +207,10 @@ impl ChatState {
                     "(cancelled)",
                     Style::default().add_modifier(Modifier::ITALIC),
                 ))),
+                Turn::Command(name) => lines.push(Line::from(Span::styled(
+                    format!("(executed /{name})"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ))),
             }
         }
         let chat = Paragraph::new(lines)
@@ -176,9 +218,29 @@ impl ChatState {
             .wrap(Wrap { trim: false });
         ratatui::widgets::Widget::render(chat, chunks[1], buf);
 
-        let input = Paragraph::new(Line::from(vec![Span::raw("> "), Span::raw(&self.input)]))
-            .block(TuiBlock::default().borders(Borders::ALL).title("input"));
-        ratatui::widgets::Widget::render(input, chunks[2], buf);
+        if let Some(palette) = self.palette.as_ref() {
+            let matches = palette.matches();
+            let mut palette_lines: Vec<Line<'_>> = Vec::new();
+            palette_lines.push(Line::from(vec![
+                Span::styled("palette: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(palette.filter().to_string()),
+            ]));
+            for (idx, cmd) in matches.iter().enumerate() {
+                let style = if idx == palette.cursor() {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                palette_lines.push(Line::from(Span::styled(format!("/{}", cmd.name), style)));
+            }
+            let palette_widget = Paragraph::new(palette_lines)
+                .block(TuiBlock::default().borders(Borders::ALL).title("palette"));
+            ratatui::widgets::Widget::render(palette_widget, chunks[2], buf);
+        } else {
+            let input = Paragraph::new(Line::from(vec![Span::raw("> "), Span::raw(&self.input)]))
+                .block(TuiBlock::default().borders(Borders::ALL).title("input"));
+            ratatui::widgets::Widget::render(input, chunks[2], buf);
+        }
     }
 }
 
@@ -354,6 +416,78 @@ mod tests {
         assert!(!s.should_quit());
     }
 
+    #[test]
+    fn slash_with_empty_input_opens_palette() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(s.palette_open());
+    }
+
+    #[test]
+    fn slash_with_text_input_just_appends() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE));
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(!s.palette_open());
+        assert_eq!(s.input(), "a/");
+    }
+
+    #[test]
+    fn palette_esc_closes_without_execute() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        s.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!s.palette_open());
+        assert!(s.transcript().is_empty());
+    }
+
+    #[test]
+    fn palette_enter_executes_command() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        // First alphabetical match is "active".
+        s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!s.palette_open());
+        assert!(matches!(s.transcript().last(), Some(Turn::Command(_))));
+    }
+
+    #[test]
+    fn palette_quit_command_sets_quit() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        for c in "qui".chars() {
+            s.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(s.should_quit());
+        let Some(Turn::Command(name)) = s.transcript().last() else {
+            panic!("expected command turn")
+        };
+        assert_eq!(name, "quit");
+    }
+
+    #[test]
+    fn palette_ctrl_c_closes_without_executing() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        s.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!s.palette_open());
+        assert!(s.transcript().is_empty());
+    }
+
+    #[test]
+    fn palette_typing_filters() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        s.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE));
+        s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let Some(Turn::Command(name)) = s.transcript().last() else {
+            panic!("expected command turn")
+        };
+        // Filter "m" leaves "model" and "models"; cursor=0 picks "model".
+        assert_eq!(name, "model");
+    }
+
     fn rendered_text(state: &ChatState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -392,6 +526,27 @@ mod tests {
         assert!(text.contains("you:"));
         assert!(text.contains("hi"));
         assert!(text.contains("echo: hi"));
+    }
+
+    #[test]
+    fn render_shows_palette_when_open() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        s.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE));
+        let text = rendered_text(&s, 60, 12);
+        assert!(text.contains("palette"));
+        assert!(text.contains("/model"));
+        // Input pane is replaced; "input" title should be gone.
+        assert!(!text.contains(" input "));
+    }
+
+    #[test]
+    fn render_shows_executed_command_marker() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let text = rendered_text(&s, 60, 10);
+        assert!(text.contains("executed /active"));
     }
 
     #[test]
