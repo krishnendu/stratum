@@ -32,6 +32,8 @@ pub mod probe;
 pub mod prompts;
 /// Provider abstractions and concrete `EchoProvider` for end-to-end loop tests.
 pub mod provider;
+/// Provider registry + role-to-provider routing table.
+pub mod registry;
 /// Composite tier classifier (low / medium / high).
 pub mod tier;
 
@@ -42,5 +44,6 @@ pub use install::{InstalledToml, TierInputs};
 pub use paths::Paths;
 pub use probe::{GpuBackend, HardwareProbe};
 pub use prompts::{system_prompt, PromptRole};
-pub use provider::{EchoProvider, GenerateRequest};
+pub use provider::{EchoProvider, GenerateRequest, Provider};
+pub use registry::Registry;
 pub use tier::Tier;

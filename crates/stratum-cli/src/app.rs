@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use stratum_runtime::{
     CancelToken, EchoProvider, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml,
-    MemoryGate, ModelInstaller, Paths, Tier, DEFAULT_MARGIN_MIB,
+    MemoryGate, ModelInstaller, Paths, Provider, Tier, DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::OffsetDateTime;

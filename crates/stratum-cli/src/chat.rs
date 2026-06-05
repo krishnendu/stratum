@@ -33,7 +33,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as TuiBlock, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
-use stratum_runtime::{CancelToken, EchoProvider, GenerateRequest, Paths, Tier};
+use stratum_runtime::{CancelToken, EchoProvider, GenerateRequest, Paths, Provider, Tier};
 use stratum_types::{Block, ModelId, StratumResult};
 
 /// One entry in the chat transcript.
