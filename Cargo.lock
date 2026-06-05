@@ -1331,6 +1331,7 @@ name = "stratum-runtime"
 version = "0.0.0"
 dependencies = [
  "dirs",
+ "rand",
  "serde",
  "serde_json",
  "sha2",

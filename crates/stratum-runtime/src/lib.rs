@@ -50,6 +50,8 @@ pub mod rag;
 pub mod rate_limit;
 /// Provider registry + role-to-provider routing table.
 pub mod registry;
+/// Deterministic retry-with-backoff helper for transient errors.
+pub mod retry;
 /// Sandbox backend detection.
 pub mod sandbox;
 /// Sandbox profile bodies (bwrap-*, macos-*, passthrough).
@@ -93,6 +95,10 @@ pub use rate_limit::{
     TokenBucketConfig,
 };
 pub use registry::Registry;
+pub use retry::{
+    retry, retry_with_clock, Clock as RetryClock, Jitter, ManualClock as RetryManualClock,
+    RetryClassifier, RetryDecision, RetryError, RetryPolicy, SystemClock as RetrySystemClock,
+};
 pub use sandbox::{SandboxBackend, SandboxReport};
 pub use sandbox_profile::{Mount, NetPolicy, SandboxProfile};
 pub use sandbox_resolve::{
