@@ -9,6 +9,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// `AgentLoop` orchestrator.
+///
+/// Composes the FSM, intent router, provider, permission store, event
+/// emitter, plan-mode fence, and capability matrix into a single
+/// `run_turn` entry point.
+pub mod agent_loop;
 /// User-agent loader.
 pub mod agents;
 /// Per-turn budget tracker layered over an `AgentBudget` + `CancelToken`.
@@ -106,6 +112,10 @@ pub mod update_manifest;
 /// Workspace / project discovery (`stratum.toml`, `.stratumignore`).
 pub mod workspace;
 
+pub use agent_loop::{
+    AgentLoop, AgentLoopBuildError, AgentLoopBuilder, AgentLoopConfig, TurnContext, TurnResult,
+    TurnResultError,
+};
 pub use agents::{AgentBudget, AgentDef, AgentLoader};
 pub use budget::{BudgetCheck, BudgetTracker};
 pub use cancel::CancelToken;
