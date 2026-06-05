@@ -57,6 +57,8 @@ pub mod panic;
 pub mod paths;
 /// Interactive permission-prompt data shape + remembered-decision store.
 pub mod permission_prompt;
+/// Plan-mode capability fence (read-only sandbox).
+pub mod plan_mode;
 /// Hardware probe: RAM, CPU features, GPU backend, OS.
 pub mod probe;
 /// Prefix prompt cache + reuse-key fingerprinting.
@@ -155,6 +157,11 @@ pub use permission_prompt::{
     evaluate as evaluate_permission, request_digest, AllowAllResponder, DenyAllResponder,
     PendingPrompt, PermissionDecision, PermissionRequest, PermissionStore, PromptId, PromptIdGen,
     PromptResponder, ScriptedResponder,
+};
+pub use plan_mode::{
+    enforce_plan_mode_on_request, explain_denied, filter_capability_matrix_for_plan,
+    is_capability_allowed_in_plan_mode, PlanMode, PlanModeError, PlanModeGuard,
+    PLAN_MODE_DENIED_CAPS,
 };
 pub use probe::{GpuBackend, HardwareProbe};
 pub use prompt_cache::{
