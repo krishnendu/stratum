@@ -150,8 +150,9 @@ impl CapabilityMatrix {
 
 /// Tiny glob matcher supporting `*` (multi-char wildcard) and
 /// `**` (path-aware wildcard treated like `*`). No `?`, no character
-/// classes. Used by capability-entry pattern matching.
-fn glob_match(pattern: &str, target: &str) -> bool {
+/// classes. Shared by capability-entry pattern matching and the
+/// `.stratumignore` rule matcher.
+pub(crate) fn glob_match(pattern: &str, target: &str) -> bool {
     let mut pi = pattern.chars().peekable();
     let target_bytes = target.as_bytes();
     let mut ti = 0;
