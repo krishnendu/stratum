@@ -36,6 +36,7 @@ tracing-subscriber  = { workspace = true }
 time                = { workspace = true }
 ratatui             = { workspace = true }
 crossterm           = { workspace = true }
+ureq                = { workspace = true }
 
 [dev-dependencies]
 serde_json          = { workspace = true }
