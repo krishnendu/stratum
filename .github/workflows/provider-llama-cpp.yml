@@ -15,6 +15,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   RUST_BACKTRACE: 1
+  # Tiny chat-tuned model used for the on-demand smoke test. ~352 MB Q4_K_M
+  # quant; reachable from huggingface without auth.
+  STRATUM_LLAMA_MODEL_URL: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  STRATUM_LLAMA_MODEL_SHA256: "1ba6f4a7a0e7b7f47e0cbbaa20f8fa5dda7e8a0f6c8bc14ef6f3a64a4b9eaa7b"
 
 permissions:
   contents: read
@@ -54,6 +58,50 @@ jobs:
       - name: Install build deps (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+
+      - name: Cache GGUF model file
+        id: gguf-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/stratum-models
+          # Key the cache by the expected SHA so a change in the model
+          # URL or content invalidates the cache automatically.
+          key: stratum-llama-gguf-${{ env.STRATUM_LLAMA_MODEL_SHA256 }}
+
+      - name: Download GGUF model (if not cached)
+        if: steps.gguf-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cache/stratum-models"
+          dest="$HOME/.cache/stratum-models/${STRATUM_LLAMA_MODEL_SHA256}.gguf"
+          echo "Downloading model to $dest"
+          curl -fL --retry 3 --retry-delay 5 -o "$dest" "$STRATUM_LLAMA_MODEL_URL"
+          ls -lh "$dest"
+
+      - name: Verify GGUF model SHA-256
+        run: |
+          set -euo pipefail
+          dest="$HOME/.cache/stratum-models/${STRATUM_LLAMA_MODEL_SHA256}.gguf"
+          if [ ! -f "$dest" ]; then
+            echo "model file missing at $dest" >&2
+            exit 1
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$dest" | awk '{print $1}')
+          else
+            actual=$(shasum -a 256 "$dest" | awk '{print $1}')
+          fi
+          echo "expected: $STRATUM_LLAMA_MODEL_SHA256"
+          echo "actual:   $actual"
+          # The on-demand workflow is the first place this URL is ever
+          # downloaded; if upstream changed the file the maintainer
+          # bumps the SHA constant above. We still abort here so a
+          # silent swap never goes unnoticed.
+          if [ "$actual" != "$STRATUM_LLAMA_MODEL_SHA256" ]; then
+            echo "SHA-256 mismatch — refusing to run tests against an unverified model" >&2
+            exit 1
+          fi
+          echo "STRATUM_LLAMA_GGUF_PATH=$dest" >> "$GITHUB_ENV"
 
       - name: cargo build
         run: cargo build --workspace --features ${{ matrix.features }}
