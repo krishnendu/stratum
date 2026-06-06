@@ -26,17 +26,11 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: build + test (${{ matrix.os }})
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            features: provider-llama-cpp
-          - os: ubuntu-latest
-            features: provider-llama-cpp
-    runs-on: ${{ matrix.os }}
+    name: build + test (ubuntu-latest)
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    env:
+      MATRIX_FEATURES: provider-llama-cpp
     steps:
       - uses: actions/checkout@v6
 
@@ -44,16 +38,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          # Cold cache for this workflow is multi-minute; partition by
-          # OS so the macOS + Linux runs do not stomp each other.
-          key: ${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
-
-      - name: Install build deps (macOS)
-        if: matrix.os == 'macos-latest'
-        run: brew install cmake
+          # Cold cache for this workflow is multi-minute.
+          key: ubuntu-latest-${{ hashFiles('Cargo.lock') }}
 
       - name: Install build deps (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y cmake build-essential
 
       - name: Cache GGUF model file
@@ -101,7 +89,7 @@ jobs:
           echo "STRATUM_LLAMA_GGUF_PATH=$dest" >> "$GITHUB_ENV"
 
       - name: cargo build
-        run: cargo build --workspace --features ${{ matrix.features }}
+        run: cargo build --workspace --features ${{ env.MATRIX_FEATURES }}
 
       - name: cargo test
-        run: cargo test --workspace --features ${{ matrix.features }} --no-fail-fast
+        run: cargo test --workspace --features ${{ env.MATRIX_FEATURES }} --no-fail-fast
