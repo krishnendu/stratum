@@ -1,13 +1,10 @@
 name: provider-llama-cpp
 
 # Off the per-PR critical path. Exercises the heavy llama.cpp build only
-# when a maintainer asks for it, on a nightly cron, or right before a
-# release tag is published.
+# when a maintainer asks for it via `gh workflow run provider-llama-cpp.yml`
+# or right before a release tag is published.
 on:
   workflow_dispatch:
-  schedule:
-    # 06:00 UTC nightly.
-    - cron: '0 6 * * *'
   release:
     types: [created]
 
@@ -18,7 +15,7 @@ env:
   # Tiny chat-tuned model used for the on-demand smoke test. ~352 MB Q4_K_M
   # quant; reachable from huggingface without auth.
   STRATUM_LLAMA_MODEL_URL: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-  STRATUM_LLAMA_MODEL_SHA256: "1ba6f4a7a0e7b7f47e0cbbaa20f8fa5dda7e8a0f6c8bc14ef6f3a64a4b9eaa7b"
+  STRATUM_LLAMA_MODEL_SHA256: "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
 
 permissions:
   contents: read
