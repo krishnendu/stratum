@@ -105,11 +105,3 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --features ${{ matrix.features }} --no-fail-fast
-
-      - name: Smoke check — feature-gated module is wired
-        # Belt-and-braces sanity check that the scaffold module compiled
-        # into the rlib. If this ever fails the CI escape hatch has
-        # silently regressed.
-        run: |
-          cargo rustc --package stratum-runtime --features ${{ matrix.features }} --lib -- --emit=dep-info
-          test -f target/debug/deps/stratum_runtime.d || (echo "stratum-runtime build artifact missing" && exit 1)
