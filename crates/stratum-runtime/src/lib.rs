@@ -101,6 +101,8 @@ pub mod secrets;
 pub mod telemetry;
 /// Composite tier classifier (low / medium / high).
 pub mod tier;
+/// Concrete `shell.exec` + `fs.read` tool dispatchers (Phase 3 v2).
+pub mod tool_dispatchers;
 /// Tool invocation data shape + dispatcher trait (Phase 3 scaffold).
 pub mod tool_invocation;
 /// Per-tool-call timeout policy + RAII timer guard.
@@ -216,6 +218,9 @@ pub use telemetry::{
     TELEMETRY_SCHEMA_VERSION,
 };
 pub use tier::Tier;
+pub use tool_dispatchers::{
+    default_dispatchers, FsReadToolDispatcher, ShellToolDispatcher, SHELL_DEFAULT_ALLOWLIST,
+};
 pub use tool_invocation::{
     quick_dispatch, DenyDispatcher, DispatchError, EchoDispatcher, RegistryDispatcher,
     ToolDispatcher, ToolInvocation, ToolResult,
