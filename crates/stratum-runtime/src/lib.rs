@@ -21,6 +21,12 @@ pub mod agent_factory;
 /// emitter, plan-mode fence, and capability matrix into a single
 /// `run_turn` entry point.
 pub mod agent_loop;
+/// `AgentSession` — high-level conversation wrapper.
+///
+/// Composes [`agent_loop::AgentLoop`], [`transcript::TranscriptStore`],
+/// and [`event_log::EventEmitter`] into a single
+/// `next_turn(prompt) -> TurnResult` surface.
+pub mod agent_session;
 /// User-agent loader.
 pub mod agents;
 /// Per-turn budget tracker layered over an `AgentBudget` + `CancelToken`.
@@ -134,6 +140,7 @@ pub use agent_loop::{
     AgentLoop, AgentLoopBuildError, AgentLoopBuilder, AgentLoopConfig, TurnContext, TurnResult,
     TurnResultError,
 };
+pub use agent_session::{AgentSession, SessionError};
 pub use agents::{AgentBudget, AgentDef, AgentLoader};
 pub use budget::{BudgetCheck, BudgetTracker};
 pub use cancel::CancelToken;
