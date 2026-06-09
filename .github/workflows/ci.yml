@@ -59,6 +59,13 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `bubblewrap` is required by the Linux sandbox-spawn tests added in
+      # PR #69; without it those tests early-return (skip). macOS uses
+      # `sandbox-exec`, which ships with the OS. See
+      # `docs/verification-gates.md` for the sandbox gate.
+      - name: Install bubblewrap (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
       # See clippy job comment re: `provider-llama-cpp`.
       - run: cargo test --workspace --no-fail-fast
 
