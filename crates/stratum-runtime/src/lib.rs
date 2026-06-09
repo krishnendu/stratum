@@ -31,6 +31,8 @@ pub mod agent_session;
 pub mod agents;
 /// Per-turn budget tracker layered over an `AgentBudget` + `CancelToken`.
 pub mod budget;
+/// Session-level cumulative budget meter (totals + per-role breakdown + hard cap).
+pub mod budget_meter;
 /// Cooperative cancellation token.
 pub mod cancel;
 /// Hierarchical cancellation cascade with reasons + RAII deadlines.
@@ -159,6 +161,7 @@ pub use agent_loop::{
 pub use agent_session::{AgentSession, SessionError};
 pub use agents::{AgentBudget, AgentDef, AgentLoader};
 pub use budget::{BudgetCheck, BudgetTracker};
+pub use budget_meter::{estimate_cost_micro_usd, BudgetMeter, BudgetMeterError, BudgetTotals};
 pub use cancel::CancelToken;
 pub use cancel_cascade::{CancelError, CancelReason, CascadeToken, DeadlineGuard};
 pub use catalog_sync::{
