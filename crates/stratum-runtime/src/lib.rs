@@ -37,6 +37,8 @@ pub mod cancel;
 pub mod cancel_cascade;
 /// Remote `ModelCatalog` sync over HTTPS — fetch + validate + atomic write.
 pub mod catalog_sync;
+/// `claude -p` subprocess transport for the Stratum LLM-judge.
+pub mod claude_cli_judge;
 /// Per-turn conversation state machine driving the agentic loop.
 pub mod conversation;
 /// Opt-in crash-report bundle + log redaction (Phase 4 scaffold).
@@ -158,6 +160,10 @@ pub use cancel_cascade::{CancelError, CancelReason, CascadeToken, DeadlineGuard}
 pub use catalog_sync::{
     CatalogSync, CatalogSyncConfig, CatalogSyncError, SyncReport, DEFAULT_CATALOG_CHANNEL,
     DEFAULT_CATALOG_MAX_BYTES, DEFAULT_CATALOG_TIMEOUT, DEFAULT_CATALOG_URL,
+};
+pub use claude_cli_judge::{
+    parse_verdict_line, synth_prompt, ClaudeCliJudge, JudgeError, JudgePrompt, JudgeResponse,
+    JudgeVerdict,
 };
 pub use conversation::{
     next_state, validate_history, TurnDriver, TurnEvent, TurnFsmError, TurnOutcome, TurnState,
