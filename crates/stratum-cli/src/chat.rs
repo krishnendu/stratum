@@ -414,6 +414,44 @@ impl ChatState {
         }
     }
 
+    /// Stage `prompt` into the input buffer and dispatch [`Self::submit`].
+    ///
+    /// Helper used by the non-interactive `stratum chat --prompt <STR>` path
+    /// (and by tests) — it replaces the current input wholesale so callers
+    /// don't have to drive a stream of `KeyCode::Char` events.
+    pub fn submit_with_prompt(&mut self, prompt: &str) {
+        self.input.clear();
+        self.input.push_str(prompt);
+        self.submit();
+    }
+
+    /// Join the most recent [`Turn::Assistant`] entry's text blocks into a
+    /// single string.
+    ///
+    /// Returns `None` when the transcript contains no assistant turn or the
+    /// last assistant turn has no [`Block::Text`] blocks. Useful for the
+    /// `--prompt` non-interactive path and integration tests that need to
+    /// inspect what the provider produced without re-walking the transcript.
+    #[must_use]
+    pub fn last_assistant_text(&self) -> Option<String> {
+        let blocks = self.transcript.iter().rev().find_map(|t| match t {
+            Turn::Assistant(b) => Some(b),
+            _ => None,
+        })?;
+        let texts: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        if texts.is_empty() {
+            None
+        } else {
+            Some(texts.join(""))
+        }
+    }
+
     /// Submit the current input through the [`AgentLoop`] and append the
     /// resulting blocks to the transcript.
     pub fn submit(&mut self) {
@@ -654,7 +692,17 @@ pub fn status_for(paths: &Paths) -> String {
 /// Propagates terminal-init failures as [`io::Error`].
 pub fn run(paths: &Paths, tier: Tier) -> StratumResult<()> {
     let provider = EchoProvider::new("echo: ");
-    let mut state = ChatState::new(provider, tier, status_for(paths));
+    let state = ChatState::new(provider, tier, status_for(paths));
+    run_with_state(state)
+}
+
+/// Drive the live TUI against a caller-supplied [`ChatState`]. Used by the
+/// `--model` path so the resolved [`AgentLoop`] (wrapping the real
+/// `LlamaCppProvider`) backs the TUI in place of the default [`EchoProvider`].
+///
+/// # Errors
+/// Propagates terminal-init failures as [`io::Error`].
+pub fn run_with_state(mut state: ChatState) -> StratumResult<()> {
     let mut stdout = io::stdout();
     enable_raw_mode().map_err(map_io_error)?;
     execute!(stdout, EnterAlternateScreen).map_err(map_io_error)?;
@@ -1664,5 +1712,57 @@ mod tests {
     fn should_quit_is_false_initially() {
         let s = state();
         assert!(!s.should_quit());
+    }
+
+    // ---------- non-interactive --prompt helpers ----------
+
+    #[test]
+    fn submit_with_prompt_stages_input_and_runs_turn() {
+        let mut s = state();
+        s.submit_with_prompt("hello");
+        // Input must be drained after submit, transcript holds a
+        // user+assistant pair.
+        assert!(s.input().is_empty());
+        assert_eq!(s.transcript().len(), 2);
+        match &s.transcript()[0] {
+            Turn::User(p) => assert_eq!(p, "hello"),
+            other => panic!("expected Turn::User, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn last_assistant_text_returns_echo_output() {
+        let mut s = state();
+        s.submit_with_prompt("hello");
+        let text = s.last_assistant_text().expect("assistant text");
+        // EchoProvider's prefix here is "echo: ".
+        assert!(text.contains("hello"), "got: {text}");
+        assert!(text.starts_with("echo: "), "got: {text}");
+    }
+
+    #[test]
+    fn last_assistant_text_none_when_no_turn() {
+        let s = state();
+        assert!(s.last_assistant_text().is_none());
+    }
+
+    #[test]
+    fn last_assistant_text_none_when_assistant_has_only_usage() {
+        let mut s = state();
+        // Push a synthetic assistant turn with no Text blocks — only
+        // Usage. Helper exercises the "no text blocks at all" branch.
+        s.transcript.push(Turn::User("x".to_string()));
+        s.transcript.push(Turn::Assistant(vec![Block::Usage {
+            prompt: 1,
+            completion: 1,
+        }]));
+        assert!(s.last_assistant_text().is_none());
+    }
+
+    #[test]
+    fn submit_with_prompt_empty_is_noop() {
+        let mut s = state();
+        s.submit_with_prompt("");
+        assert!(s.transcript().is_empty());
     }
 }
