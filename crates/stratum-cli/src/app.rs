@@ -123,6 +123,10 @@ struct ChatArgs {
     /// open the interactive TUI.
     #[arg(long, value_name = "STR")]
     prompt: Option<String>,
+    /// Append structured runtime events to this JSONL file (one record per
+    /// line; persists across runs).
+    #[arg(long = "events-jsonl", value_name = "PATH")]
+    events_jsonl: Option<PathBuf>,
 }
 
 /// Clap-friendly mirror of the `kind` tag of [`Event`].
@@ -1448,8 +1452,30 @@ fn chat_command(
     if let Some(prompt) = args.prompt.as_deref() {
         let provider = EchoProvider::new("echo: ");
         let mut state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths));
+        if let Some(path) = args.events_jsonl.as_deref() {
+            state = match attach_jsonl_events(state, path, err) {
+                Ok(s) => s,
+                Err(code) => return code,
+            };
+        }
         state.submit_with_prompt(prompt);
         return print_assistant_text(&state, out, err);
+    }
+
+    if let Some(path) = args.events_jsonl.as_deref() {
+        let provider = EchoProvider::new("echo: ");
+        let state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths));
+        let state = match attach_jsonl_events(state, path, err) {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        return match crate::chat::run_with_state(state) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                let _ = writeln!(err, "{e}");
+                ExitCode::from(70)
+            }
+        };
     }
 
     match crate::chat::run(paths, tier) {
@@ -1459,6 +1485,36 @@ fn chat_command(
             ExitCode::from(70)
         }
     }
+}
+
+/// Open `path` as a [`JsonlEventSink`], wrap it in an [`EventEmitter`], and
+/// install the emitter into `state` via [`crate::chat::ChatState::with_events`].
+///
+/// On failure (e.g. missing parent dir), writes a STRAT-E1001 diag to `err`
+/// and returns exit code 1.
+fn attach_jsonl_events(
+    state: crate::chat::ChatState,
+    path: &Path,
+    err: &mut dyn Write,
+) -> Result<crate::chat::ChatState, ExitCode> {
+    use std::sync::Arc;
+
+    use stratum_runtime::{EventEmitter, EventSink, JsonlEventSink};
+
+    let sink = match JsonlEventSink::open(path.to_path_buf()) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "STRAT-E1001 cannot open events JSONL {}: {e}",
+                path.display()
+            );
+            return Err(ExitCode::from(1));
+        }
+    };
+    let sink_dyn: Arc<dyn EventSink> = Arc::new(sink);
+    let emitter = Arc::new(EventEmitter::new(sink_dyn));
+    Ok(state.with_events(emitter))
 }
 
 /// Resolve `--model <slug>` to a catalog entry, materialise the GGUF, open
