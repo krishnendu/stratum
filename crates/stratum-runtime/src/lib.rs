@@ -21,6 +21,12 @@ pub mod agent_factory;
 /// emitter, plan-mode fence, and capability matrix into a single
 /// `run_turn` entry point.
 pub mod agent_loop;
+/// `AgentSession` — high-level conversation wrapper.
+///
+/// Composes [`agent_loop::AgentLoop`], [`transcript::TranscriptStore`],
+/// and [`event_log::EventEmitter`] into a single
+/// `next_turn(prompt) -> TurnResult` surface.
+pub mod agent_session;
 /// User-agent loader.
 pub mod agents;
 /// Per-turn budget tracker layered over an `AgentBudget` + `CancelToken`.
@@ -67,6 +73,10 @@ pub mod mcp;
 pub mod mcp_jsonrpc;
 /// Curated model catalog: structured index of installer-resolvable models.
 pub mod model_catalog;
+/// Slug → local GGUF path resolver composing a [`model_catalog::ModelCatalog`]
+/// + a pluggable [`model_resolver::BlobFetcher`] over a content-addressed
+/// `<state_root>/models/<sha256>.gguf` cache.
+pub mod model_resolver;
 /// Turn-level observability primitives: token meter, latency steps, tok/s.
 pub mod observability;
 /// Panic hook + crash report file writer.
@@ -136,6 +146,7 @@ pub use agent_loop::{
     AgentLoop, AgentLoopBuildError, AgentLoopBuilder, AgentLoopConfig, TurnContext, TurnResult,
     TurnResultError,
 };
+pub use agent_session::{AgentSession, SessionError};
 pub use agents::{AgentBudget, AgentDef, AgentLoader};
 pub use budget::{BudgetCheck, BudgetTracker};
 pub use cancel::CancelToken;
@@ -194,6 +205,7 @@ pub use model_catalog::{
     ArtifactRef, ArtifactRefError, CatalogError, ModelCatalog, ModelEntry, ModelSlug,
     ModelSlugError, ModelTask, ModelTier, MODEL_CATALOG_SCHEMA_VERSION,
 };
+pub use model_resolver::{BlobFetcher, ModelResolver, ResolveModelError};
 pub use observability::{
     format_tokens_per_second, RoleStep, RoleTimer, TurnId, TurnIdGen, TurnMetrics, TurnRecorder,
 };

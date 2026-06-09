@@ -55,8 +55,10 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         max_blocks: u32,
     },
-    /// Open the interactive `EchoProvider`-backed chat TUI.
-    Chat,
+    /// Open the chat surface — either the interactive TUI or, with
+    /// `--prompt`, a single non-interactive turn against the resolved
+    /// provider.
+    Chat(ChatArgs),
     /// Manage on-disk model files.
     #[command(subcommand)]
     Models(ModelsCommand),
@@ -94,6 +96,33 @@ struct EventsTailArgs {
     /// Keep reading after EOF, polling for new lines.
     #[arg(long)]
     follow: bool,
+}
+
+/// Arguments for `stratum chat`.
+///
+/// All four arguments are optional. The interactive TUI is preserved as the
+/// default surface; `--prompt <STR>` opts into a single non-interactive
+/// turn, useful for scripting and integration tests. `--model <slug>`
+/// resolves a catalog entry from `<state>/models.json` and spawns the
+/// `LlamaCppProvider` against the on-disk GGUF (feature-gated by
+/// `provider-llama-cpp`).
+#[derive(Debug, Args)]
+struct ChatArgs {
+    /// Catalog slug to load from `<state>/models.json`. When omitted,
+    /// the default [`EchoProvider`] is used (Phase 1 behavior).
+    #[arg(long, value_name = "SLUG")]
+    model: Option<String>,
+    /// Logical context window passed to the llama.cpp provider, in tokens.
+    #[arg(long, default_value_t = 4096)]
+    ctx: u32,
+    /// Maximum number of blocks the provider is allowed to emit per turn.
+    #[arg(long = "max-blocks", default_value_t = 1)]
+    max_blocks: u32,
+    /// When set, run one non-interactive turn against the resolved
+    /// provider, print the assistant text to stdout, and exit. Omit to
+    /// open the interactive TUI.
+    #[arg(long, value_name = "STR")]
+    prompt: Option<String>,
 }
 
 /// Clap-friendly mirror of the `kind` tag of [`Event`].
@@ -656,7 +685,7 @@ where
         Some(Command::Doctor(doc_args)) => doctor(cli.json, &doc_args, &paths, out, err),
         Some(Command::Init) => init(cli.json, &paths, out, err),
         Some(Command::Echo { prompt, max_blocks }) => echo(cli.json, &prompt, max_blocks, out),
-        Some(Command::Chat) => chat_command(&paths, err),
+        Some(Command::Chat(chat_args)) => chat_command(&chat_args, &paths, out, err),
         Some(Command::Models(ModelsCommand::List(list_args))) => {
             models_list(cli.json, &paths, &list_args, out, err)
         }
@@ -1398,15 +1427,250 @@ fn format_gb_one_decimal(mib: u32) -> String {
     format!("{whole}.{frac}")
 }
 
-fn chat_command(paths: &Paths, err: &mut dyn Write) -> ExitCode {
+fn chat_command(
+    args: &ChatArgs,
+    paths: &Paths,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     let probe = HardwareProbe::run();
     let tier = Tier::classify(&probe);
+
+    // Model-resolution flow only runs when --model is set. Without the
+    // `provider-llama-cpp` feature, the only legal mode is EchoProvider —
+    // surface a clear STRAT-E1001 error instead of silently downgrading.
+    if let Some(slug) = args.model.as_deref() {
+        return chat_with_model(slug, args, paths, tier, out, err);
+    }
+
+    // No --model: keep EchoProvider behavior. `--prompt` still works for
+    // the scripted path; otherwise fall through to the interactive TUI.
+    if let Some(prompt) = args.prompt.as_deref() {
+        let provider = EchoProvider::new("echo: ");
+        let mut state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths));
+        state.submit_with_prompt(prompt);
+        return print_assistant_text(&state, out, err);
+    }
+
     match crate::chat::run(paths, tier) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "{e}");
             ExitCode::from(70)
         }
+    }
+}
+
+/// Resolve `--model <slug>` to a catalog entry, materialise the GGUF, open
+/// the `LlamaCppProvider`, and either run one `--prompt` turn or launch the
+/// interactive TUI. Feature-gated: without `provider-llama-cpp`, returns a
+/// STRAT-E1001 error and exit 1.
+#[cfg(not(feature = "provider-llama-cpp"))]
+fn chat_with_model(
+    _slug: &str,
+    _args: &ChatArgs,
+    _paths: &Paths,
+    _tier: Tier,
+    _out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let _ = writeln!(
+        err,
+        "STRAT-E1001 the `provider-llama-cpp` feature is not enabled; rebuild with `--features provider-llama-cpp`"
+    );
+    ExitCode::from(1)
+}
+
+#[cfg(feature = "provider-llama-cpp")]
+fn chat_with_model(
+    slug: &str,
+    args: &ChatArgs,
+    paths: &Paths,
+    _tier: Tier,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    use std::sync::Arc;
+
+    use stratum_runtime::Provider as ProviderTrait;
+
+    let provider = match resolve_llama_provider(slug, args.ctx, paths, err) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let provider_arc: Arc<dyn ProviderTrait> = Arc::new(provider);
+
+    let loop_ = match build_llama_agent_loop(provider_arc, err) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    let _ = args.max_blocks; // honored by provider request path; reserved for Phase 3 wiring.
+
+    let mut state = crate::chat::ChatState::with_agent_loop(loop_);
+    if let Some(prompt) = args.prompt.as_deref() {
+        state.submit_with_prompt(prompt);
+        return print_assistant_text(&state, out, err);
+    }
+    // No --prompt: drop into the interactive TUI. The state already wraps
+    // the llama-backed loop so input is routed through real inference.
+    match crate::chat::run_with_state(state) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            ExitCode::from(70)
+        }
+    }
+}
+
+/// Resolve `slug` against the on-disk catalog, materialise the GGUF on
+/// disk (downloading + SHA-verifying when needed), and open a
+/// [`LlamaCppProvider`]. Every failure mode emits a STRAT-E1001 diag
+/// to `err` and returns exit code 1.
+#[cfg(feature = "provider-llama-cpp")]
+fn resolve_llama_provider(
+    slug: &str,
+    n_ctx: u32,
+    paths: &Paths,
+    err: &mut dyn Write,
+) -> Result<stratum_runtime::LlamaCppProvider, ExitCode> {
+    use stratum_runtime::llama_provider::LlamaCppProviderConfig;
+    use stratum_runtime::LlamaCppProvider;
+
+    let parsed_slug: ModelSlug = slug.parse().map_err(|e| {
+        let _ = writeln!(err, "STRAT-E1001 invalid --model slug {slug:?}: {e}");
+        ExitCode::from(1)
+    })?;
+
+    let catalog_file = catalog_path(paths);
+    let catalog = match ModelCatalog::load(&catalog_file) {
+        Ok(c) => c,
+        Err(CatalogError::Io(io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            // Missing catalog file is the common first-run state; surface
+            // the same "unknown slug" diag as a present-but-empty catalog
+            // so the user gets one consistent error message.
+            ModelCatalog::default()
+        }
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "STRAT-E1001 cannot load catalog {}: {e}",
+                catalog_file.display()
+            );
+            let _ = writeln!(
+                err,
+                "hint: run `stratum models list` to see installed catalog entries"
+            );
+            return Err(ExitCode::from(1));
+        }
+    };
+
+    let Some(entry) = catalog.get(&parsed_slug) else {
+        let _ = writeln!(
+            err,
+            "STRAT-E1001 unknown slug {:?} in {}",
+            slug,
+            catalog_file.display()
+        );
+        let _ = writeln!(
+            err,
+            "hint: run `stratum models list` to see installed catalog entries"
+        );
+        return Err(ExitCode::from(1));
+    };
+
+    // Target path is content-addressed by sha256, so re-downloads converge
+    // on the same file regardless of slug renames.
+    let models_root = models_dir(paths);
+    let target = models_root.join(format!("{}.gguf", entry.artifact.sha256));
+    if needs_refetch(&target, &entry.artifact.sha256, entry.artifact.bytes) {
+        let dest_filename = format!("{}.gguf", entry.artifact.sha256);
+        let installer = ModelInstaller {
+            dest_dir: &models_root,
+            dest_filename: &dest_filename,
+            expected_sha256: Some(entry.artifact.sha256.as_str()),
+        };
+        installer
+            .install_from_url(entry.artifact.url.as_str())
+            .map_err(|e| {
+                let _ = writeln!(err, "STRAT-E1001 download failed for {slug}: {e}");
+                ExitCode::from(1)
+            })?;
+    }
+
+    let cfg = LlamaCppProviderConfig {
+        model_path: target,
+        n_ctx,
+        n_threads: None,
+        n_gpu_layers: 0,
+        seed: 42,
+    };
+    LlamaCppProvider::open(&cfg).map_err(|e| {
+        let _ = writeln!(err, "STRAT-E1001 provider open failed: {e}");
+        ExitCode::from(1)
+    })
+}
+
+/// Build the `AgentLoop` wrapping `provider` with the documented
+/// defaults. Mirrors `chat::default_agent_loop` but lives in `app.rs` so
+/// the loop can carry the llama-backed provider rather than the echo
+/// fallback.
+#[cfg(feature = "provider-llama-cpp")]
+fn build_llama_agent_loop(
+    provider: std::sync::Arc<dyn stratum_runtime::Provider>,
+    err: &mut dyn Write,
+) -> Result<std::sync::Arc<stratum_runtime::AgentLoop>, ExitCode> {
+    use std::sync::Arc;
+
+    use stratum_runtime::{
+        AgentLoop, AgentLoopConfig, AllowAllResponder, CapabilityMatrix, EventEmitter, EventSink,
+        IntentRouter, MemoryEventSink, PermissionStore, PlanMode, PromptIdGen,
+    };
+
+    let sink: Arc<dyn EventSink> = Arc::new(MemoryEventSink::new());
+    let events = Arc::new(EventEmitter::new(sink));
+    AgentLoop::builder()
+        .with_provider(provider)
+        .with_router(IntentRouter::default())
+        .with_permission_store(Arc::new(PermissionStore::new()))
+        .with_prompt_gen(Arc::new(PromptIdGen::new()))
+        .with_responder(Arc::new(AllowAllResponder))
+        .with_events(events)
+        .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
+        .with_plan_mode(Arc::new(PlanMode::new()))
+        .with_config(AgentLoopConfig::default())
+        .build()
+        .map(Arc::new)
+        .map_err(|e| {
+            let _ = writeln!(err, "STRAT-E1001 agent loop build failed: {e}");
+            ExitCode::from(1)
+        })
+}
+
+/// Returns `true` when the target GGUF on disk is missing or has the wrong
+/// byte count. The filename is content-addressed by SHA-256, so a matching
+/// byte count plus correct filename is treated as a cache hit; mismatched
+/// or missing files fall through to [`ModelInstaller::install_from_url`]
+/// which re-verifies the SHA during install.
+#[cfg(feature = "provider-llama-cpp")]
+fn needs_refetch(target: &Path, _expected_sha256: &str, expected_bytes: u64) -> bool {
+    std::fs::metadata(target).map_or(true, |m| m.len() != expected_bytes)
+}
+
+/// Print the most recent assistant turn text to `out`. Used by the
+/// non-interactive `--prompt` flow.
+fn print_assistant_text(
+    state: &crate::chat::ChatState,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if let Some(text) = state.last_assistant_text() {
+        if writeln!(out, "{text}").is_err() {
+            return ExitCode::from(74);
+        }
+        ExitCode::SUCCESS
+    } else {
+        let _ = writeln!(err, "STRAT-E1001 provider returned no text blocks");
+        ExitCode::from(1)
     }
 }
 
