@@ -9,6 +9,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// `AgentFactory` builder.
+///
+/// Fluent builder that composes a fully-wired [`agent_loop::AgentLoop`]
+/// from a config struct + the minimum required dependency (a
+/// [`provider::Provider`]).
+pub mod agent_factory;
 /// `AgentLoop` orchestrator.
 ///
 /// Composes the FSM, intent router, provider, permission store, event
@@ -120,6 +126,10 @@ pub mod update_manifest;
 /// Workspace / project discovery (`stratum.toml`, `.stratumignore`).
 pub mod workspace;
 
+pub use agent_factory::{
+    default_factory_with_dispatchers, AgentFactory, AgentFactoryConfig, AgentFactoryError,
+    PermissionMode,
+};
 pub use agent_loop::{
     AgentLoop, AgentLoopBuildError, AgentLoopBuilder, AgentLoopConfig, TurnContext, TurnResult,
     TurnResultError,
