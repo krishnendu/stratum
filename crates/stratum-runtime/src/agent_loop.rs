@@ -22,10 +22,37 @@
 //!
 //! # Lock order
 //!
-//! `permission_store -> events -> turn_counter`. The orchestrator never
-//! holds the permission store guard across an event emit, and never holds
-//! either across a `turn_counter.fetch_add`. The counter is the only
-//! atomic we touch on the hot path.
+//! `permission_store -> events -> turn_counter -> dispatcher`. The
+//! orchestrator never holds the permission store guard across an event
+//! emit, never holds either across a `turn_counter.fetch_add`, and never
+//! holds the counter while invoking the dispatcher. The counter is the
+//! only atomic we touch on the hot path.
+//!
+//! # Tool dispatch semantics
+//!
+//! Tool calls are **fail-fast**: the first `ToolResult::Err` (including
+//! "no matching dispatcher") aborts the turn with a
+//! [`TurnOutcome::ToolFailure`]. A future PR can introduce a
+//! `continue-on-tool-error` config knob; for now this matches the
+//! single-pass permission scaffold and keeps the surface small.
+//!
+//! Block::ToolCall does not currently carry a structured argument map
+//! (only a JSON-serialized blob); the orchestrator therefore forwards an
+//! empty [`std::collections::BTreeMap`] for `ToolInvocation::args`. Real
+//! arg parsing lands when the dispatcher contract evolves to share a
+//! typed schema with the model.
+//!
+//! Capability strings handed to the dispatcher come from the
+//! [`crate::tools::CapabilityMatrix`]: the first matrix entry whose verb
+//! matches the tool id is used; otherwise the orchestrator falls back to
+//! the sentinel `format!("tool.{tool_id}")` so the dispatcher still sees
+//! a non-empty capability label.
+//!
+//! Dispatcher invocations are wrapped in
+//! [`std::panic::catch_unwind`]; a panicking dispatcher converts to an
+//! `Event::ProviderError { code: "E_TOOL_PANIC" }` plus
+//! [`TurnOutcome::ToolFailure`] with code `E_TOOL_PANIC`. This mirrors
+//! the worker-thread panic path used by the provider above.
 //!
 //! # Error catalog
 //!
@@ -36,12 +63,18 @@
 //! * `STRAT-E5004` — tool denied. Same code as the tool-deny path in the
 //!   permission system. Documented in
 //!   [`stratum_types::error::catalog::E5004_TOOL_DENIED`].
+//! * `STRAT-E5005` — no dispatcher registered for the requested tool id.
+//!   Surfaced by [`crate::tool_invocation::RegistryDispatcher::dispatch`].
 //! * `E_NO_BLOCKS` — local sentinel for "provider returned zero blocks";
 //!   intentionally lower-case to flag it as a non-catalog code (future
 //!   PR can promote it).
+//! * `E_TOOL_PANIC` — local sentinel for a panicking dispatcher; same
+//!   non-catalog convention as `E_NO_BLOCKS` and `E_PROVIDER_PANIC`.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -61,6 +94,7 @@ use crate::permission_prompt::{
 };
 use crate::plan_mode::{enforce_plan_mode_on_request, PlanMode};
 use crate::provider::{GenerateRequest, Provider};
+use crate::tool_invocation::{RegistryDispatcher, ToolInvocation, ToolResult};
 use crate::tools::CapabilityMatrix;
 
 // ---------------------------------------------------------------------------
@@ -184,6 +218,7 @@ pub struct AgentLoopBuilder {
     events: Option<Arc<EventEmitter>>,
     capability_matrix: Option<Arc<CapabilityMatrix>>,
     plan_mode: Option<Arc<PlanMode>>,
+    dispatcher: Option<Arc<RegistryDispatcher>>,
     config: Option<AgentLoopConfig>,
 }
 
@@ -198,6 +233,7 @@ impl fmt::Debug for AgentLoopBuilder {
             .field("events_set", &self.events.is_some())
             .field("capability_matrix_set", &self.capability_matrix.is_some())
             .field("plan_mode_set", &self.plan_mode.is_some())
+            .field("dispatcher_set", &self.dispatcher.is_some())
             .field("config", &self.config)
             .finish()
     }
@@ -261,6 +297,20 @@ impl AgentLoopBuilder {
         self
     }
 
+    /// Set the tool dispatcher registry.
+    ///
+    /// Optional. If never set, [`Self::build`] defaults to an empty
+    /// [`RegistryDispatcher`]; any `Block::ToolCall` will then short-circuit
+    /// to [`TurnOutcome::ToolFailure`] with code `STRAT-E5005`
+    /// ("no matching dispatcher") via the registry's existing no-match
+    /// path. This default preserves backward compatibility with callers
+    /// (e.g. the current CLI) that don't yet wire real tool dispatchers.
+    #[must_use]
+    pub fn with_dispatcher(mut self, dispatcher: Arc<RegistryDispatcher>) -> Self {
+        self.dispatcher = Some(dispatcher);
+        self
+    }
+
     /// Set the loop config.
     #[must_use]
     pub const fn with_config(mut self, config: AgentLoopConfig) -> Self {
@@ -299,6 +349,14 @@ impl AgentLoopBuilder {
         let plan_mode = self
             .plan_mode
             .ok_or(AgentLoopBuildError::MissingField("plan_mode"))?;
+        // Dispatcher is optional. When omitted, fall back to an empty
+        // `RegistryDispatcher`: any `Block::ToolCall` will short-circuit
+        // to `TurnOutcome::ToolFailure { code: "STRAT-E5005" }` via the
+        // registry's no-match path. This matches what the CLI does
+        // implicitly today and keeps the builder backward-compatible.
+        let dispatcher = self
+            .dispatcher
+            .unwrap_or_else(|| Arc::new(RegistryDispatcher::new()));
         let config = self
             .config
             .ok_or(AgentLoopBuildError::MissingField("config"))?;
@@ -312,6 +370,7 @@ impl AgentLoopBuilder {
             events,
             capability_matrix,
             plan_mode,
+            dispatcher,
             config,
             turn_counter: AtomicU64::new(0),
         })
@@ -330,9 +389,9 @@ pub struct AgentLoop {
     prompt_gen: Arc<PromptIdGen>,
     responder: Arc<dyn PromptResponder>,
     events: Arc<EventEmitter>,
-    #[allow(dead_code, reason = "held for future tool-execution PR")]
     capability_matrix: Arc<CapabilityMatrix>,
     plan_mode: Arc<PlanMode>,
+    dispatcher: Arc<RegistryDispatcher>,
     config: AgentLoopConfig,
     turn_counter: AtomicU64,
 }
@@ -571,14 +630,34 @@ impl AgentLoop {
             };
         }
 
-        // 8. Walk blocks; gate ToolCalls through the permission store.
+        // 8. Walk blocks; gate ToolCalls through the permission store
+        //    and dispatch the approved calls via `RegistryDispatcher`.
         let mut tool_checks: u8 = 0;
         for block in blocks.clone() {
             let Block::ToolCall { id, .. } = block else {
                 continue;
             };
             if tool_checks >= self.config.max_tool_calls_per_turn {
-                break;
+                // Budget exhausted before this call ran — fail fast with
+                // a structured `BudgetExceeded` outcome so the caller can
+                // distinguish "model wanted more tools than allowed" from
+                // a clean finish.
+                let outcome = TurnOutcome::BudgetExceeded {
+                    kind: "tool_calls".into(),
+                };
+                let _ = driver.apply(
+                    TurnEvent::Finish {
+                        outcome: outcome.clone(),
+                    },
+                    ctx.started_at,
+                );
+                return TurnResult {
+                    turn_id: ctx.turn_id,
+                    outcome,
+                    blocks,
+                    transitions: driver.history().to_vec(),
+                    events_emitted,
+                };
             }
             tool_checks = tool_checks.saturating_add(1);
 
@@ -640,24 +719,111 @@ impl AgentLoop {
                         },
                         ctx.started_at,
                     );
-                    // Actual tool execution is the next PR; record a
-                    // zero-duration ok=true placeholder.
+
+                    // Resolve the capability label from the matrix:
+                    // first entry whose verb matches the tool id wins.
+                    // Otherwise fall back to a `tool.<id>` sentinel so
+                    // the dispatcher still sees a non-empty label.
+                    let capability = self
+                        .capability_matrix
+                        .entries()
+                        .find(|e| e.verb_matches(&id))
+                        .map_or_else(|| format!("tool.{id}"), |e| e.as_str().to_string());
+
+                    let inv = ToolInvocation {
+                        tool_id: id.clone(),
+                        args: BTreeMap::new(),
+                        capability,
+                        turn_id: turn_id_u64,
+                    };
+
+                    // Run the dispatch under `catch_unwind` so a
+                    // panicking dispatcher cannot poison the turn loop.
+                    // Mirrors the worker-thread join above used to
+                    // contain provider panics.
+                    let timer = RoleTimer::start();
+                    let dispatcher = Arc::clone(&self.dispatcher);
+                    let inv_ref = &inv;
+                    let dispatch_result =
+                        std::panic::catch_unwind(AssertUnwindSafe(|| dispatcher.dispatch(inv_ref)));
+                    let duration_ms = u64::from(timer.stop_ms());
+
+                    let Ok(result) = dispatch_result else {
+                        events_emitted.push(self.events.emit(
+                            Event::ProviderError {
+                                provider: self.provider.id().to_string(),
+                                code: "E_TOOL_PANIC".into(),
+                                message: format!("dispatcher panicked for {id}"),
+                            },
+                            Some(turn_id_u64),
+                        ));
+                        let outcome = TurnOutcome::ToolFailure {
+                            tool_id: id,
+                            code: "E_TOOL_PANIC".into(),
+                        };
+                        let _ = driver.apply(
+                            TurnEvent::Finish {
+                                outcome: outcome.clone(),
+                            },
+                            ctx.started_at,
+                        );
+                        return TurnResult {
+                            turn_id: ctx.turn_id,
+                            outcome,
+                            blocks,
+                            transitions: driver.history().to_vec(),
+                            events_emitted,
+                        };
+                    };
+
+                    let ok = matches!(result, ToolResult::Ok { .. });
                     events_emitted.push(self.events.emit(
                         Event::ToolCall {
                             tool_id: id.clone(),
-                            ok: true,
-                            duration_ms: 0,
+                            ok,
+                            duration_ms,
                         },
                         Some(turn_id_u64),
                     ));
-                    let _ = driver.apply(
-                        TurnEvent::ToolCompleted {
-                            tool_id: id.clone(),
-                            ok: true,
-                            code: None,
-                        },
-                        ctx.started_at,
-                    );
+
+                    match result {
+                        ToolResult::Ok { .. } => {
+                            let _ = driver.apply(
+                                TurnEvent::ToolCompleted {
+                                    tool_id: id.clone(),
+                                    ok: true,
+                                    code: None,
+                                },
+                                ctx.started_at,
+                            );
+                        }
+                        ToolResult::Err { code, .. } => {
+                            // Fail-fast: the first tool error bails the
+                            // turn. See module docs for the rationale.
+                            let _ = driver.apply(
+                                TurnEvent::ToolCompleted {
+                                    tool_id: id.clone(),
+                                    ok: false,
+                                    code: Some(code.clone()),
+                                },
+                                ctx.started_at,
+                            );
+                            let outcome = TurnOutcome::ToolFailure { tool_id: id, code };
+                            let _ = driver.apply(
+                                TurnEvent::Finish {
+                                    outcome: outcome.clone(),
+                                },
+                                ctx.started_at,
+                            );
+                            return TurnResult {
+                                turn_id: ctx.turn_id,
+                                outcome,
+                                blocks,
+                                transitions: driver.history().to_vec(),
+                                events_emitted,
+                            };
+                        }
+                    }
                 }
             }
         }
@@ -782,9 +948,160 @@ mod tests {
             .with_events(fixed_emitter())
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_dispatcher(Arc::new(RegistryDispatcher::new()))
             .with_config(AgentLoopConfig::default())
             .build()
             .unwrap()
+    }
+
+    fn empty_dispatcher() -> Arc<RegistryDispatcher> {
+        Arc::new(RegistryDispatcher::new())
+    }
+
+    fn echo_dispatcher() -> Arc<RegistryDispatcher> {
+        let mut registry = RegistryDispatcher::new();
+        registry
+            .register(Box::new(crate::tool_invocation::EchoDispatcher))
+            .expect("register echo");
+        Arc::new(registry)
+    }
+
+    fn deny_dispatcher() -> Arc<RegistryDispatcher> {
+        let mut registry = RegistryDispatcher::new();
+        registry
+            .register(Box::new(crate::tool_invocation::DenyDispatcher::new(
+                "deny", "blocked",
+            )))
+            .expect("register deny");
+        Arc::new(registry)
+    }
+
+    fn permissive_dispatcher() -> Arc<RegistryDispatcher> {
+        // Always-Ok dispatcher used by tests that need any tool id to
+        // dispatch successfully without caring about the body.
+        let mut registry = RegistryDispatcher::new();
+        registry
+            .register(Box::new(AcceptAllDispatcher))
+            .expect("register accept_all");
+        Arc::new(registry)
+    }
+
+    #[derive(Debug)]
+    struct AcceptAllDispatcher;
+    impl crate::tool_invocation::ToolDispatcher for AcceptAllDispatcher {
+        fn invoke(
+            &self,
+            inv: &crate::tool_invocation::ToolInvocation,
+        ) -> crate::tool_invocation::ToolResult {
+            crate::tool_invocation::ToolResult::Ok {
+                tool_id: inv.tool_id.clone(),
+                body: serde_json::Value::Null,
+                bytes: 0,
+            }
+        }
+        fn supports(&self, _tool_id: &str) -> bool {
+            true
+        }
+        fn id(&self) -> &'static str {
+            "accept_all"
+        }
+    }
+
+    // --- inline test-only dispatchers --------------------------------
+
+    use crate::tool_invocation::{ToolDispatcher, ToolInvocation as Inv, ToolResult as TR};
+    use std::sync::atomic::AtomicU64 as Counter;
+
+    #[derive(Debug)]
+    struct CountingDispatcher {
+        count: Arc<Counter>,
+    }
+    impl ToolDispatcher for CountingDispatcher {
+        fn invoke(&self, inv: &Inv) -> TR {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            TR::Ok {
+                tool_id: inv.tool_id.clone(),
+                body: serde_json::Value::Null,
+                bytes: 0,
+            }
+        }
+        fn supports(&self, _tool_id: &str) -> bool {
+            true
+        }
+        fn id(&self) -> &'static str {
+            "counting"
+        }
+    }
+
+    #[derive(Debug)]
+    struct CapturingDispatcher {
+        last_cap: Mutex<Option<String>>,
+    }
+    impl ToolDispatcher for CapturingDispatcher {
+        fn invoke(&self, inv: &Inv) -> TR {
+            *self.last_cap.lock().unwrap() = Some(inv.capability.clone());
+            TR::Ok {
+                tool_id: inv.tool_id.clone(),
+                body: serde_json::Value::Null,
+                bytes: 0,
+            }
+        }
+        fn supports(&self, _tool_id: &str) -> bool {
+            true
+        }
+        fn id(&self) -> &'static str {
+            "capturing"
+        }
+    }
+
+    #[derive(Debug)]
+    struct SlowDispatcher;
+    impl ToolDispatcher for SlowDispatcher {
+        fn invoke(&self, inv: &Inv) -> TR {
+            thread::sleep(Duration::from_millis(10));
+            TR::Ok {
+                tool_id: inv.tool_id.clone(),
+                body: serde_json::Value::Null,
+                bytes: 0,
+            }
+        }
+        fn supports(&self, _tool_id: &str) -> bool {
+            true
+        }
+        fn id(&self) -> &'static str {
+            "slow_dispatcher"
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanickingDispatcher;
+    impl ToolDispatcher for PanickingDispatcher {
+        fn invoke(&self, _inv: &Inv) -> TR {
+            panic!("intentional dispatcher panic")
+        }
+        fn supports(&self, _tool_id: &str) -> bool {
+            true
+        }
+        fn id(&self) -> &'static str {
+            "panicking"
+        }
+    }
+
+    /// Delegating dispatcher that re-uses a shared `CapturingDispatcher`
+    /// instance. The wrapper exists so the test can keep the original
+    /// `Arc` for assertions while the registry takes ownership.
+    #[derive(Debug)]
+    struct CapturingShim(Arc<CapturingDispatcher>);
+    impl ToolDispatcher for CapturingShim {
+        fn invoke(&self, inv: &Inv) -> TR {
+            self.0.invoke(inv)
+        }
+        fn supports(&self, t: &str) -> bool {
+            self.0.supports(t)
+        }
+        fn id(&self) -> &'static str {
+            "capturing_shim"
+        }
     }
 
     // ---- inline test-only providers ----------------------------------
@@ -979,6 +1296,37 @@ mod tests {
     }
 
     #[test]
+    fn builder_defaults_dispatcher_to_empty_registry() {
+        // `.with_dispatcher` is intentionally omitted. `.build()` must
+        // succeed by defaulting to an empty `RegistryDispatcher`, and
+        // any tool block must then short-circuit through the registry's
+        // no-match path to `TurnOutcome::ToolFailure { code:
+        // "STRAT-E5005" }`. This pins the backward-compat contract for
+        // the CLI, which currently never wires a dispatcher.
+        let scripted = Arc::new(ScriptedProvider::new(vec![tool_call("foo", "foo")]));
+        let loop_ = AgentLoop::builder()
+            .with_provider(scripted)
+            .with_router(IntentRouter::empty())
+            .with_permission_store(Arc::new(PermissionStore::new()))
+            .with_prompt_gen(Arc::new(PromptIdGen::new()))
+            .with_responder(Arc::new(AllowAllResponder))
+            .with_events(fixed_emitter())
+            .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
+            .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_config(AgentLoopConfig::default())
+            .build()
+            .expect("build with default empty-registry dispatcher must succeed");
+        let res = loop_.run_turn(ctx("call foo"), &CancelToken::new());
+        match res.outcome {
+            TurnOutcome::ToolFailure { tool_id, code } => {
+                assert_eq!(tool_id, "foo");
+                assert_eq!(code, "STRAT-E5005");
+            }
+            other => panic!("expected ToolFailure(STRAT-E5005), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn builder_requires_config() {
         let err = AgentLoop::builder()
             .with_provider(Arc::new(EchoProvider::new("")))
@@ -989,6 +1337,7 @@ mod tests {
             .with_events(fixed_emitter())
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_dispatcher(empty_dispatcher())
             .build()
             .unwrap_err();
         assert_eq!(err, AgentLoopBuildError::MissingField("config"));
@@ -1014,6 +1363,7 @@ mod tests {
             .with_events(fixed_emitter())
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_dispatcher(empty_dispatcher())
             .with_config(AgentLoopConfig::default())
             .build()
             .unwrap();
@@ -1040,6 +1390,7 @@ mod tests {
             .with_events(fixed_emitter())
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_dispatcher(empty_dispatcher())
             .with_config(AgentLoopConfig::default())
             .build()
             .unwrap();
@@ -1081,6 +1432,7 @@ mod tests {
             .with_events(fixed_emitter())
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(plan)
+            .with_dispatcher(empty_dispatcher())
             .with_config(cfg)
             .build()
             .unwrap();
@@ -1118,6 +1470,7 @@ mod tests {
             .with_events(fixed_emitter())
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_dispatcher(empty_dispatcher())
             .with_config(cfg)
             .build()
             .unwrap();
@@ -1140,6 +1493,7 @@ mod tests {
             .with_events(events)
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_dispatcher(empty_dispatcher())
             .with_config(AgentLoopConfig::default())
             .build()
             .unwrap();
@@ -1224,6 +1578,7 @@ mod tests {
             .with_events(fixed_emitter())
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(plan.clone())
+            .with_dispatcher(empty_dispatcher())
             .with_config(AgentLoopConfig::default())
             .build()
             .unwrap();
@@ -1264,6 +1619,7 @@ mod tests {
             .with_events(fixed_emitter())
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_dispatcher(permissive_dispatcher())
             .with_config(AgentLoopConfig::default())
             .build()
             .unwrap();
@@ -1311,6 +1667,7 @@ mod tests {
             .with_events(fixed_emitter())
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_dispatcher(empty_dispatcher())
             .with_config(AgentLoopConfig::default())
             .build()
             .unwrap();
@@ -1338,6 +1695,7 @@ mod tests {
             .with_events(fixed_emitter())
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(plan.clone())
+            .with_dispatcher(empty_dispatcher())
             .with_config(cfg)
             .build()
             .unwrap();
@@ -1452,6 +1810,7 @@ mod tests {
             .with_events(fixed_emitter())
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_dispatcher(empty_dispatcher())
             .with_config(AgentLoopConfig::default())
             .build()
             .unwrap();
@@ -1491,6 +1850,7 @@ mod tests {
             .with_events(fixed_emitter())
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_dispatcher(empty_dispatcher())
             .with_config(AgentLoopConfig::default())
             .build()
             .unwrap();
@@ -1504,7 +1864,8 @@ mod tests {
     #[test]
     fn max_tool_calls_per_turn_caps_inner_loop() {
         // Provider returns three tool calls; loop is configured to allow
-        // only one. The cap test exercises the `break` branch.
+        // only one. With dispatch wired in, the second call short-circuits
+        // to `BudgetExceeded { kind: "tool_calls" }` (fail-fast).
         let scripted = Arc::new(ScriptedProvider {
             script: Mutex::new(vec![vec![
                 Block::ToolCall {
@@ -1538,11 +1899,15 @@ mod tests {
             .with_events(events)
             .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
             .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_dispatcher(permissive_dispatcher())
             .with_config(cfg)
             .build()
             .unwrap();
         let res = loop_.run_turn(ctx("call"), &CancelToken::new());
-        assert!(matches!(res.outcome, TurnOutcome::Success));
+        match res.outcome {
+            TurnOutcome::BudgetExceeded { ref kind } => assert_eq!(kind, "tool_calls"),
+            ref other => panic!("expected BudgetExceeded(tool_calls), got {other:?}"),
+        }
         let tool_events = sink
             .snapshot()
             .into_iter()
@@ -1568,5 +1933,419 @@ mod tests {
         let l = echo_loop();
         let dbg = format!("{l:?}");
         assert!(dbg.contains("AgentLoop"));
+    }
+
+    // ---- new dispatcher-wiring tests ---------------------------------
+
+    fn build_loop_with(
+        provider: Arc<dyn Provider>,
+        dispatcher: Arc<RegistryDispatcher>,
+        matrix: Arc<CapabilityMatrix>,
+        cfg: AgentLoopConfig,
+        events: Arc<EventEmitter>,
+    ) -> AgentLoop {
+        AgentLoop::builder()
+            .with_provider(provider)
+            .with_router(IntentRouter::empty())
+            .with_permission_store(Arc::new(PermissionStore::new()))
+            .with_prompt_gen(Arc::new(PromptIdGen::new()))
+            .with_responder(Arc::new(AllowAllResponder))
+            .with_events(events)
+            .with_capability_matrix(matrix)
+            .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_dispatcher(dispatcher)
+            .with_config(cfg)
+            .build()
+            .unwrap()
+    }
+
+    fn tool_call(id: &str, tool: &str) -> Block {
+        Block::ToolCall {
+            id: id.into(),
+            tool: tool.into(),
+            args: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn tool_dispatch_happy_path_emits_ok_event() {
+        let scripted = Arc::new(ScriptedProvider::new(vec![tool_call("echo", "echo")]));
+        let (events, sink) = fixed_emitter_with_sink();
+        let loop_ = build_loop_with(
+            scripted,
+            echo_dispatcher(),
+            Arc::new(CapabilityMatrix::new()),
+            AgentLoopConfig::default(),
+            events,
+        );
+        let res = loop_.run_turn(ctx("call echo"), &CancelToken::new());
+        assert!(matches!(res.outcome, TurnOutcome::Success));
+        let tool_evt = sink
+            .snapshot()
+            .into_iter()
+            .find_map(|r| match r.event {
+                Event::ToolCall { tool_id, ok, .. } => Some((tool_id, ok)),
+                _ => None,
+            })
+            .expect("ToolCall event");
+        assert_eq!(tool_evt, ("echo".to_string(), true));
+    }
+
+    #[test]
+    fn tool_dispatch_latency_is_non_zero_for_slow_dispatcher() {
+        let mut registry = RegistryDispatcher::new();
+        registry
+            .register(Box::new(SlowDispatcher))
+            .expect("register");
+        let dispatcher = Arc::new(registry);
+        let scripted = Arc::new(ScriptedProvider::new(vec![tool_call("any", "fs.read")]));
+        let (events, sink) = fixed_emitter_with_sink();
+        let loop_ = build_loop_with(
+            scripted,
+            dispatcher,
+            Arc::new(CapabilityMatrix::new()),
+            AgentLoopConfig::default(),
+            events,
+        );
+        let res = loop_.run_turn(ctx("slow"), &CancelToken::new());
+        assert!(matches!(res.outcome, TurnOutcome::Success));
+        let duration = sink
+            .snapshot()
+            .into_iter()
+            .find_map(|r| match r.event {
+                Event::ToolCall { duration_ms, .. } => Some(duration_ms),
+                _ => None,
+            })
+            .expect("ToolCall event");
+        assert!(duration > 0, "expected duration_ms > 0, got {duration}");
+    }
+
+    #[test]
+    fn tool_dispatch_err_returns_tool_failure() {
+        let scripted = Arc::new(ScriptedProvider::new(vec![tool_call(
+            "fs.write", "fs.write",
+        )]));
+        let loop_ = build_loop_with(
+            scripted,
+            deny_dispatcher(),
+            Arc::new(CapabilityMatrix::new()),
+            AgentLoopConfig::default(),
+            fixed_emitter(),
+        );
+        let res = loop_.run_turn(ctx("call"), &CancelToken::new());
+        match res.outcome {
+            TurnOutcome::ToolFailure { tool_id, code } => {
+                assert_eq!(tool_id, "fs.write");
+                assert_eq!(code, "STRAT-E5004");
+            }
+            other => panic!("expected ToolFailure(STRAT-E5004), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_matching_dispatcher_returns_e5005() {
+        let scripted = Arc::new(ScriptedProvider::new(vec![tool_call("foo", "foo")]));
+        let loop_ = build_loop_with(
+            scripted,
+            empty_dispatcher(),
+            Arc::new(CapabilityMatrix::new()),
+            AgentLoopConfig::default(),
+            fixed_emitter(),
+        );
+        let res = loop_.run_turn(ctx("call foo"), &CancelToken::new());
+        match res.outcome {
+            TurnOutcome::ToolFailure { tool_id, code } => {
+                assert_eq!(tool_id, "foo");
+                assert_eq!(code, "STRAT-E5005");
+            }
+            other => panic!("expected ToolFailure(STRAT-E5005), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn budget_exhaustion_short_circuits_second_call() {
+        let scripted = Arc::new(ScriptedProvider::new(vec![
+            tool_call("echo", "echo"),
+            tool_call("echo2", "echo"),
+        ]));
+        let cfg = AgentLoopConfig {
+            max_tool_calls_per_turn: 1,
+            ..AgentLoopConfig::default()
+        };
+        let (events, sink) = fixed_emitter_with_sink();
+        let loop_ = build_loop_with(
+            scripted,
+            permissive_dispatcher(),
+            Arc::new(CapabilityMatrix::new()),
+            cfg,
+            events,
+        );
+        let res = loop_.run_turn(ctx("two"), &CancelToken::new());
+        match res.outcome {
+            TurnOutcome::BudgetExceeded { ref kind } => assert_eq!(kind, "tool_calls"),
+            ref other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+        // Exactly one tool dispatch happened.
+        let tool_count = sink
+            .snapshot()
+            .into_iter()
+            .filter(|r| matches!(r.event, Event::ToolCall { .. }))
+            .count();
+        assert_eq!(tool_count, 1);
+    }
+
+    #[test]
+    fn deny_forever_does_not_invoke_dispatcher() {
+        let count = Arc::new(Counter::new(0));
+        let mut registry = RegistryDispatcher::new();
+        registry
+            .register(Box::new(CountingDispatcher {
+                count: Arc::clone(&count),
+            }))
+            .expect("register");
+        let dispatcher = Arc::new(registry);
+        let scripted = Arc::new(ScriptedProvider::new(vec![tool_call(
+            "fs.read#1",
+            "fs.read",
+        )]));
+        let loop_ = AgentLoop::builder()
+            .with_provider(scripted)
+            .with_router(IntentRouter::empty())
+            .with_permission_store(Arc::new(PermissionStore::new()))
+            .with_prompt_gen(Arc::new(PromptIdGen::new()))
+            .with_responder(Arc::new(DenyAllResponder))
+            .with_events(fixed_emitter())
+            .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
+            .with_plan_mode(Arc::new(PlanMode::new()))
+            .with_dispatcher(dispatcher)
+            .with_config(AgentLoopConfig::default())
+            .build()
+            .unwrap();
+        let res = loop_.run_turn(ctx("call"), &CancelToken::new());
+        assert!(matches!(res.outcome, TurnOutcome::ToolFailure { .. }));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn panicking_dispatcher_returns_tool_panic_failure() {
+        let mut registry = RegistryDispatcher::new();
+        registry
+            .register(Box::new(PanickingDispatcher))
+            .expect("register");
+        let dispatcher = Arc::new(registry);
+        let scripted = Arc::new(ScriptedProvider::new(vec![tool_call("boom", "boom")]));
+        let (events, sink) = fixed_emitter_with_sink();
+        let loop_ = build_loop_with(
+            scripted,
+            dispatcher,
+            Arc::new(CapabilityMatrix::new()),
+            AgentLoopConfig::default(),
+            events,
+        );
+        // Silence the libstd default panic-hook output during this test
+        // so the captured panic doesn't pollute test logs.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let res = loop_.run_turn(ctx("call"), &CancelToken::new());
+        std::panic::set_hook(prev);
+        match res.outcome {
+            TurnOutcome::ToolFailure { ref code, .. } => assert_eq!(code, "E_TOOL_PANIC"),
+            ref other => panic!("expected ToolFailure(E_TOOL_PANIC), got {other:?}"),
+        }
+        let saw_provider_error = sink.snapshot().into_iter().any(
+            |r| matches!(r.event, Event::ProviderError { ref code, .. } if code == "E_TOOL_PANIC"),
+        );
+        assert!(
+            saw_provider_error,
+            "ProviderError(E_TOOL_PANIC) must be emitted"
+        );
+    }
+
+    #[test]
+    fn capability_matrix_hit_supplies_resolved_capability() {
+        let cap = Arc::new(CapturingDispatcher {
+            last_cap: Mutex::new(None),
+        });
+        // Re-use a shared CapturingDispatcher via a delegating shim so
+        // the test can keep its own Arc for assertions.
+        let mut registry = RegistryDispatcher::new();
+        registry
+            .register(Box::new(CapturingShim(Arc::clone(&cap))))
+            .expect("register");
+        let dispatcher = Arc::new(registry);
+
+        let matrix = Arc::new(CapabilityMatrix::from_entries(["fs.read"]));
+        let scripted = Arc::new(ScriptedProvider::new(vec![tool_call("fs.read", "fs.read")]));
+        let loop_ = build_loop_with(
+            scripted,
+            dispatcher,
+            matrix,
+            AgentLoopConfig::default(),
+            fixed_emitter(),
+        );
+        let res = loop_.run_turn(ctx("call"), &CancelToken::new());
+        assert!(matches!(res.outcome, TurnOutcome::Success));
+        assert_eq!(cap.last_cap.lock().unwrap().as_deref(), Some("fs.read"));
+    }
+
+    #[test]
+    fn capability_matrix_miss_falls_back_to_sentinel() {
+        let cap = Arc::new(CapturingDispatcher {
+            last_cap: Mutex::new(None),
+        });
+        let mut registry = RegistryDispatcher::new();
+        registry
+            .register(Box::new(CapturingShim(Arc::clone(&cap))))
+            .expect("register");
+        let dispatcher = Arc::new(registry);
+
+        let matrix = Arc::new(CapabilityMatrix::new()); // empty
+        let scripted = Arc::new(ScriptedProvider::new(vec![tool_call(
+            "unknown_id",
+            "fs.read",
+        )]));
+        let loop_ = build_loop_with(
+            scripted,
+            dispatcher,
+            matrix,
+            AgentLoopConfig::default(),
+            fixed_emitter(),
+        );
+        let res = loop_.run_turn(ctx("call"), &CancelToken::new());
+        assert!(matches!(res.outcome, TurnOutcome::Success));
+        assert_eq!(
+            cap.last_cap.lock().unwrap().as_deref(),
+            Some("tool.unknown_id")
+        );
+    }
+
+    #[test]
+    fn multi_tool_happy_path_emits_two_tool_events() {
+        let scripted = Arc::new(ScriptedProvider::new(vec![
+            tool_call("echo", "echo"),
+            tool_call("echo2", "echo"),
+        ]));
+        let (events, sink) = fixed_emitter_with_sink();
+        let loop_ = build_loop_with(
+            scripted,
+            permissive_dispatcher(),
+            Arc::new(CapabilityMatrix::new()),
+            AgentLoopConfig::default(),
+            events,
+        );
+        let res = loop_.run_turn(ctx("two"), &CancelToken::new());
+        assert!(matches!(res.outcome, TurnOutcome::Success));
+        let tool_count = sink
+            .snapshot()
+            .into_iter()
+            .filter(|r| matches!(r.event, Event::ToolCall { .. }))
+            .count();
+        assert_eq!(tool_count, 2);
+    }
+
+    #[test]
+    fn turn_counter_increments_once_regardless_of_tool_count() {
+        let scripted = Arc::new(ScriptedProvider::new(vec![
+            tool_call("a", "fs.read"),
+            tool_call("b", "fs.read"),
+            tool_call("c", "fs.read"),
+        ]));
+        let loop_ = build_loop_with(
+            scripted,
+            permissive_dispatcher(),
+            Arc::new(CapabilityMatrix::new()),
+            AgentLoopConfig::default(),
+            fixed_emitter(),
+        );
+        assert_eq!(loop_.turn_counter(), 0);
+        let _ = loop_.run_turn(ctx("call"), &CancelToken::new());
+        assert_eq!(loop_.turn_counter(), 1);
+    }
+
+    #[test]
+    fn concurrent_run_turn_shares_dispatcher_safely() {
+        let count = Arc::new(Counter::new(0));
+        let mut registry = RegistryDispatcher::new();
+        registry
+            .register(Box::new(CountingDispatcher {
+                count: Arc::clone(&count),
+            }))
+            .expect("register");
+        let dispatcher = Arc::new(registry);
+
+        // Each provider script needs one tool call per turn.
+        let make_loop = |dispatcher: Arc<RegistryDispatcher>| -> AgentLoop {
+            let scripted = Arc::new(ScriptedProvider::new(vec![tool_call("x", "fs.read")]));
+            build_loop_with(
+                scripted,
+                dispatcher,
+                Arc::new(CapabilityMatrix::new()),
+                AgentLoopConfig::default(),
+                fixed_emitter(),
+            )
+        };
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let d = Arc::clone(&dispatcher);
+            handles.push(thread::spawn(move || {
+                // Each thread keeps a private loop but shares the
+                // dispatcher Arc — we re-script for every turn by
+                // building a new loop per iteration (cheap; the goal
+                // is to exercise dispatcher Send+Sync under load).
+                let mut ok = 0;
+                for _ in 0..10 {
+                    let loop_ = make_loop(Arc::clone(&d));
+                    let res = loop_.run_turn(ctx("call"), &CancelToken::new());
+                    if matches!(res.outcome, TurnOutcome::Success) {
+                        ok += 1;
+                    }
+                }
+                ok
+            }));
+        }
+        let mut total = 0;
+        for h in handles {
+            total += h.join().unwrap();
+        }
+        assert_eq!(total, 40);
+        assert_eq!(count.load(Ordering::SeqCst), 40);
+    }
+
+    #[test]
+    fn tool_call_duration_ms_field_is_non_negative() {
+        // u64 is always non-negative; this pins the type contract.
+        let scripted = Arc::new(ScriptedProvider::new(vec![tool_call("echo", "echo")]));
+        let (events, sink) = fixed_emitter_with_sink();
+        let loop_ = build_loop_with(
+            scripted,
+            echo_dispatcher(),
+            Arc::new(CapabilityMatrix::new()),
+            AgentLoopConfig::default(),
+            events,
+        );
+        let _ = loop_.run_turn(ctx("call"), &CancelToken::new());
+        for r in sink.snapshot() {
+            if let Event::ToolCall { duration_ms, .. } = r.event {
+                // Always true for u64; keeps the assertion explicit.
+                assert!(duration_ms < u64::MAX);
+            }
+        }
+    }
+
+    #[test]
+    fn turn_result_blocks_preserve_tool_call_blocks() {
+        let original = vec![tool_call("echo", "echo"), Block::Text { text: "hi".into() }];
+        let scripted = Arc::new(ScriptedProvider::new(original.clone()));
+        let loop_ = build_loop_with(
+            scripted,
+            echo_dispatcher(),
+            Arc::new(CapabilityMatrix::new()),
+            AgentLoopConfig::default(),
+            fixed_emitter(),
+        );
+        let res = loop_.run_turn(ctx("call"), &CancelToken::new());
+        assert!(matches!(res.outcome, TurnOutcome::Success));
+        assert_eq!(res.blocks, original);
     }
 }
