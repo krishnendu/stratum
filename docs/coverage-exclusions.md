@@ -16,6 +16,7 @@ When a new carve-out is added it MUST be appended here in the same PR. The PR de
 | Coverage region artifacts in `#[cfg(test)]` test bodies (`matches!` second arms, `||` short-circuits) | various | These are llvm-cov's region tracking inside test assertions. They affect the regions percentage but not the line percentage. CI gate uses `--fail-under-lines`, not regions. |
 | `crates/stratum-cli/src/chat.rs` | `run()` and `event_loop()` (lines ~218-244) | TTY-bound: requires real terminal raw-mode + alternate-screen + event poll. Not driveable from `cargo test`; covered manually by `stratum chat` and a Phase 7 expectrl-driven end-to-end. |
 | `crates/stratum-cli/src/app.rs` | `chat_command` function | Forwards to `chat::run` whose body is TTY-bound (see above). The branch arms are mechanically obvious. |
+| `crates/xtask/**` | Entire crate | Dev tooling (workspace lint validator, error-code scanner). Not shipped to users; verified at PR time by the `xtask check-error-codes` CI job, not by coverage. Excluded via `cargo llvm-cov --workspace --exclude xtask` in both gate + lcov-artifact steps. |
 
 ## Why 98 instead of 100
 
