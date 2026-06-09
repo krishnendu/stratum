@@ -100,15 +100,17 @@ jobs:
       - name: cargo llvm-cov (threshold gate)
         shell: bash
         # Excludes the `provider-llama-cpp` feature; see clippy job comment.
+        # Excludes `xtask` (dev tooling, not shipped); see
+        # `docs/coverage-exclusions.md`.
         run: |
           set -euxo pipefail
-          cargo llvm-cov --workspace --fail-under-lines 98
+          cargo llvm-cov --workspace --exclude xtask --fail-under-lines 98
       - name: cargo llvm-cov (lcov artifact)
         shell: bash
         # Excludes the `provider-llama-cpp` feature; see clippy job comment.
         run: |
           set -euxo pipefail
-          cargo llvm-cov --workspace --lcov --output-path lcov.info
+          cargo llvm-cov --workspace --exclude xtask --lcov --output-path lcov.info
       - name: Upload coverage report
         if: hashFiles('lcov.info') != ''
         uses: actions/upload-artifact@v7
