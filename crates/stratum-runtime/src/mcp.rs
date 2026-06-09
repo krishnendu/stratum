@@ -6,16 +6,29 @@
 //! tool entries so the global capability matrix can intersect them today.
 //!
 //! Per `plan/33-mcp-and-external-tools.md` §2-3.
+//!
+//! ## Lock order
+//!
+//! When multiple `McpStdioSession` mutexes need to be held at once they
+//! must be acquired in the following order, top down, to avoid deadlock:
+//!
+//! 1. `stdout_buffer` (paired with its `Condvar`).
+//! 2. `stdin` (the `Mutex<Option<ChildStdin>>` backing `take_stdin` /
+//!    `write_line`).
+//! 3. `child` (the `Mutex<Option<Child>>` backing `shutdown`).
+//!
+//! The `state` and `stderr_lines` mutexes are leaves and can be acquired
+//! from any depth without imposing further ordering constraints.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -283,11 +296,22 @@ pub struct McpStdioSession {
     child: Mutex<Option<Child>>,
     name: String,
     started_at: SystemTime,
-    stderr_lines: std::sync::Arc<Mutex<Vec<String>>>,
+    stderr_lines: Arc<Mutex<Vec<String>>>,
     state: Mutex<McpStdioState>,
     /// One-shot receiver fed by the stdout reader thread with the first
     /// line the child writes. `None` until `spawn` populates it.
     stdout_rx: Mutex<Option<mpsc::Receiver<String>>>,
+    /// Rolling buffer of stdout lines pushed by the drain thread, paired
+    /// with a `Condvar` so [`Self::recv_line`] can park instead of busy
+    /// poll. Lines land here in addition to the one-shot mpsc above so
+    /// the legacy handshake reader keeps working byte-for-byte.
+    stdout_buffer: Arc<(Mutex<VecDeque<String>>, Condvar)>,
+    /// Child's stdin handle. Wrapped in a `Mutex<Option<…>>` so it can
+    /// either be consumed by [`Self::take_stdin`] (caller takes
+    /// ownership) or driven by [`Self::write_line`] (the session keeps
+    /// the handle). After `take_stdin`, `write_line` errors with
+    /// [`McpSessionError::StdinAlreadyTaken`].
+    stdin: Mutex<Option<ChildStdin>>,
     init_timeout: Duration,
 }
 
@@ -319,6 +343,17 @@ pub enum McpSessionError {
         /// Human-readable label of the state(s) the call expected.
         expected: String,
     },
+    /// [`McpStdioSession::take_stdin`] was called a second time, or
+    /// [`McpStdioSession::write_line`] was called after `take_stdin`
+    /// already moved ownership of the handle to an external caller.
+    StdinAlreadyTaken,
+    /// [`McpStdioSession::recv_line`] observed the stdout drain thread
+    /// disconnect (the child closed its stdout / exited) before a line
+    /// arrived.
+    RecvLineClosed,
+    /// [`McpStdioSession::write_line`] failed to write the bytes to the
+    /// child's stdin pipe.
+    WriteFailed(std::io::Error),
 }
 
 impl fmt::Display for McpSessionError {
@@ -340,6 +375,13 @@ impl fmt::Display for McpSessionError {
                     "mcp stdio session in unexpected state {current:?}, expected {expected}"
                 )
             }
+            Self::StdinAlreadyTaken => {
+                write!(f, "mcp stdio stdin handle already taken")
+            }
+            Self::RecvLineClosed => {
+                write!(f, "mcp stdio recv_line: stdout pipe closed")
+            }
+            Self::WriteFailed(err) => write!(f, "mcp stdio write_line failed: {err}"),
         }
     }
 }
@@ -347,8 +389,14 @@ impl fmt::Display for McpSessionError {
 impl std::error::Error for McpSessionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Spawn(err) | Self::HandshakeIo(err) | Self::Shutdown(err) => Some(err),
-            Self::HandshakeTimeout { .. } | Self::BadState { .. } => None,
+            Self::Spawn(err)
+            | Self::HandshakeIo(err)
+            | Self::Shutdown(err)
+            | Self::WriteFailed(err) => Some(err),
+            Self::HandshakeTimeout { .. }
+            | Self::BadState { .. }
+            | Self::StdinAlreadyTaken
+            | Self::RecvLineClosed => None,
         }
     }
 }
@@ -375,26 +423,57 @@ impl McpStdioSession {
             command.current_dir(dir);
         }
         let mut child = command.spawn().map_err(McpSessionError::Spawn)?;
+        let stdin_handle = child.stdin.take();
 
-        // Wire the stdout reader: a background thread reads exactly the
-        // first line and ships it to the handshake. The reader exits as
-        // soon as it has a line — or signals EOF/IO failure by dropping
-        // the sender, which surfaces as `RecvTimeoutError::Disconnected`
-        // in the handshake.
+        // Wire the stdout reader: a background thread reads every line
+        // the child writes. The first line is mirrored into a one-shot
+        // mpsc so the legacy handshake reader keeps working byte-for-
+        // byte; every line (including the first) is also appended to
+        // the rolling `stdout_buffer`, paired with a `Condvar` so
+        // `recv_line` can park instead of busy-poll. EOF / IO failure
+        // drops the sender and notifies the condvar, surfacing as
+        // `RecvTimeoutError::Disconnected` in the handshake and as
+        // `RecvLineClosed` in `recv_line`.
         let (stdout_tx, stdout_rx) = mpsc::channel::<String>();
+        let stdout_buffer: Arc<(Mutex<VecDeque<String>>, Condvar)> =
+            Arc::new((Mutex::new(VecDeque::<String>::new()), Condvar::new()));
         if let Some(stdout) = child.stdout.take() {
+            let buffer = Arc::clone(&stdout_buffer);
             thread::spawn(move || {
                 let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    let _ = stdout_tx.send(line);
+                let mut first = true;
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if first {
+                                let _ = stdout_tx.send(line.clone());
+                                first = false;
+                            }
+                            let (lock, cvar) = &*buffer;
+                            if let Ok(mut guard) = lock.lock() {
+                                guard.push_back(line);
+                                cvar.notify_all();
+                            }
+                        }
+                    }
+                }
+                // Drop the mpsc sender explicitly to surface EOF to any
+                // handshake still parked on it, and wake any `recv_line`
+                // parked on the condvar so it can observe the closed
+                // pipe.
+                drop(stdout_tx);
+                let (lock, cvar) = &*buffer;
+                if lock.lock().is_ok() {
+                    cvar.notify_all();
                 }
             });
         }
 
-        let stderr_lines = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
         if let Some(stderr) = child.stderr.take() {
-            let sink = std::sync::Arc::clone(&stderr_lines);
+            let sink = Arc::clone(&stderr_lines);
             thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
@@ -415,6 +494,8 @@ impl McpStdioSession {
             stderr_lines,
             state: Mutex::new(McpStdioState::Initializing),
             stdout_rx: Mutex::new(Some(stdout_rx)),
+            stdout_buffer,
+            stdin: Mutex::new(stdin_handle),
             init_timeout: cfg.init_timeout,
         })
     }
@@ -562,6 +643,125 @@ impl McpStdioSession {
     #[must_use]
     pub const fn started_at(&self) -> SystemTime {
         self.started_at
+    }
+
+    /// Take ownership of the child's stdin handle. One-shot: the second
+    /// call (or any call after [`Self::write_line`]'s handle has been
+    /// otherwise consumed) returns [`McpSessionError::StdinAlreadyTaken`].
+    ///
+    /// After this call the session no longer owns stdin, so subsequent
+    /// [`Self::write_line`] invocations will also error with
+    /// `StdinAlreadyTaken`.
+    ///
+    /// # Errors
+    /// [`McpSessionError::StdinAlreadyTaken`] when the handle has
+    /// already been taken or was never available (child closed stdin or
+    /// session was constructed without a stdin pipe).
+    pub fn take_stdin(&self) -> Result<ChildStdin, McpSessionError> {
+        let mut guard = self
+            .stdin
+            .lock()
+            .map_err(|_| McpSessionError::StdinAlreadyTaken)?;
+        guard.take().ok_or(McpSessionError::StdinAlreadyTaken)
+    }
+
+    /// Block up to `timeout` for the next stdout line. Returns
+    /// `Ok(Some(line))` with the raw bytes (trailing `\n` preserved),
+    /// `Ok(None)` when the timeout elapsed with the buffer empty, and
+    /// [`McpSessionError::RecvLineClosed`] when the drain thread has
+    /// exited (child closed its stdout / process died) and no buffered
+    /// line is left to hand back.
+    ///
+    /// # Errors
+    /// - [`McpSessionError::RecvLineClosed`] if the underlying stdout
+    ///   pipe has been closed and the buffer is empty.
+    pub fn recv_line(&self, timeout: Duration) -> Result<Option<String>, McpSessionError> {
+        let deadline = Instant::now().checked_add(timeout);
+        let (lock, cvar) = &*self.stdout_buffer;
+        let mut guard = lock.lock().map_err(|_| McpSessionError::RecvLineClosed)?;
+        loop {
+            if let Some(line) = guard.pop_front() {
+                return Ok(Some(line));
+            }
+            // The drain thread only holds a weak reference via `Arc`;
+            // once it exits its clone is dropped. When this `Arc` is
+            // the last strong reference the writer has gone away.
+            if Arc::strong_count(&self.stdout_buffer) == 1 {
+                return Err(McpSessionError::RecvLineClosed);
+            }
+            let now = Instant::now();
+            let remaining = match deadline {
+                Some(d) if d > now => d - now,
+                Some(_) => return Ok(None),
+                None => Duration::from_millis(10),
+            };
+            let (next_guard, result) = cvar
+                .wait_timeout(guard, remaining)
+                .map_err(|_| McpSessionError::RecvLineClosed)?;
+            guard = next_guard;
+            if result.timed_out() && guard.is_empty() {
+                if Arc::strong_count(&self.stdout_buffer) == 1 {
+                    return Err(McpSessionError::RecvLineClosed);
+                }
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Drain every currently-buffered stdout line and return them in
+    /// arrival order. Returns an empty `Vec` when nothing is pending.
+    /// Lines are removed from the internal buffer; subsequent
+    /// [`Self::recv_line`] calls will only see lines that arrive after
+    /// this call.
+    #[must_use]
+    pub fn pending_lines(&self) -> Vec<String> {
+        let (lock, _) = &*self.stdout_buffer;
+        let Ok(mut guard) = lock.lock() else {
+            return Vec::new();
+        };
+        guard.drain(..).collect()
+    }
+
+    /// `true` while the child process is still running. Uses
+    /// `Child::try_wait` under the hood; a poisoned mutex or any
+    /// `try_wait` error is reported as "not alive".
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        let Ok(mut guard) = self.child.lock() else {
+            return false;
+        };
+        let Some(child) = guard.as_mut() else {
+            return false;
+        };
+        matches!(child.try_wait(), Ok(None))
+    }
+
+    /// Write `line` (followed by a single `\n`) to the child's stdin
+    /// and flush. Only usable while the session still owns stdin: once
+    /// [`Self::take_stdin`] has handed ownership to an external caller
+    /// this method errors with [`McpSessionError::StdinAlreadyTaken`].
+    ///
+    /// # Errors
+    /// - [`McpSessionError::StdinAlreadyTaken`] if stdin has already
+    ///   been taken (or was never available).
+    /// - [`McpSessionError::WriteFailed`] if the write or flush returns
+    ///   an IO error.
+    // The stdin mutex must be held for the full write+flush so two
+    // concurrent callers cannot interleave bytes into the JSON-RPC
+    // framing — that's the whole point of the lock — so the tightening
+    // lint doesn't apply here.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn write_line(&self, line: &str) -> Result<(), McpSessionError> {
+        let mut guard = self
+            .stdin
+            .lock()
+            .map_err(|_| McpSessionError::StdinAlreadyTaken)?;
+        let stdin = guard.as_mut().ok_or(McpSessionError::StdinAlreadyTaken)?;
+        stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"))
+            .and_then(|()| stdin.flush())
+            .map_err(McpSessionError::WriteFailed)
     }
 }
 
@@ -1060,6 +1260,9 @@ allow = ["issue.read"]
                 current: McpStdioState::Ready,
                 expected: "initializing".into(),
             },
+            McpSessionError::StdinAlreadyTaken,
+            McpSessionError::RecvLineClosed,
+            McpSessionError::WriteFailed(std::io::Error::other("pipe")),
         ];
         for err in variants {
             let msg = format!("{err}");
@@ -1067,6 +1270,21 @@ allow = ["issue.read"]
             // std::error::Error::source should not panic.
             let _ = std::error::Error::source(&err);
         }
+    }
+
+    #[test]
+    fn new_error_variants_display_have_expected_substrings() {
+        assert!(format!("{}", McpSessionError::StdinAlreadyTaken)
+            .contains("stdin handle already taken"));
+        assert!(format!("{}", McpSessionError::RecvLineClosed).contains("stdout pipe closed"));
+        let write_err = McpSessionError::WriteFailed(std::io::Error::other("boom"));
+        let msg = format!("{write_err}");
+        assert!(msg.contains("write_line failed"));
+        assert!(msg.contains("boom"));
+        // Source plumbing: WriteFailed surfaces the inner io::Error.
+        assert!(std::error::Error::source(&write_err).is_some());
+        assert!(std::error::Error::source(&McpSessionError::StdinAlreadyTaken).is_none());
+        assert!(std::error::Error::source(&McpSessionError::RecvLineClosed).is_none());
     }
 
     #[test]
@@ -1135,6 +1353,191 @@ allow = ["issue.read"]
         // `Closed { code: None }` round-trips through clone+eq.
         let s = McpStdioState::Closed { code: None };
         assert_eq!(s, s.clone());
+    }
+
+    #[cfg(unix)]
+    fn sleep_forever_cfg() -> McpStdioConfig {
+        McpStdioConfig {
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env: BTreeMap::new(),
+            workdir: None,
+            init_timeout: Duration::from_millis(100),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn take_stdin_is_one_shot() {
+        let session = McpStdioSession::spawn("once".into(), &sleep_forever_cfg()).expect("spawn");
+        assert!(session.take_stdin().is_ok(), "first take must succeed");
+        let err = session.take_stdin().expect_err("second take must fail");
+        assert!(matches!(err, McpSessionError::StdinAlreadyTaken));
+        let _ = session.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn take_stdin_after_shutdown_then_taken_errors() {
+        let session = McpStdioSession::spawn("post".into(), &sleep_forever_cfg()).expect("spawn");
+        let _stdin = session.take_stdin().expect("first take");
+        let _ = session.shutdown();
+        // Stdin was moved out before shutdown; a second take after the
+        // child is gone must report StdinAlreadyTaken.
+        let err = session.take_stdin().expect_err("must error");
+        assert!(matches!(err, McpSessionError::StdinAlreadyTaken));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recv_line_times_out_when_child_is_silent() {
+        let session = McpStdioSession::spawn("quiet".into(), &sleep_forever_cfg()).expect("spawn");
+        let line = session
+            .recv_line(Duration::from_millis(50))
+            .expect("timeout returns Ok(None)");
+        assert!(line.is_none(), "expected no line, got {line:?}");
+        let _ = session.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recv_line_returns_some_after_child_writes() {
+        let cfg = McpStdioConfig {
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "echo hello".into()],
+            env: BTreeMap::new(),
+            workdir: None,
+            init_timeout: Duration::from_secs(2),
+        };
+        let session = McpStdioSession::spawn("hello".into(), &cfg).expect("spawn");
+        let line = session
+            .recv_line(Duration::from_secs(2))
+            .expect("recv_line ok")
+            .expect("some line");
+        assert!(line.contains("hello"), "got {line:?}");
+        let _ = session.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_lines_drains_buffered_lines() {
+        let cfg = McpStdioConfig {
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "echo one; echo two; echo three".into()],
+            env: BTreeMap::new(),
+            workdir: None,
+            init_timeout: Duration::from_secs(2),
+        };
+        let session = McpStdioSession::spawn("three".into(), &cfg).expect("spawn");
+        // Wait for the drain thread to land all three lines.
+        std::thread::sleep(Duration::from_millis(200));
+        let drained = session.pending_lines();
+        assert!(
+            drained.len() >= 3,
+            "expected >=3 lines, got {}: {drained:?}",
+            drained.len()
+        );
+        // Buffer is empty after drain.
+        let again = session.pending_lines();
+        assert!(
+            again.is_empty(),
+            "expected empty after drain, got {again:?}"
+        );
+        let _ = session.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_lines_empty_when_buffer_empty() {
+        let session = McpStdioSession::spawn("idle".into(), &sleep_forever_cfg()).expect("spawn");
+        assert!(session.pending_lines().is_empty());
+        let _ = session.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_alive_true_after_spawn() {
+        let session = McpStdioSession::spawn("alive".into(), &sleep_forever_cfg()).expect("spawn");
+        assert!(session.is_alive());
+        let _ = session.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_alive_false_after_shutdown() {
+        let session = McpStdioSession::spawn("dying".into(), &sleep_forever_cfg()).expect("spawn");
+        let _ = session.shutdown();
+        assert!(!session.is_alive());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_line_succeeds_before_take_stdin() {
+        // A `cat` child echoes whatever we write back out.
+        let cfg = McpStdioConfig {
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "cat".into()],
+            env: BTreeMap::new(),
+            workdir: None,
+            init_timeout: Duration::from_millis(100),
+        };
+        let session = McpStdioSession::spawn("cat".into(), &cfg).expect("spawn");
+        session.write_line("hello").expect("write ok");
+        let _ = session.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_line_errors_after_take_stdin() {
+        let session = McpStdioSession::spawn("moved".into(), &sleep_forever_cfg()).expect("spawn");
+        let _stdin = session.take_stdin().expect("take ok");
+        let err = session.write_line("nope").expect_err("must error");
+        assert!(matches!(err, McpSessionError::StdinAlreadyTaken));
+        let _ = session.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn end_to_end_write_then_recv_echo() {
+        // `cat` mirrors stdin to stdout line-by-line — the cheapest
+        // imitation of a JSON-RPC peer that responds to every request.
+        let cfg = McpStdioConfig {
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "cat".into()],
+            env: BTreeMap::new(),
+            workdir: None,
+            init_timeout: Duration::from_secs(2),
+        };
+        let session = McpStdioSession::spawn("echo-e2e".into(), &cfg).expect("spawn");
+        session.write_line("hi").expect("write ok");
+        let line = session
+            .recv_line(Duration::from_secs(2))
+            .expect("recv_line ok")
+            .expect("got line");
+        assert!(line.contains("hi"), "expected echo of 'hi', got {line:?}");
+        let _ = session.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recv_line_returns_closed_after_child_exit() {
+        // Child exits immediately with no output. The drain thread
+        // closes the buffer; recv_line should return RecvLineClosed.
+        let cfg = McpStdioConfig {
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "exit 0".into()],
+            env: BTreeMap::new(),
+            workdir: None,
+            init_timeout: Duration::from_secs(2),
+        };
+        let session = McpStdioSession::spawn("departed".into(), &cfg).expect("spawn");
+        // Let the drain thread observe EOF.
+        std::thread::sleep(Duration::from_millis(150));
+        let err = session
+            .recv_line(Duration::from_millis(200))
+            .expect_err("must error");
+        assert!(matches!(err, McpSessionError::RecvLineClosed));
+        let _ = session.shutdown();
     }
 
     #[test]

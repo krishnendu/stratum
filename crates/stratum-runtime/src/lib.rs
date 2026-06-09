@@ -36,6 +36,8 @@ pub mod agent_session;
 pub mod agents;
 /// Per-turn budget tracker layered over an `AgentBudget` + `CancelToken`.
 pub mod budget;
+/// Session-level cumulative budget meter (totals + per-role breakdown + hard cap).
+pub mod budget_meter;
 /// Cooperative cancellation token.
 pub mod cancel;
 /// Hierarchical cancellation cascade with reasons + RAII deadlines.
@@ -130,6 +132,10 @@ pub mod sandbox_profile;
 pub mod sandbox_resolve;
 /// Secrets / keyring data shape (Phase 1 scaffold; real OS backend lands later).
 pub mod secrets;
+/// `stratum serve` JSON-RPC 2.0 wire-protocol data shapes.
+pub mod serve_protocol;
+/// Synchronous `stratum serve` JSON-RPC dispatch server over Unix or TCP loopback.
+pub mod serve_server;
 /// Default-on opt-out telemetry payload shape + allowlist guard.
 pub mod telemetry;
 /// Composite tier classifier (low / medium / high).
@@ -164,6 +170,7 @@ pub use agent_loop::{
 pub use agent_session::{AgentSession, SessionError};
 pub use agents::{AgentBudget, AgentDef, AgentLoader};
 pub use budget::{BudgetCheck, BudgetTracker};
+pub use budget_meter::{estimate_cost_micro_usd, BudgetMeter, BudgetMeterError, BudgetTotals};
 pub use cancel::CancelToken;
 pub use cancel_cascade::{CancelError, CancelReason, CascadeToken, DeadlineGuard};
 pub use catalog_sync::{
@@ -271,6 +278,16 @@ pub use sandbox_resolve::{
 pub use secrets::{
     redact_for_log, InMemorySecretStore, ProjectId, SecretId, SecretIdError, SecretRef,
     SecretScope, SecretStore, SecretStoreError, SecretValue,
+};
+pub use serve_protocol::{
+    parse_request as parse_serve_request, render_response as render_serve_response,
+    ParseRequestError, RequestId, RunTurnParams, ServeMethod, ServeRequest, ServeResponse,
+    ServeResponseBody, SERVE_ERR_INTERNAL, SERVE_ERR_INVALID, SERVE_ERR_METHOD, SERVE_ERR_PARAMS,
+    SERVE_ERR_PARSE,
+};
+pub use serve_server::{
+    make_default_handler, EchoServeHandler, ServeBind, ServeConfig, ServeError, ServeHandle,
+    ServeHandler, ServeServer,
 };
 pub use telemetry::{
     build_payload, payload_is_allowlisted, redact, AnonInstallId, AnonInstallIdError, CpuArchTag,
