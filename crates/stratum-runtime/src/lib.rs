@@ -47,6 +47,12 @@ pub mod crash_report;
 pub mod download;
 /// Embedding backend trait + deterministic `HashEmbedder` stub.
 pub mod embedder;
+/// Prompt-based eval suites over an [`agent_loop::AgentLoop`].
+///
+/// `EvalRunner` runs an [`eval_runner::EvalSuite`] (sequence of prompts +
+/// expected substrings) against an [`agent_loop::AgentLoop`] and produces
+/// an [`eval_runner::EvalReport`].
+pub mod eval_runner;
 /// Append-only structured event log for tool calls, permissions, hand-offs.
 pub mod event_log;
 /// Memory-safety gate.
@@ -171,6 +177,10 @@ pub use download::{InstallReport, ModelInstaller};
 pub use embedder::{
     cosine_similarity, top_k, EmbedError, Embedder, EmbeddingDim, EmbeddingVector, HashEmbedder,
     InMemoryVectorStore,
+};
+pub use eval_runner::{
+    EvalCase, EvalLoadError, EvalReport, EvalReportError, EvalRun, EvalRunner, EvalSuite,
+    EVAL_SUITE_SCHEMA_VERSION,
 };
 pub use event_log::{
     Event, EventClock, EventEmitter, EventLogError, EventRecord, EventSink, FixedEventClock,
