@@ -15,6 +15,11 @@
 /// from a config struct + the minimum required dependency (a
 /// [`provider::Provider`]).
 pub mod agent_factory;
+/// `AgentHandoff` multi-role coordinator.
+///
+/// Routes a turn through one or more [`agent_loop::AgentLoop`]s based on
+/// a hand-off sentinel emitted by the assistant's last block.
+pub mod agent_handoff;
 /// `AgentLoop` orchestrator.
 ///
 /// Composes the FSM, intent router, provider, permission store, event
@@ -147,6 +152,10 @@ pub mod workspace;
 pub use agent_factory::{
     default_factory_with_dispatchers, AgentFactory, AgentFactoryConfig, AgentFactoryError,
     PermissionMode,
+};
+pub use agent_handoff::{
+    parse_handoff_marker, AgentHandoff, AgentRegistry, HandoffError, HandoffPolicy, HandoffResult,
+    HandoffStep,
 };
 pub use agent_loop::{
     AgentLoop, AgentLoopBuildError, AgentLoopBuilder, AgentLoopConfig, TurnContext, TurnResult,
