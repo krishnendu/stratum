@@ -23,6 +23,8 @@ pub mod budget;
 pub mod cancel;
 /// Hierarchical cancellation cascade with reasons + RAII deadlines.
 pub mod cancel_cascade;
+/// Remote `ModelCatalog` sync over HTTPS — fetch + validate + atomic write.
+pub mod catalog_sync;
 /// Per-turn conversation state machine driving the agentic loop.
 pub mod conversation;
 /// Opt-in crash-report bundle + log redaction (Phase 4 scaffold).
@@ -124,6 +126,10 @@ pub use agents::{AgentBudget, AgentDef, AgentLoader};
 pub use budget::{BudgetCheck, BudgetTracker};
 pub use cancel::CancelToken;
 pub use cancel_cascade::{CancelError, CancelReason, CascadeToken, DeadlineGuard};
+pub use catalog_sync::{
+    CatalogSync, CatalogSyncConfig, CatalogSyncError, SyncReport, DEFAULT_CATALOG_CHANNEL,
+    DEFAULT_CATALOG_MAX_BYTES, DEFAULT_CATALOG_TIMEOUT, DEFAULT_CATALOG_URL,
+};
 pub use conversation::{
     next_state, validate_history, TurnDriver, TurnEvent, TurnFsmError, TurnOutcome, TurnState,
     TurnTransition,
