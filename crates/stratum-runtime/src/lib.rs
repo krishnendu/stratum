@@ -55,6 +55,8 @@ pub mod llama_provider;
 pub mod logging;
 /// MCP client + server data shapes (Phase 3 data-only scaffold for Phase 6).
 pub mod mcp;
+/// Real JSON-RPC 2.0 client over an MCP stdio child (Phase 6 scaffold).
+pub mod mcp_jsonrpc;
 /// Curated model catalog: structured index of installer-resolvable models.
 pub mod model_catalog;
 /// Turn-level observability primitives: token meter, latency steps, tok/s.
@@ -166,6 +168,11 @@ pub use llama_provider::LlamaCppProvider;
 pub use mcp::{
     McpServeTransport, McpServerConfig, McpServerExpose, McpServerSet, McpServerStatus,
     McpTransport,
+};
+pub use mcp_jsonrpc::{
+    ClientCapabilities, ClientInfo, McpInitializeParams, McpInitializeResult, McpJsonRpcClient,
+    McpRpcError, RootsClientCapability, ServerCapabilities, ServerInfo, ToolCallResult,
+    ToolContentBlock, ToolDescriptor, ToolsClientCapability,
 };
 pub use model_catalog::{
     ArtifactRef, ArtifactRefError, CatalogError, ModelCatalog, ModelEntry, ModelSlug,
