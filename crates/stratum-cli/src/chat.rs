@@ -25,7 +25,7 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -48,6 +48,14 @@ use stratum_types::{Block, ModelId, StratumResult};
 
 use crate::palette::{self, Palette};
 
+/// Multi-line `/help` body listing every wired palette command.
+const HELP_TEXT: &str = "available commands:\n\
+    /plan [on|off] — toggle (or set) plan mode\n\
+    /cancel — cancel the in-flight turn\n\
+    /clear — clear the transcript\n\
+    /help — show this message\n\
+    /quit, /exit — exit the TUI";
+
 /// One entry in the chat transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Turn {
@@ -57,8 +65,33 @@ pub enum Turn {
     Assistant(Vec<Block>),
     /// Cancellation marker (Ctrl-C mid-stream).
     Cancelled,
-    /// Slash command was invoked from the palette.
-    Command(String),
+    /// Slash command was invoked from the palette and dispatched.
+    Command {
+        /// The command keyword (without the leading `/`) as the user typed it.
+        text: String,
+        /// `true` for an acknowledged dispatch, `false` for a rejection
+        /// (e.g. unknown command).
+        ok: bool,
+        /// Human-friendly message rendered in the transcript.
+        message: String,
+    },
+}
+
+/// Outcome of dispatching a palette command via
+/// [`ChatState::execute_palette_command`]. Each variant carries the
+/// message that the transcript renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaletteOutcome {
+    /// The command was recognised and executed.
+    Acknowledged {
+        /// Human-friendly message describing the effect.
+        message: String,
+    },
+    /// The command was unknown or otherwise rejected.
+    Rejected {
+        /// Human-friendly explanation.
+        message: String,
+    },
 }
 
 /// Pure TUI state. Driven by events; rendered into any [`Backend`].
@@ -93,6 +126,11 @@ pub struct ChatState {
     agent_loop: Arc<AgentLoop>,
     /// Most recent [`TurnResult`] returned by [`AgentLoop::run_turn`].
     last_turn_result: Option<TurnResult>,
+    /// Plan-mode handle wired into both this state (for `/plan` palette
+    /// toggling) and the [`AgentLoop`] (for capability gating). Sharing
+    /// the same `Arc` is what makes `/plan` semantically meaningful: a
+    /// toggle here immediately reflects in the loop's fence.
+    plan_mode: Arc<PlanMode>,
 }
 
 impl Default for ChatState {
@@ -107,12 +145,13 @@ impl ChatState {
     pub fn new(provider: EchoProvider, tier: Tier, status: String) -> Self {
         let sink = Arc::new(MemoryEventSink::new());
         let events = Arc::new(EventEmitter::new(sink.clone()));
+        let plan_mode = Arc::new(PlanMode::new());
         #[allow(
             clippy::expect_used,
             reason = "default_agent_loop sets all nine required builder fields; build() cannot return MissingField on this code path"
         )]
         let agent_loop = Arc::new(
-            default_agent_loop(provider.clone(), events.clone())
+            default_agent_loop(provider.clone(), events.clone(), plan_mode.clone())
                 .expect("default AgentLoop builder sets every required field"),
         );
         Self {
@@ -130,6 +169,7 @@ impl ChatState {
             memory_sink: Some(sink),
             agent_loop,
             last_turn_result: None,
+            plan_mode,
         }
     }
 
@@ -160,8 +200,12 @@ impl ChatState {
             reason = "default_agent_loop sets all nine required builder fields; build() cannot return MissingField on this code path"
         )]
         let agent_loop = Arc::new(
-            default_agent_loop(self.provider.clone(), events.clone())
-                .expect("default AgentLoop builder sets every required field"),
+            default_agent_loop(
+                self.provider.clone(),
+                events.clone(),
+                self.plan_mode.clone(),
+            )
+            .expect("default AgentLoop builder sets every required field"),
         );
         self.agent_loop = agent_loop;
         self.events = events;
@@ -256,11 +300,118 @@ impl ChatState {
         }
     }
 
+    /// Internal palette-flush bridge: the palette emits a bare command
+    /// name (no leading `/`); we re-attach the slash and route through
+    /// [`Self::execute_palette_command`].
     fn execute_command(&mut self, name: &str) {
-        if name == "quit" {
-            self.quit = true;
+        let with_slash = format!("/{name}");
+        let _ = self.execute_palette_command(&with_slash);
+    }
+
+    /// Dispatch a single palette command. Recognised commands mutate
+    /// state (toggle `plan_mode`, fire the `cancel` token, clear the
+    /// transcript, set `should_quit`) and push a
+    /// [`Turn::Command`] entry to the transcript. Unknown commands are
+    /// rejected. The return value also exposes the outcome so callers
+    /// can render a status message without re-walking the transcript.
+    ///
+    /// `cmd` must start with `/` (the palette parser preserves the
+    /// slash). An empty string or a command without the leading slash
+    /// is rejected with `"unknown command: <cmd>"`.
+    ///
+    /// `/plan` is a toggle: if plan mode is currently active it is
+    /// deactivated, else it is activated. Pass `/plan on` or
+    /// `/plan off` to force a specific state.
+    pub fn execute_palette_command(&mut self, cmd: &str) -> PaletteOutcome {
+        // `/clear` is the only command whose post-state is the empty
+        // transcript: it erases history *including* the marker for the
+        // clear itself. Detect it up front so we can clear after the
+        // push and end up with an empty transcript.
+        let is_clear = cmd.trim() == "/clear";
+        let outcome = self.dispatch_command(cmd);
+        let (ok, message) = match &outcome {
+            PaletteOutcome::Acknowledged { message } => (true, message.clone()),
+            PaletteOutcome::Rejected { message } => (false, message.clone()),
+        };
+        self.transcript.push(Turn::Command {
+            text: cmd.to_string(),
+            ok,
+            message,
+        });
+        if is_clear && ok {
+            self.transcript.clear();
         }
-        self.transcript.push(Turn::Command(name.to_string()));
+        outcome
+    }
+
+    fn dispatch_command(&mut self, cmd: &str) -> PaletteOutcome {
+        let Some(rest) = cmd.strip_prefix('/') else {
+            return PaletteOutcome::Rejected {
+                message: format!("unknown command: {cmd}"),
+            };
+        };
+        let trimmed = rest.trim();
+        if trimmed.is_empty() {
+            return PaletteOutcome::Rejected {
+                message: format!("unknown command: {cmd}"),
+            };
+        }
+        let mut parts = trimmed.split_whitespace();
+        let head = parts.next().unwrap_or("");
+        let arg = parts.next();
+        match head {
+            "plan" => {
+                let message = match arg {
+                    Some("on") => {
+                        self.plan_mode.activate(SystemTime::now());
+                        "plan mode: on".to_string()
+                    }
+                    Some("off") => {
+                        self.plan_mode.deactivate();
+                        "plan mode: off".to_string()
+                    }
+                    None => {
+                        if self.plan_mode.is_active() {
+                            self.plan_mode.deactivate();
+                            "plan mode: off".to_string()
+                        } else {
+                            self.plan_mode.activate(SystemTime::now());
+                            "plan mode: on".to_string()
+                        }
+                    }
+                    Some(other) => {
+                        return PaletteOutcome::Rejected {
+                            message: format!("unknown command: /plan {other}"),
+                        };
+                    }
+                };
+                PaletteOutcome::Acknowledged { message }
+            }
+            "cancel" => {
+                self.cancel.cancel();
+                PaletteOutcome::Acknowledged {
+                    message: "cancel signal sent".to_string(),
+                }
+            }
+            "clear" => {
+                self.transcript.clear();
+                PaletteOutcome::Acknowledged {
+                    message: "transcript cleared".to_string(),
+                }
+            }
+            "help" => PaletteOutcome::Acknowledged {
+                message: HELP_TEXT.to_string(),
+            },
+            "quit" | "exit" => {
+                self.quit = true;
+                PaletteOutcome::Acknowledged {
+                    message: "exiting".to_string(),
+                }
+            }
+            _ => PaletteOutcome::Rejected {
+                message: format!("unknown command: {cmd}"),
+            },
+        }
     }
 
     /// Submit the current input through the [`AgentLoop`] and append the
@@ -399,10 +550,15 @@ impl ChatState {
                     "(cancelled)",
                     Style::default().add_modifier(Modifier::ITALIC),
                 ))),
-                Turn::Command(name) => lines.push(Line::from(Span::styled(
-                    format!("(executed /{name})"),
-                    Style::default().add_modifier(Modifier::DIM),
-                ))),
+                Turn::Command { text, ok, message } => {
+                    let prefix = if *ok { "executed" } else { "rejected" };
+                    for line in message.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("({prefix} {text}: {line})"),
+                            Style::default().add_modifier(Modifier::DIM),
+                        )));
+                    }
+                }
             }
         }
         let chat = Paragraph::new(lines)
@@ -447,6 +603,7 @@ impl ChatState {
 fn default_agent_loop(
     provider: EchoProvider,
     events: Arc<EventEmitter>,
+    plan_mode: Arc<PlanMode>,
 ) -> Result<AgentLoop, stratum_runtime::AgentLoopBuildError> {
     let provider_arc: Arc<dyn Provider> = Arc::new(provider);
     AgentLoop::builder()
@@ -457,7 +614,7 @@ fn default_agent_loop(
         .with_responder(Arc::new(AllowAllResponder))
         .with_events(events)
         .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
-        .with_plan_mode(Arc::new(PlanMode::new()))
+        .with_plan_mode(plan_mode)
         .with_config(AgentLoopConfig::default())
         .build()
 }
@@ -667,10 +824,11 @@ mod tests {
     fn palette_enter_executes_command() {
         let mut s = state();
         s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-        // First alphabetical match is "active".
+        // First alphabetical match is "active" — unknown to the
+        // dispatcher, so it lands as a rejected command turn.
         s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!s.palette_open());
-        assert!(matches!(s.transcript().last(), Some(Turn::Command(_))));
+        assert!(matches!(s.transcript().last(), Some(Turn::Command { .. })));
     }
 
     #[test]
@@ -682,10 +840,11 @@ mod tests {
         }
         s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(s.should_quit());
-        let Some(Turn::Command(name)) = s.transcript().last() else {
+        let Some(Turn::Command { text, ok, .. }) = s.transcript().last() else {
             panic!("expected command turn")
         };
-        assert_eq!(name, "quit");
+        assert_eq!(text, "/quit");
+        assert!(*ok);
     }
 
     #[test]
@@ -703,11 +862,12 @@ mod tests {
         s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
         s.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE));
         s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
-        let Some(Turn::Command(name)) = s.transcript().last() else {
+        let Some(Turn::Command { text, .. }) = s.transcript().last() else {
             panic!("expected command turn")
         };
         // Filter "m" leaves "model" and "models"; cursor=0 picks "model".
-        assert_eq!(name, "model");
+        // The palette flush prepends the slash before dispatch.
+        assert_eq!(text, "/model");
     }
 
     fn rendered_text(state: &ChatState, width: u16, height: u16) -> String {
@@ -808,10 +968,12 @@ mod tests {
     #[test]
     fn render_shows_executed_command_marker() {
         let mut s = state();
-        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-        s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
-        let text = rendered_text(&s, 60, 10);
-        assert!(text.contains("executed /active"));
+        // Dispatch a known command so the transcript shows the
+        // "executed /<cmd>" marker.
+        let outcome = s.execute_palette_command("/help");
+        assert!(matches!(outcome, PaletteOutcome::Acknowledged { .. }));
+        let text = rendered_text(&s, 80, 14);
+        assert!(text.contains("executed /help"));
     }
 
     #[test]
@@ -1281,5 +1443,226 @@ mod tests {
         }
         s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(s.transcript().len(), 2);
+    }
+
+    // ---------- palette command dispatch ----------
+
+    #[test]
+    fn execute_plan_activates_and_acknowledges() {
+        let mut s = state();
+        assert!(!s.plan_mode.is_active());
+        let outcome = s.execute_palette_command("/plan");
+        assert!(matches!(outcome, PaletteOutcome::Acknowledged { .. }));
+        assert!(s.plan_mode.is_active());
+    }
+
+    #[test]
+    fn execute_plan_toggle_deactivates_when_already_active() {
+        let mut s = state();
+        s.execute_palette_command("/plan");
+        assert!(s.plan_mode.is_active());
+        let outcome = s.execute_palette_command("/plan");
+        assert!(matches!(outcome, PaletteOutcome::Acknowledged { .. }));
+        assert!(!s.plan_mode.is_active());
+    }
+
+    #[test]
+    fn execute_plan_on_force_activates_regardless_of_state() {
+        let mut s = state();
+        // Inactive -> on.
+        s.execute_palette_command("/plan on");
+        assert!(s.plan_mode.is_active());
+        // Active -> on (still active).
+        s.execute_palette_command("/plan on");
+        assert!(s.plan_mode.is_active());
+    }
+
+    #[test]
+    fn execute_plan_off_force_deactivates_regardless_of_state() {
+        let mut s = state();
+        // Inactive -> off (still inactive).
+        s.execute_palette_command("/plan off");
+        assert!(!s.plan_mode.is_active());
+        // Activate, then off.
+        s.execute_palette_command("/plan on");
+        assert!(s.plan_mode.is_active());
+        s.execute_palette_command("/plan off");
+        assert!(!s.plan_mode.is_active());
+    }
+
+    #[test]
+    fn execute_plan_unknown_arg_is_rejected() {
+        let mut s = state();
+        let outcome = s.execute_palette_command("/plan maybe");
+        assert!(matches!(outcome, PaletteOutcome::Rejected { .. }));
+        assert!(!s.plan_mode.is_active());
+    }
+
+    #[test]
+    fn execute_cancel_fires_cancel_token() {
+        let mut s = state();
+        assert!(!s.cancel.is_cancelled());
+        let outcome = s.execute_palette_command("/cancel");
+        assert!(matches!(outcome, PaletteOutcome::Acknowledged { .. }));
+        assert!(s.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn execute_clear_empties_transcript() {
+        // /clear is a meta-action: it removes prior turns *and* its own
+        // marker, leaving the transcript empty.
+        let mut s = state();
+        for c in "hi".chars() {
+            s.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!s.transcript().is_empty());
+        s.execute_palette_command("/clear");
+        assert!(s.transcript().is_empty());
+    }
+
+    #[test]
+    fn execute_help_returns_acknowledged_with_nonempty_message() {
+        let mut s = state();
+        let outcome = s.execute_palette_command("/help");
+        let PaletteOutcome::Acknowledged { message } = outcome else {
+            panic!("expected acknowledged");
+        };
+        assert!(!message.is_empty());
+        assert!(message.contains("/plan"));
+        assert!(message.contains("/cancel"));
+        assert!(message.contains("/clear"));
+        assert!(message.contains("/quit"));
+    }
+
+    #[test]
+    fn execute_quit_sets_should_quit() {
+        let mut s = state();
+        assert!(!s.should_quit());
+        let outcome = s.execute_palette_command("/quit");
+        assert!(matches!(outcome, PaletteOutcome::Acknowledged { .. }));
+        assert!(s.should_quit());
+    }
+
+    #[test]
+    fn execute_exit_is_alias_for_quit() {
+        let mut s = state();
+        assert!(!s.should_quit());
+        let outcome = s.execute_palette_command("/exit");
+        assert!(matches!(outcome, PaletteOutcome::Acknowledged { .. }));
+        assert!(s.should_quit());
+    }
+
+    #[test]
+    fn execute_unknown_command_returns_rejected() {
+        let mut s = state();
+        let outcome = s.execute_palette_command("/unknown");
+        let PaletteOutcome::Rejected { message } = outcome else {
+            panic!("expected rejected");
+        };
+        assert_eq!(message, "unknown command: /unknown");
+    }
+
+    #[test]
+    fn execute_empty_command_returns_rejected() {
+        let mut s = state();
+        let outcome = s.execute_palette_command("");
+        assert!(matches!(outcome, PaletteOutcome::Rejected { .. }));
+    }
+
+    #[test]
+    fn execute_slash_only_returns_rejected() {
+        // `cmd = "/"` strips the prefix but leaves an empty body — covered
+        // by the dedicated empty-trim branch.
+        let mut s = state();
+        let outcome = s.execute_palette_command("/");
+        assert!(matches!(outcome, PaletteOutcome::Rejected { .. }));
+    }
+
+    #[test]
+    fn execute_command_via_palette_flush() {
+        // Exercise the palette → execute_command → execute_palette_command
+        // bridge (lower-level than the existing `Enter`-key tests). Pick a
+        // recognised command so the dispatch path is OK.
+        let mut s = state();
+        s.execute_command("help");
+        let Turn::Command { text, ok, .. } = s.transcript().last().expect("turn") else {
+            panic!("expected command turn")
+        };
+        assert_eq!(text, "/help");
+        assert!(*ok);
+    }
+
+    #[test]
+    fn render_rejected_command_shows_marker() {
+        let mut s = state();
+        s.execute_palette_command("/unknown");
+        let text = rendered_text(&s, 80, 14);
+        assert!(text.contains("rejected /unknown"));
+    }
+
+    #[test]
+    fn transcript_records_ok_true_after_plan() {
+        let mut s = state();
+        s.execute_palette_command("/plan");
+        let Turn::Command { ok, text, .. } = s.transcript().last().expect("turn") else {
+            panic!("expected command turn")
+        };
+        assert!(*ok);
+        assert_eq!(text, "/plan");
+    }
+
+    #[test]
+    fn transcript_records_ok_false_after_unknown() {
+        let mut s = state();
+        s.execute_palette_command("/unknown");
+        let Turn::Command { ok, text, message } = s.transcript().last().expect("turn") else {
+            panic!("expected command turn")
+        };
+        assert!(!*ok);
+        assert_eq!(text, "/unknown");
+        assert_eq!(message, "unknown command: /unknown");
+    }
+
+    #[test]
+    fn clear_then_help_results_in_single_help_entry() {
+        let mut s = state();
+        s.execute_palette_command("/plan");
+        s.execute_palette_command("/clear");
+        // /clear wipes its own marker, so the transcript is empty here.
+        assert!(s.transcript().is_empty());
+        s.execute_palette_command("/help");
+        assert_eq!(s.transcript().len(), 1);
+        let Turn::Command { text, .. } = &s.transcript()[0] else {
+            panic!("expected command turn")
+        };
+        assert_eq!(text, "/help");
+    }
+
+    #[test]
+    fn submit_after_cancel_still_proceeds_via_agent_loop() {
+        // Document the current AgentLoop behavior: a parent cancel set
+        // before submit causes `run_turn` to return a UserAbort outcome,
+        // and the state still pushes a User+Assistant pair. We assert
+        // the user-abort outcome to pin the contract.
+        let mut s = state();
+        s.execute_palette_command("/cancel");
+        assert!(s.cancel.is_cancelled());
+        for c in "hi".chars() {
+            s.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let tr = s.last_turn_result().expect("turn result populated");
+        // AgentLoop sees the cancel and short-circuits with UserAbort.
+        assert!(matches!(
+            tr.outcome,
+            stratum_runtime::TurnOutcome::UserAbort
+        ));
+    }
+
+    #[test]
+    fn should_quit_is_false_initially() {
+        let s = state();
+        assert!(!s.should_quit());
     }
 }
