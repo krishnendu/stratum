@@ -39,6 +39,12 @@ pub mod agent_registry_loader;
 pub mod agent_session;
 /// User-agent loader.
 pub mod agents;
+/// `AnthropicApiJudge` — metered HTTP transport for the Stratum LLM-judge.
+///
+/// Opt-in alternative to the default subscription-backed
+/// [`claude_cli_judge`] subprocess; speaks the Anthropic Messages API
+/// over `ureq`.
+pub mod anthropic_api_judge;
 /// Per-turn budget tracker layered over an `AgentBudget` + `CancelToken`.
 pub mod budget;
 /// Session-level cumulative budget meter (totals + per-role breakdown + hard cap).
@@ -202,6 +208,7 @@ pub use agent_registry_loader::{
 };
 pub use agent_session::{AgentSession, SessionError};
 pub use agents::{AgentBudget, AgentDef, AgentLoader};
+pub use anthropic_api_judge::{synth_anthropic_body, AnthropicApiConfig, AnthropicApiJudge};
 pub use budget::{BudgetCheck, BudgetTracker};
 pub use budget_meter::{estimate_cost_micro_usd, BudgetMeter, BudgetMeterError, BudgetTotals};
 pub use cancel::CancelToken;
