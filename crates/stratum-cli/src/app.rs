@@ -12,15 +12,16 @@ use serde::Serialize;
 use stratum_runtime::{
     build_payload as build_telemetry_payload, evaluate as evaluate_update,
     payload_is_allowlisted as telemetry_payload_is_allowlisted, AgentFactory, AgentServeHandler,
-    AnonInstallId, ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CpuArchTag,
-    EchoProvider, EvalReport, EvalRunner, EvalSuite, Event, EventEmitter, EventRecord,
-    GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadedModel, ManifestError,
-    McpServerConfig, McpServerSet, McpTransport, MemoryEventSink, MemoryGate, ModelCatalog,
-    ModelEntry, ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag, Paths, PlatformTag,
-    Provider, ReleaseChannel, ReleaseVersion, RequestId, SandboxReport, ServeBind, ServeConfig,
-    ServeHandler, ServeServer, SessionId, TelemetryConfig, TelemetryEventKind, TelemetryPayload,
-    Tier, Transcript, TranscriptBlock, TranscriptStore, TranscriptTurn, UpdateChannel,
-    UpdateDecision, UpdateManifest, DEFAULT_MARGIN_MIB,
+    AnonInstallId, ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CatalogSync,
+    CatalogSyncConfig, CpuArchTag, EchoProvider, EvalReport, EvalRunner, EvalSuite, Event,
+    EventEmitter, EventRecord, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml,
+    LoadedModel, ManifestError, McpServerConfig, McpServerSet, McpTransport, MemoryEventSink,
+    MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag,
+    Paths, PlatformTag, Provider, ReleaseChannel, ReleaseVersion, RequestId, SandboxReport,
+    ServeBind, ServeConfig, ServeHandler, ServeServer, SessionId, TelemetryConfig,
+    TelemetryEventKind, TelemetryPayload, Tier, Transcript, TranscriptBlock, TranscriptStore,
+    TranscriptTurn, UpdateChannel, UpdateDecision, UpdateManifest, DEFAULT_CATALOG_MAX_BYTES,
+    DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::format_description::well_known::Rfc3339;
@@ -663,6 +664,9 @@ enum ModelsCommand {
     Recommend(RecommendArgs),
     /// Validate the on-disk catalog file.
     Validate,
+    /// Fetch a fresh [`ModelCatalog`] from the channel manifest URL
+    /// (or a local file) and atomically write it to `<state>/models.json`.
+    Sync(SyncArgs),
     /// Legacy: install a model file from a local source path.
     InstallFile(InstallFileArgs),
 }
@@ -737,6 +741,49 @@ struct RecommendArgs {
     /// Task tag.
     #[arg(long)]
     task: TaskArg,
+}
+
+/// Arguments for `stratum models sync`.
+///
+/// Materializes a fresh [`ModelCatalog`] at `<state>/models.json` (or
+/// `--out <PATH>`). The catalog source is, in priority order:
+///
+/// 1. `--manifest-file <PATH>` — load directly from a local JSON file.
+///    Used for offline runs and the integration tests.
+/// 2. `--manifest-url <URL>` — fetch over HTTPS via [`CatalogSync::fetch`].
+/// 3. Neither flag set — fetch the default
+///    `https://catalog.stratum.dev/<channel>.json`.
+///
+/// The two source flags are mutually exclusive.
+#[derive(Debug, Args)]
+struct SyncArgs {
+    /// Release channel. Used to assemble the default URL and threaded
+    /// through to the [`SyncReport`] / `--json` summary.
+    #[arg(long, value_enum, default_value_t = ChannelArg::Stable)]
+    channel: ChannelArg,
+    /// HTTPS URL of the channel catalog JSON. Defaults to
+    /// `https://catalog.stratum.dev/<channel>.json`. Mutually exclusive
+    /// with `--manifest-file`.
+    #[arg(long, value_name = "URL", conflicts_with = "manifest_file")]
+    manifest_url: Option<String>,
+    /// Local catalog fixture path (used for offline runs / tests). Loaded
+    /// directly via [`ModelCatalog::load`] and then re-saved atomically to
+    /// `--out`. Mutually exclusive with `--manifest-url`.
+    #[arg(long, value_name = "PATH", conflicts_with = "manifest_url")]
+    manifest_file: Option<PathBuf>,
+    /// Override the destination path. Defaults to `<state>/models.json`.
+    #[arg(long, value_name = "PATH")]
+    out: Option<PathBuf>,
+    /// Emit a JSON summary `{"channel":..., "url":..., "entries":N, "out":...}`
+    /// instead of the prose line.
+    #[arg(long)]
+    json: bool,
+    /// Hidden test-only override: allow non-`https://` manifest URLs (e.g.
+    /// the in-process `http://127.0.0.1:<port>/…` server used by the
+    /// integration tests). Gated by `cfg(debug_assertions)` OR
+    /// `STRATUM_ALLOW_INSECURE_URL=1` (mirrors the self-update gate).
+    #[arg(long, hide = true)]
+    allow_insecure_url: bool,
 }
 
 /// Arguments for the legacy `stratum models install-file`.
@@ -900,6 +947,9 @@ where
             models_recommend(cli.json, &paths, &rec_args, out, err)
         }
         Some(Command::Models(ModelsCommand::Validate)) => models_validate(&paths, out, err),
+        Some(Command::Models(ModelsCommand::Sync(sync_args))) => {
+            models_sync(&paths, &sync_args, out, err)
+        }
         Some(Command::Models(ModelsCommand::InstallFile(inst_args))) => {
             models_install_file(cli.json, &paths, &inst_args, out, err)
         }
@@ -1337,6 +1387,124 @@ fn models_validate(paths: &Paths, out: &mut dyn Write, err: &mut dyn Write) -> E
             ExitCode::from(1)
         }
     }
+}
+
+/// `--json` payload for `stratum models sync`.
+#[derive(Debug, Serialize)]
+struct ModelsSyncReport<'a> {
+    channel: &'a str,
+    url: &'a str,
+    entries: usize,
+    out: String,
+}
+
+fn models_sync(
+    paths: &Paths,
+    args: &SyncArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    // Reject the hidden test-only flag on production builds.
+    if args.allow_insecure_url && !insecure_flags_allowed() {
+        let _ = writeln!(
+            err,
+            "STRAT-E1001 --allow-insecure-url requires a debug build or \
+             STRATUM_ALLOW_INSECURE_URL=1"
+        );
+        return ExitCode::from(64);
+    }
+
+    if let Err(code) = ensure_state_dir(paths, err) {
+        return code;
+    }
+
+    let dest = args.out.clone().unwrap_or_else(|| catalog_path(paths));
+    // Mirror the `models add` / `save_atomic` parent-dir contract: if `--out`
+    // points into a subdirectory the caller hasn't created yet, we materialise
+    // it here so save_atomic doesn't trip on ENOENT for the .tmp sibling.
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                let _ = writeln!(err, "STRAT-E1001 cannot create {}: {e}", parent.display());
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    let channel_wire = args.channel.as_wire();
+
+    // Resolve catalog source by priority: --manifest-file > --manifest-url >
+    // default channel URL.
+    let (catalog, url_for_summary) = if let Some(path) = args.manifest_file.as_deref() {
+        match ModelCatalog::load(path) {
+            Ok(c) => (c, format!("file://{}", path.display())),
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        let url = args
+            .manifest_url
+            .clone()
+            .unwrap_or_else(|| format!("https://catalog.stratum.dev/{channel_wire}.json"));
+        // CLI-level https-only guard. The runtime also enforces this, but
+        // checking up front gives a uniform diagnostic regardless of which
+        // transport step would have rejected the URL.
+        if !url.starts_with("https://") && !args.allow_insecure_url {
+            let _ = writeln!(err, "STRAT-E1001 manifest url must be https:// (got {url})");
+            return ExitCode::from(1);
+        }
+        let cfg = CatalogSyncConfig {
+            url: url.clone(),
+            channel: channel_wire.to_owned(),
+            timeout: Duration::from_secs(10),
+            max_bytes: DEFAULT_CATALOG_MAX_BYTES,
+        };
+        let sync = CatalogSync::new(cfg);
+        match sync.fetch() {
+            Ok(c) => (c, url),
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 {e}");
+                return ExitCode::from(1);
+            }
+        }
+    };
+
+    if let Err(e) = catalog.save_atomic(&dest) {
+        let _ = writeln!(err, "STRAT-E1001 {e}");
+        return ExitCode::from(1);
+    }
+
+    let entries = catalog.entries.len();
+    if args.json {
+        let payload = ModelsSyncReport {
+            channel: channel_wire,
+            url: &url_for_summary,
+            entries,
+            out: dest.display().to_string(),
+        };
+        #[allow(
+            clippy::expect_used,
+            reason = "ModelsSyncReport serialization is infallible (primitives only)"
+        )]
+        let rendered = serde_json::to_string_pretty(&payload)
+            .expect("ModelsSyncReport serialization is infallible");
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+    } else if writeln!(
+        out,
+        "synced · channel={} · entries={} · {}",
+        channel_wire,
+        entries,
+        dest.display()
+    )
+    .is_err()
+    {
+        return ExitCode::from(74);
+    }
+    ExitCode::SUCCESS
 }
 
 fn models_install_file(
