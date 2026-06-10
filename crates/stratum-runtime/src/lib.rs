@@ -161,6 +161,12 @@ pub mod serve_server;
 pub mod telemetry;
 /// Composite tier classifier (low / medium / high).
 pub mod tier;
+/// `McpToolDispatcher` — bridges an MCP `tools/call` client into the
+/// `ToolDispatcher` trait (Phase 6 scaffold).
+///
+/// Routes `mcp.<server>.<verb>` calls through the same
+/// `RegistryDispatcher` as the local `fs.read` / `shell.exec` tools.
+pub mod tool_dispatcher_mcp;
 /// Concrete `shell.exec` + `fs.read` tool dispatchers (Phase 3 v2).
 pub mod tool_dispatchers;
 /// Tool invocation data shape + dispatcher trait (Phase 3 scaffold).
@@ -330,6 +336,7 @@ pub use telemetry::{
     TELEMETRY_SCHEMA_VERSION,
 };
 pub use tier::Tier;
+pub use tool_dispatcher_mcp::{parse_mcp_tool_id, McpToolDispatcher};
 pub use tool_dispatchers::{
     default_dispatchers, FsReadToolDispatcher, ShellToolDispatcher, SHELL_DEFAULT_ALLOWLIST,
 };
