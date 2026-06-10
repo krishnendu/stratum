@@ -13,17 +13,17 @@ use serde::Serialize;
 use stratum_runtime::{
     build_payload as build_telemetry_payload, evaluate as evaluate_update,
     payload_is_allowlisted as telemetry_payload_is_allowlisted, AgentDef, AgentFactory,
-    AgentLoader, AgentRegistryLoadError, AgentRegistryLoader, AgentServeHandler, AnonInstallId,
-    ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CatalogSync, CatalogSyncConfig,
-    CpuArchTag, EchoProvider, EvalReport, EvalRunner, EvalSuite, Event, EventEmitter, EventRecord,
-    GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadFailure, LoadedModel,
-    ManifestError, McpServerConfig, McpServerSet, McpTransport, MemoryEventSink, MemoryGate,
-    ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag, Paths,
-    PlatformTag, Provider, ReleaseChannel, ReleaseVersion, RequestId, SandboxReport, ServeBind,
-    ServeConfig, ServeHandler, ServeServer, SessionId, SkipReason, SuggestedRole, TelemetryConfig,
-    TelemetryEventKind, TelemetryPayload, Tier, Transcript, TranscriptBlock, TranscriptStore,
-    TranscriptTurn, UpdateChannel, UpdateDecision, UpdateManifest, DEFAULT_CATALOG_MAX_BYTES,
-    DEFAULT_MARGIN_MIB,
+    AgentHandoff, AgentLoader, AgentRegistryLoadError, AgentRegistryLoader, AgentServeHandler,
+    AnonInstallId, ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CatalogSync,
+    CatalogSyncConfig, CpuArchTag, EchoProvider, EvalReport, EvalRunner, EvalSuite, Event,
+    EventEmitter, EventRecord, GenerateRequest, GpuBackend, HandoffPolicy, HardwareProbe,
+    InstalledToml, LoadFailure, LoadedModel, ManifestError, McpServerConfig, McpServerSet,
+    McpTransport, MemoryEventSink, MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug,
+    ModelTask, ModelTier, OsTag, Paths, PlatformTag, Provider, ReleaseChannel, ReleaseVersion,
+    RequestId, SandboxReport, ServeBind, ServeConfig, ServeHandler, ServeServer, SessionId,
+    SkipReason, SuggestedRole, TelemetryConfig, TelemetryEventKind, TelemetryPayload, Tier,
+    Transcript, TranscriptBlock, TranscriptStore, TranscriptTurn, UpdateChannel, UpdateDecision,
+    UpdateManifest, DEFAULT_CATALOG_MAX_BYTES, DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::format_description::well_known::Rfc3339;
@@ -361,6 +361,18 @@ struct ChatArgs {
     /// new turn's response is printed.
     #[arg(long, value_name = "SESSION_ID")]
     resume: Option<String>,
+    /// Load custom agent role definitions from `<PATH>/*.toml` and route the
+    /// chat through an [`stratum_runtime::AgentHandoff`] keyed off the
+    /// classified intent.
+    ///
+    /// When set, the registry is built via
+    /// [`stratum_runtime::AgentRegistryLoader`] against the supplied path. An
+    /// empty directory exits 1 with `STRAT-E1001` — the loader treats a
+    /// missing or empty agents dir as "no custom agents", but `--agents-dir`
+    /// is opt-in so an empty result is a misconfiguration the user wants to
+    /// hear about immediately.
+    #[arg(long = "agents-dir", value_name = "PATH")]
+    agents_dir: Option<PathBuf>,
 }
 
 /// Clap-friendly mirror of the `kind` tag of [`Event`].
@@ -2247,6 +2259,13 @@ fn chat_command(
         },
     };
 
+    // `--agents-dir` opts the chat into multi-role routing via
+    // `AgentRegistryLoader` + `AgentHandoff`. Takes priority over `--model`
+    // so the documented "load my agents and route" path is unambiguous.
+    if let Some(dir) = args.agents_dir.clone() {
+        return chat_with_agents_dir(&dir, args, paths, tier, resumed, out, err);
+    }
+
     // Model-resolution flow only runs when --model is set. Without the
     // `provider-llama-cpp` feature, the only legal mode is EchoProvider —
     // surface a clear STRAT-E1001 error instead of silently downgrading.
@@ -2310,6 +2329,87 @@ fn chat_command(
     }
 
     match crate::chat::run(paths, tier) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let _ = writeln!(err, "{e}");
+            ExitCode::from(70)
+        }
+    }
+}
+
+/// Load custom agents from `dir` via [`AgentRegistryLoader`], build an
+/// [`AgentHandoff`] with the [`SuggestedRole::Default`] fall-back, and route
+/// the chat through it.
+///
+/// * Empty registry → exit 1 + `STRAT-E1001` + a "create `*.toml` files
+///   there" hint. The loader treats a missing directory as "no custom
+///   agents", but `--agents-dir` is opt-in so the user wants to hear about
+///   an empty result loudly.
+/// * Load failure on the directory itself (permissions, etc.) → exit 1 +
+///   `STRAT-E1001` carrying the underlying error.
+/// * Success → builds a `ChatState` against the handoff and either runs one
+///   `--prompt` turn or drops into the interactive TUI, mirroring the
+///   default `chat_command` shape.
+fn chat_with_agents_dir(
+    dir: &Path,
+    args: &ChatArgs,
+    paths: &Paths,
+    tier: Tier,
+    resumed: Option<Transcript>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let factory = Arc::new(AgentFactory::new().with_provider(Arc::new(EchoProvider::new(""))));
+    let loader = AgentRegistryLoader::new(dir.to_path_buf(), factory);
+    let (registry, _report) = match loader.load() {
+        Ok(pair) => pair,
+        Err(AgentRegistryLoadError::Io(e)) => {
+            let _ = writeln!(
+                err,
+                "STRAT-E1001 cannot read agents dir {}: {e}",
+                dir.display()
+            );
+            return ExitCode::from(1);
+        }
+        Err(AgentRegistryLoadError::Factory(msg)) => {
+            let _ = writeln!(err, "STRAT-E1001 agent factory error: {msg}");
+            return ExitCode::from(1);
+        }
+    };
+    if registry.is_empty() {
+        let _ = writeln!(
+            err,
+            "STRAT-E1001 no agents found at {}; create *.toml files there",
+            dir.display()
+        );
+        return ExitCode::from(1);
+    }
+    let handoff = Arc::new(AgentHandoff::new(
+        registry,
+        SuggestedRole::Default,
+        HandoffPolicy::default(),
+    ));
+
+    let provider = EchoProvider::new("");
+    let mut state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths))
+        .with_handoff(handoff);
+    if let Some(path) = args.events_jsonl.as_deref() {
+        state = match attach_jsonl_events(state, path, err) {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+    }
+    if let Some(t) = resumed {
+        if args.prompt.is_some() {
+            print_resumed_transcript(&t, out);
+        }
+        state = state.with_resumed_transcript(t);
+    }
+    if let Some(prompt) = args.prompt.as_deref() {
+        state.submit_with_prompt(prompt);
+        return print_assistant_text(&state, out, err);
+    }
+    match crate::chat::run_with_state(state) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "{e}");

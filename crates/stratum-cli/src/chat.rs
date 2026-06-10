@@ -39,11 +39,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as TuiBlock, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use stratum_runtime::{
-    format_tokens_per_second, AgentLoop, AgentLoopConfig, CancelToken, CapabilityMatrix,
-    EchoProvider, Event as RtEvent, EventEmitter, EventRecord, IntentRouter, MemoryEventSink,
-    Paths, PendingPrompt, PermissionDecision, PermissionRequest, PermissionStore, PlanMode,
-    PromptId, PromptIdGen, Provider, RoleTimer, Tier, Transcript, TranscriptTurn, TurnContext,
-    TurnId, TurnMetrics, TurnRecorder, TurnResult,
+    format_tokens_per_second, AgentHandoff, AgentLoop, AgentLoopConfig, CancelToken,
+    CapabilityMatrix, EchoProvider, Event as RtEvent, EventEmitter, EventRecord, IntentRouter,
+    MemoryEventSink, Paths, PendingPrompt, PermissionDecision, PermissionRequest, PermissionStore,
+    PlanMode, PromptId, PromptIdGen, Provider, RoleTimer, Tier, Transcript, TranscriptTurn,
+    TurnContext, TurnId, TurnMetrics, TurnRecorder, TurnResult,
 };
 use stratum_types::{Block, ModelId, StratumResult};
 
@@ -163,6 +163,11 @@ pub struct ChatState {
     /// free, and good enough for a status-bar gauge — the precise token count
     /// from the provider's `Block::Usage` still flows through `TurnRecorder`.
     last_token_count: u64,
+    /// Optional multi-role coordinator. When `Some`, [`Self::submit`] routes
+    /// each turn through [`AgentHandoff::run_turn_with_handoff`] instead of
+    /// the single-loop default path. `None` preserves the Phase 1 single-loop
+    /// behaviour.
+    handoff: Option<Arc<AgentHandoff>>,
 }
 
 impl Default for ChatState {
@@ -212,6 +217,7 @@ impl ChatState {
             permission_prompter,
             in_flight_since: None,
             last_token_count: 0,
+            handoff: None,
         }
     }
 
@@ -227,6 +233,27 @@ impl ChatState {
         let mut state = Self::new(EchoProvider::new("echo: "), Tier::High, String::new());
         state.agent_loop = loop_;
         state
+    }
+
+    /// Route every subsequent [`Self::submit`] turn through the supplied
+    /// [`AgentHandoff`] instead of the default single-loop path.
+    ///
+    /// Calling this is what turns `stratum chat --agents-dir <path>` into a
+    /// multi-role surface: `submit` builds a [`stratum_runtime::RoutedIntent`]
+    /// via [`IntentRouter::default`] and hands the turn (plus context) to
+    /// [`AgentHandoff::run_turn_with_handoff`]. The default-loop path remains
+    /// available — it just is not used while `handoff` is `Some`.
+    #[must_use]
+    pub fn with_handoff(mut self, h: Arc<AgentHandoff>) -> Self {
+        self.handoff = Some(h);
+        self
+    }
+
+    /// Whether [`Self::submit`] currently routes through an [`AgentHandoff`].
+    /// Test-friendly accessor; production callers do not branch on this.
+    #[must_use]
+    pub const fn has_handoff(&self) -> bool {
+        self.handoff.is_some()
     }
 
     /// Replace the structured-event emitter (e.g. with a JSONL-backed one).
@@ -594,6 +621,12 @@ impl ChatState {
 
     /// Submit the current input through the [`AgentLoop`] and append the
     /// resulting blocks to the transcript.
+    ///
+    /// When [`Self::with_handoff`] has installed an [`AgentHandoff`], the
+    /// turn is routed through [`AgentHandoff::run_turn_with_handoff`]
+    /// instead — a multi-role classifier + sentinel-driven chain — and any
+    /// extra hops surface as `(handoff: from → to)` command lines in the
+    /// transcript so the UI shows the chain that produced the final blocks.
     pub fn submit(&mut self) {
         if self.input.trim().is_empty() {
             return;
@@ -612,11 +645,18 @@ impl ChatState {
             turn_id,
             started_at: std::time::SystemTime::now(),
         };
+
         let role_timer = RoleTimer::start();
-        let turn_result = self.agent_loop.run_turn(ctx, &self.cancel);
+        let (blocks, last_turn_result, handoff_lines) = if let Some(handoff) = self.handoff.as_ref()
+        {
+            self.run_turn_via_handoff(handoff.as_ref(), ctx, &prompt)
+        } else {
+            let turn_result = self.agent_loop.run_turn(ctx, &self.cancel);
+            let blocks = turn_result.blocks.clone();
+            (blocks, Some(turn_result), Vec::new())
+        };
         let step_ms = role_timer.stop_ms();
 
-        let blocks = turn_result.blocks.clone();
         let mut recorder = TurnRecorder::new(turn_id);
         for block in &blocks {
             recorder.record_block(block);
@@ -632,10 +672,58 @@ impl ChatState {
 
         self.transcript.push(Turn::User(prompt));
         self.transcript.push(Turn::Assistant(blocks));
-        self.last_turn_result = Some(turn_result);
+        for line in handoff_lines {
+            self.transcript.push(line);
+        }
+        self.last_turn_result = last_turn_result;
 
         // Turn finished: drop the in-flight indicator.
         self.in_flight_since = None;
+    }
+
+    /// Drive one turn through the supplied [`AgentHandoff`]. Returns the
+    /// final hop's blocks, the matching [`TurnResult`] (for `last_turn_result`),
+    /// and zero-or-more `Turn::Command` rows describing each step in the
+    /// chain (one per step, only when `result.steps.len() > 1`).
+    ///
+    /// On [`stratum_runtime::HandoffError`] the transcript receives an empty
+    /// assistant block, a single `Turn::Command` with `ok = false`, and the
+    /// `last_turn_result` is cleared so the status bar does not surface
+    /// stale metrics.
+    fn run_turn_via_handoff(
+        &self,
+        handoff: &AgentHandoff,
+        ctx: TurnContext,
+        prompt: &str,
+    ) -> (Vec<Block>, Option<TurnResult>, Vec<Turn>) {
+        let intent = IntentRouter::default().classify(prompt);
+        match handoff.run_turn_with_handoff(ctx, intent, &self.cancel) {
+            Ok(result) => {
+                let extra: Vec<Turn> = if result.steps.len() > 1 {
+                    result
+                        .steps
+                        .iter()
+                        .map(|step| Turn::Command {
+                            text: format!("(handoff: {:?} → {:?})", step.from_role, step.to_role),
+                            ok: true,
+                            message: String::new(),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let last = result.steps.last().map(|s| s.turn_result.clone());
+                (result.final_blocks, last, extra)
+            }
+            Err(e) => {
+                let line = Turn::Command {
+                    text: "(handoff failed)".to_string(),
+                    ok: false,
+                    message: e.to_string(),
+                };
+                (Vec::new(), None, vec![line])
+            }
+        }
     }
 
     /// Render the status-bar text for the current turn state.
@@ -2628,5 +2716,54 @@ mod tests {
         s.submit_with_prompt("hi");
         assert_eq!(s.resumed_count(), baseline);
         assert!(s.transcript().len() > pre_len);
+    }
+
+    // -- with_handoff -------------------------------------------------------
+
+    /// Build a tiny [`AgentHandoff`] wrapping a registry that has a single
+    /// `Default` role backed by [`AgentFactory::echo`].
+    fn handoff_default_only() -> Arc<AgentHandoff> {
+        use stratum_runtime::{AgentFactory, AgentRegistry, HandoffPolicy, SuggestedRole};
+        let l = Arc::new(AgentFactory::echo().expect("echo factory builds"));
+        let mut reg = AgentRegistry::new();
+        reg.register(SuggestedRole::Default, l);
+        Arc::new(AgentHandoff::new(
+            reg,
+            SuggestedRole::Default,
+            HandoffPolicy::default(),
+        ))
+    }
+
+    #[test]
+    fn default_state_has_no_handoff() {
+        let s = state();
+        assert!(!s.has_handoff());
+    }
+
+    #[test]
+    fn with_handoff_installs_coordinator() {
+        let s = state().with_handoff(handoff_default_only());
+        assert!(s.has_handoff());
+    }
+
+    #[test]
+    fn submit_with_handoff_records_user_and_assistant_turns() {
+        let mut s = state().with_handoff(handoff_default_only());
+        s.submit_with_prompt("hi");
+        // At minimum we expect a User then an Assistant entry.
+        assert!(matches!(s.transcript()[0], Turn::User(_)));
+        assert!(matches!(s.transcript()[1], Turn::Assistant(_)));
+    }
+
+    #[test]
+    fn submit_without_handoff_still_uses_single_loop_path() {
+        // Regression: omitting `with_handoff` preserves the Phase 1 behaviour
+        // — `submit` routes through `agent_loop.run_turn` and records a
+        // `User` + `Assistant` pair with no command lines.
+        let mut s = state();
+        s.submit_with_prompt("hi");
+        assert_eq!(s.transcript().len(), 2);
+        assert!(matches!(s.transcript()[0], Turn::User(_)));
+        assert!(matches!(s.transcript()[1], Turn::Assistant(_)));
     }
 }
