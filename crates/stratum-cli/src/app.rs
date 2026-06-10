@@ -5,20 +5,22 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use stratum_runtime::{
     build_payload as build_telemetry_payload, evaluate as evaluate_update,
-    payload_is_allowlisted as telemetry_payload_is_allowlisted, AgentFactory, AgentServeHandler,
-    AnonInstallId, ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CatalogSync,
-    CatalogSyncConfig, CpuArchTag, EchoProvider, EvalReport, EvalRunner, EvalSuite, Event,
-    EventEmitter, EventRecord, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml,
-    LoadedModel, ManifestError, McpServerConfig, McpServerSet, McpTransport, MemoryEventSink,
-    MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag,
-    Paths, PlatformTag, Provider, ReleaseChannel, ReleaseVersion, RequestId, SandboxReport,
-    ServeBind, ServeConfig, ServeHandler, ServeServer, SessionId, TelemetryConfig,
+    payload_is_allowlisted as telemetry_payload_is_allowlisted, AgentDef, AgentFactory,
+    AgentLoader, AgentRegistryLoadError, AgentRegistryLoader, AgentServeHandler, AnonInstallId,
+    ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CatalogSync, CatalogSyncConfig,
+    CpuArchTag, EchoProvider, EvalReport, EvalRunner, EvalSuite, Event, EventEmitter, EventRecord,
+    GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadFailure, LoadedModel,
+    ManifestError, McpServerConfig, McpServerSet, McpTransport, MemoryEventSink, MemoryGate,
+    ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag, Paths,
+    PlatformTag, Provider, ReleaseChannel, ReleaseVersion, RequestId, SandboxReport, ServeBind,
+    ServeConfig, ServeHandler, ServeServer, SessionId, SkipReason, SuggestedRole, TelemetryConfig,
     TelemetryEventKind, TelemetryPayload, Tier, Transcript, TranscriptBlock, TranscriptStore,
     TranscriptTurn, UpdateChannel, UpdateDecision, UpdateManifest, DEFAULT_CATALOG_MAX_BYTES,
     DEFAULT_MARGIN_MIB,
@@ -88,6 +90,40 @@ enum Command {
     /// Inspect configured MCP (Model Context Protocol) upstream servers.
     #[command(subcommand)]
     Mcp(McpCommand),
+    /// Inspect user-authored agent definitions under `<state>/agents/`.
+    #[command(subcommand)]
+    Agents(AgentsCommand),
+}
+
+/// Subcommands under `stratum agents`.
+#[derive(Debug, Subcommand)]
+enum AgentsCommand {
+    /// List registered roles plus any skipped or errored files.
+    List(AgentsListArgs),
+    /// Show one agent's TOML by role.
+    Show(AgentsShowArgs),
+}
+
+/// Arguments for `stratum agents list`.
+#[derive(Debug, Args)]
+struct AgentsListArgs {
+    /// Emit a structured JSON object instead of the human prose summary.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments for `stratum agents show`.
+#[derive(Debug, Args)]
+struct AgentsShowArgs {
+    /// Role to look up. The directory is walked alphabetically and the
+    /// first file whose first declared role (or file stem, when `roles`
+    /// is empty) matches this value wins.
+    #[arg(long, value_name = "ROLE")]
+    role: String,
+    /// Emit the parsed [`AgentDef`] as pretty JSON instead of the prose
+    /// summary.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Default loopback TCP address used by `stratum client` when neither
@@ -969,6 +1005,12 @@ where
         Some(Command::Serve(serve_args)) => serve(&serve_args, &paths, out, err),
         Some(Command::Client(client_args)) => client(&client_args, out, err),
         Some(Command::Mcp(McpCommand::List(mcp_args))) => mcp_list(&paths, &mcp_args, out, err),
+        Some(Command::Agents(AgentsCommand::List(agents_args))) => {
+            agents_list(&paths, &agents_args, out, err)
+        }
+        Some(Command::Agents(AgentsCommand::Show(agents_args))) => {
+            agents_show(&paths, &agents_args, out, err)
+        }
     }
 }
 
@@ -1110,6 +1152,245 @@ fn load_mcp_set_or_empty(path: &Path, err: &mut dyn Write) -> Result<McpServerSe
             Err(ExitCode::from(1))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// `stratum agents …`
+// ---------------------------------------------------------------------------
+
+fn agents_dir(paths: &Paths) -> PathBuf {
+    paths.state.join("agents")
+}
+
+/// Build the default [`AgentFactory`] used by every `stratum agents` call —
+/// just an [`EchoProvider`] so the registry loader can construct
+/// [`stratum_runtime::AgentLoop`]s while we walk the directory. Real
+/// per-agent provider binding lands alongside the hot-reload work.
+fn default_agent_factory() -> Arc<AgentFactory> {
+    Arc::new(AgentFactory::new().with_provider(Arc::new(EchoProvider::new(""))))
+}
+
+/// Render the file path stored on a [`SkipReason`] / [`LoadFailure`] using
+/// just the file name when possible — the prose surface is meant for humans
+/// and a tempdir-rooted path adds noise without information.
+fn short_file(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+fn render_skip_reason(reason: &SkipReason) -> String {
+    match reason {
+        SkipReason::UnknownRole { file, role } => {
+            format!("file: {} — unknown role \"{}\"", short_file(file), role)
+        }
+        SkipReason::MissingRoleField { file } => {
+            format!("file: {} — missing role field", short_file(file))
+        }
+        SkipReason::DuplicateRole {
+            role,
+            existing_file,
+            new_file,
+        } => {
+            let role_str = suggested_role_wire(*role);
+            format!(
+                "file: {} — duplicate role \"{}\" (first registered from {})",
+                short_file(new_file),
+                role_str,
+                short_file(existing_file),
+            )
+        }
+    }
+}
+
+fn render_load_failure(failure: &LoadFailure) -> String {
+    format!("file: {} — {}", short_file(&failure.file), failure.error)
+}
+
+/// Snake-case wire name for a [`SuggestedRole`]. Mirrors the
+/// `#[serde(rename_all = "snake_case")]` enum encoding.
+const fn suggested_role_wire(role: SuggestedRole) -> &'static str {
+    match role {
+        SuggestedRole::Default => "default",
+        SuggestedRole::Cavemanish => "cavemanish",
+        SuggestedRole::Polisher => "polisher",
+        SuggestedRole::Coder => "coder",
+        SuggestedRole::Researcher => "researcher",
+    }
+}
+
+fn agents_list(
+    paths: &Paths,
+    args: &AgentsListArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let dir = agents_dir(paths);
+    let loader = AgentRegistryLoader::new(dir, default_agent_factory());
+    let (_registry, mut report) = match loader.load() {
+        Ok(pair) => pair,
+        Err(AgentRegistryLoadError::Io(e)) => {
+            let _ = writeln!(err, "STRAT-E1001 read agents dir: {e}");
+            return ExitCode::from(1);
+        }
+        Err(AgentRegistryLoadError::Factory(msg)) => {
+            let _ = writeln!(err, "STRAT-E1001 agent factory error: {msg}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Sort the registered roles alphabetically so the prose / JSON output is
+    // deterministic regardless of filesystem walk order. (The loader itself
+    // already walks alphabetically, but we don't want callers to depend on
+    // that ordering — sorting here makes the contract explicit.)
+    report.registered.sort_by_key(|r| suggested_role_wire(*r));
+
+    if args.json {
+        #[allow(
+            clippy::expect_used,
+            reason = "LoadReport serialization is infallible (string/enum primitives)"
+        )]
+        let rendered =
+            serde_json::to_string_pretty(&report).expect("LoadReport serialization is infallible");
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if writeln!(out, "registered roles (sorted):").is_err() {
+        return ExitCode::from(74);
+    }
+    for role in &report.registered {
+        if writeln!(out, "  - {}", suggested_role_wire(*role)).is_err() {
+            return ExitCode::from(74);
+        }
+    }
+    if writeln!(out, "skipped: {}", report.skipped.len()).is_err() {
+        return ExitCode::from(74);
+    }
+    for reason in &report.skipped {
+        if writeln!(out, "  - {}", render_skip_reason(reason)).is_err() {
+            return ExitCode::from(74);
+        }
+    }
+    if writeln!(out, "errors: {}", report.errors.len()).is_err() {
+        return ExitCode::from(74);
+    }
+    for failure in &report.errors {
+        if writeln!(out, "  - {}", render_load_failure(failure)).is_err() {
+            return ExitCode::from(74);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Walk `dir` alphabetically and return the first [`AgentDef`] whose first
+/// declared role (or file stem, when `roles` is empty) matches `role`.
+///
+/// Returns `Ok(None)` when no match is found *and* no I/O error occurred.
+/// Files that fail to parse are skipped silently — `agents list` already
+/// surfaces parse errors; `show` is a read-the-one-file shortcut.
+fn find_agent_by_role(dir: &Path, role: &str) -> std::io::Result<Option<AgentDef>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("toml"))
+        })
+        .collect();
+    paths.sort();
+    for path in paths {
+        let Ok(def) = AgentLoader::load_file(&path) else {
+            continue;
+        };
+        let candidate = def
+            .roles
+            .first()
+            .map(|r| r.as_str().to_owned())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_default();
+        if candidate == role {
+            return Ok(Some(def));
+        }
+    }
+    Ok(None)
+}
+
+fn agents_show(
+    paths: &Paths,
+    args: &AgentsShowArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let dir = agents_dir(paths);
+    let def = match find_agent_by_role(&dir, &args.role) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            let _ = writeln!(err, "STRAT-E1001 no agent found for role {:?}", args.role);
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 read agents dir: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if args.json {
+        #[allow(
+            clippy::expect_used,
+            reason = "AgentDef serialization is infallible (no non-string keys, no floats)"
+        )]
+        let rendered =
+            serde_json::to_string_pretty(&def).expect("AgentDef serialization is infallible");
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let caps = if def.tools.is_empty() {
+        "-".to_owned()
+    } else {
+        def.tools
+            .entries()
+            .map(|e| e.as_str().to_owned())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if writeln!(out, "role: {}", args.role).is_err() {
+        return ExitCode::from(74);
+    }
+    if writeln!(out, "name: {}", def.name).is_err() {
+        return ExitCode::from(74);
+    }
+    if writeln!(out, "description: {}", def.description).is_err() {
+        return ExitCode::from(74);
+    }
+    if writeln!(out, "model: {}", def.model.as_str()).is_err() {
+        return ExitCode::from(74);
+    }
+    if writeln!(out, "sandbox: {}", def.sandbox).is_err() {
+        return ExitCode::from(74);
+    }
+    if writeln!(out, "capabilities: {caps}").is_err() {
+        return ExitCode::from(74);
+    }
+    ExitCode::SUCCESS
 }
 
 fn models_dir(paths: &Paths) -> PathBuf {
