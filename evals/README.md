@@ -6,12 +6,16 @@ This directory contains eval suites for `stratum eval run`. Each suite is JSON m
 
 | File              | Cases | Purpose                                                            |
 |---|---|---|
-| `baseline.json`   | 10    | Smoke-test the chat plumbing against `EchoProvider` (no LLM)      |
+| `baseline.json`   | 20    | Smoke-test the chat plumbing against `EchoProvider` (no LLM)      |
+| `coder.json`      | 10    | Code-shaped prompts (`fn`/`struct`/`impl`/`->`/`=>`/`;`/`{}`)     |
+| `polisher.json`   | 10    | Prose-shaped prompts (sentences, punctuation, lists, contractions) |
 
 ## Running locally
 
 ```bash
 cargo run -- eval run --suite evals/baseline.json
+cargo run -- eval run --suite evals/coder.json
+cargo run -- eval run --suite evals/polisher.json
 ```
 
 ## Adding a new suite
