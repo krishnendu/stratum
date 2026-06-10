@@ -125,6 +125,8 @@ pub mod provider_cache;
 pub mod rag;
 /// `RagIndexBuilder` — workspace tree → `RagIndex` + `InMemoryVectorStore` pipeline.
 pub mod rag_index_builder;
+/// `RagQuery` — prompt → ranked passages over a `BuiltIndex`.
+pub mod rag_query;
 /// Token-bucket rate limiter primitives (scaffold for `stratum serve`).
 pub mod rate_limit;
 /// Provider registry + role-to-provider routing table.
@@ -277,6 +279,9 @@ pub use provider_cache::{CacheError, CacheSlot, ProviderCache, ProviderKey};
 pub use rag::{chunk_document, Chunk, ChunkPlan, ChunkSpan, DocumentId, RagDocument, RagIndex};
 pub use rag_index_builder::{
     BuildStats, BuiltIndex, RagBuildError, RagIndexBuilder, DEFAULT_MAX_FILE_BYTES,
+};
+pub use rag_query::{
+    split_vector_key, QueryError, QueryReport, RagQuery, RagQueryConfig, RankedPassage,
 };
 pub use rate_limit::{
     Clock, KeyedRateLimiter, ManualClock, RateLimitError, SystemClock, TokenBucket,
