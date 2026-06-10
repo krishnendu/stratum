@@ -71,17 +71,21 @@ pub enum UpdateChannel {
 /// suppressed with a `reason` on the enum itself.
 #[allow(clippy::upper_case_acronyms, reason = "exact wire encoding")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum PlatformTag {
     /// macOS on Apple Silicon (`aarch64-apple-darwin`).
+    #[serde(rename = "macos_aarch64")]
     MacOsAarch64,
     /// macOS on `x86_64` (`x86_64-apple-darwin`).
+    #[serde(rename = "macos_x86_64")]
     MacOsX86_64,
     /// Linux on aarch64 (`aarch64-unknown-linux-gnu`).
+    #[serde(rename = "linux_aarch64")]
     LinuxAarch64,
     /// Linux on `x86_64` (`x86_64-unknown-linux-gnu`).
+    #[serde(rename = "linux_x86_64")]
     LinuxX86_64,
     /// Windows on `x86_64` (`x86_64-pc-windows-msvc`).
+    #[serde(rename = "windows_x86_64")]
     WindowsX86_64,
 }
 
@@ -780,11 +784,11 @@ mod tests {
         // Exact wire forms — these are part of the manifest contract.
         assert_eq!(
             serde_json::to_string(&PlatformTag::MacOsAarch64).unwrap(),
-            "\"mac_os_aarch64\""
+            "\"macos_aarch64\""
         );
         assert_eq!(
             serde_json::to_string(&PlatformTag::MacOsX86_64).unwrap(),
-            "\"mac_os_x86_64\""
+            "\"macos_x86_64\""
         );
         assert_eq!(
             serde_json::to_string(&PlatformTag::LinuxAarch64).unwrap(),

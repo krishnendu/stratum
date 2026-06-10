@@ -98,13 +98,14 @@ fn build_manifest_json(
     )
 }
 
-/// `update_manifest` serializes `PlatformTag::MacOsAarch64` as
-/// `mac_os_aarch64` etc. The CLI's `--platform` value uses the friendlier
-/// `macos_*` form; the manifest fixture has to use the wire form.
+/// CLI `--platform` and wire form are now the same after the explicit
+/// per-variant rename in `update_manifest::PlatformTag` (fixes the
+/// `mac_os_*` mismatch reported by users running `self-update --check`
+/// against the release workflow's `stable.json`).
 fn wire_platform_for(cli_platform: &str) -> &'static str {
     match cli_platform {
-        "macos_aarch64" => "mac_os_aarch64",
-        "macos_x86_64" => "mac_os_x86_64",
+        "macos_aarch64" => "macos_aarch64",
+        "macos_x86_64" => "macos_x86_64",
         "linux_aarch64" => "linux_aarch64",
         "linux_x86_64" => "linux_x86_64",
         "windows_x86_64" => "windows_x86_64",
