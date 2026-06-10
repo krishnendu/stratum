@@ -1,0 +1,45 @@
+name: eval-baseline
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 04:00 UTC nightly.
+    - cron: '0 4 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  baseline:
+    name: eval baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --release --bin stratum
+      - name: run baseline
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/state
+          ./target/release/stratum --storage-root /tmp/state eval run --suite evals/baseline.json --out /tmp/state/baseline-report.json --json | tee baseline-summary.json
+      - name: upload report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: baseline-report
+          path: |
+            /tmp/state/baseline-report.json
+            baseline-summary.json
