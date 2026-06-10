@@ -195,7 +195,8 @@ pub use agent_loop::{
     TurnResultError,
 };
 pub use agent_registry_loader::{
-    AgentRegistryLoadError, AgentRegistryLoader, LoadFailure, LoadReport, SkipReason,
+    AgentRegistryLoadError, AgentRegistryLoader, EchoProviderResolver, LoadFailure, LoadReport,
+    ProviderResolveError, ProviderResolver, SkipReason,
 };
 pub use agent_session::{AgentSession, SessionError};
 pub use agents::{AgentBudget, AgentDef, AgentLoader};
