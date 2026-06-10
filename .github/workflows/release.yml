@@ -1,0 +1,151 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+permissions:
+  contents: write  # for creating releases
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: cargo build --release
+        run: cargo build --release --bin stratum --target ${{ matrix.target }}
+      - name: archive
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          if [ -z "$tag" ] || [ "$tag" = "$GITHUB_REF" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          fi
+          name="stratum-${tag}-${{ matrix.target }}"
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/stratum dist/
+          chmod +x dist/stratum
+          tar -C dist -czf ${name}.tar.gz stratum
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum ${name}.tar.gz > ${name}.tar.gz.sha256
+          else
+            shasum -a 256 ${name}.tar.gz > ${name}.tar.gz.sha256
+          fi
+          ls -lh ${name}.tar.gz*
+      - name: upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: stratum-${{ matrix.target }}
+          path: |
+            stratum-*.tar.gz
+            stratum-*.tar.gz.sha256
+
+  publish:
+    name: publish github release + manifest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+      - name: collect artifacts + manifest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          if [ -z "$tag" ] || [ "$tag" = "$GITHUB_REF" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          fi
+          # Flatten + compute summary table
+          mkdir -p release-files
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.tar.gz.sha256' \) -exec cp {} release-files/ \;
+          ls -lh release-files
+          # Build manifest JSON
+          version="${tag#v}"
+          python3 - <<PY
+          import hashlib, json, os, pathlib, sys
+          tag = "${tag}"
+          version = "${version}"
+          out = {
+              "schema_version": 1,
+              "channel": "stable",
+              "latest": None,
+              "history": [],
+          }
+          artifacts = []
+          for p in sorted(pathlib.Path("release-files").glob("*.tar.gz")):
+              data = p.read_bytes()
+              sha = hashlib.sha256(data).hexdigest()
+              bytes_ = len(data)
+              target = p.stem.split("-", 2)[2].rsplit(".tar", 1)[0]
+              platform = {
+                  "x86_64-unknown-linux-gnu": "linux_x86_64",
+                  "aarch64-apple-darwin": "macos_aarch64",
+              }.get(target)
+              if not platform:
+                  continue
+              artifacts.append({
+                  "url": f"https://github.com/krishnendu/stratum/releases/download/{tag}/{p.name}",
+                  "sha256": sha,
+                  "bytes": bytes_,
+                  "platform": platform,
+              })
+          entry = {
+              "version": {
+                  "major": int(version.split(".")[0]),
+                  "minor": int(version.split(".")[1]),
+                  "patch": int(version.split(".")[2].split("-")[0]),
+                  "pre": None if "-" not in version else version.split("-", 1)[1],
+              },
+              "released_at": {"secs_since_epoch": int(__import__("time").time()), "nanos_since_epoch": 0},
+              "binary": artifacts[0] if artifacts else None,
+              "min_supported_from": None,
+              "release_notes_url": f"https://github.com/krishnendu/stratum/releases/tag/{tag}",
+          }
+          # Stratum's UpdateManifest expects ONE binary per release, but the artifact list
+          # carries platforms in `binary.platform`. The first artifact wins for the manifest's
+          # `latest.binary`; the rest are linked via GitHub's release assets directly. We document
+          # this as a known limitation; a follow-up multi-binary manifest schema is on the
+          # roadmap (see plan/27).
+          out["latest"] = entry
+          out["history"] = [entry]
+          pathlib.Path("release-files/stable.json").write_text(json.dumps(out, indent=2))
+          PY
+          ls -lh release-files
+      - name: create github release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
