@@ -4,6 +4,18 @@ All notable changes to Stratum. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-06-11
+
+### Fixed
+- Default `--manifest-url` and catalog URLs pointed at `updates.stratum.dev` and `catalog.stratum.dev`, which are not registered. Switch to the GitHub Releases artifacts the release workflow already publishes:
+  `https://github.com/krishnendu/stratum/releases/latest/download/<channel>.json`
+  `https://github.com/krishnendu/stratum/releases/latest/download/catalog-<channel>.json` (#135)
+
+### Added
+- `stratum config get|set|list|unset` for `<state>/config.toml`. Supports `string`/`bool`/`int`/`float` types. (#134)
+- `dist/systemd/stratum.service` + `dist/launchd/dev.stratum.serve.plist` + `docs/service-install.md` for running `stratum serve` as a background daemon. (#131)
+- `docs/architecture.md` — high-level Mermaid diagram + per-turn sequence + module map. (#132)
+
 ## [0.1.1] - 2026-06-11
 
 ### Fixed
