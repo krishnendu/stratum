@@ -30,9 +30,30 @@ use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+/// Long-form `--version` output: semver + short git SHA + UTC build date.
+///
+/// Both `STRATUM_BUILD_SHA` and `STRATUM_BUILD_DATE` are emitted by
+/// `build.rs` and always set (falling back to `"unknown"` when git or
+/// `date` aren't available), so `env!()` here is infallible at compile
+/// time. The short `-V` form keeps clap's default `stratum <version>`;
+/// `--version` produces e.g. `stratum 0.1.1 (abc1234 built 2026-06-10T12:34:56Z)`.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("STRATUM_BUILD_SHA"),
+    " built ",
+    env!("STRATUM_BUILD_DATE"),
+    ")",
+);
+
 /// Stratum CLI.
 #[derive(Debug, Parser)]
-#[command(name = "stratum", version, about = "Stratum local-LLM TUI agent")]
+#[command(
+    name = "stratum",
+    version,
+    long_version = LONG_VERSION,
+    about = "Stratum local-LLM TUI agent"
+)]
 struct Cli {
     /// Emit machine-readable JSON instead of human prose where applicable.
     #[arg(long, global = true)]
