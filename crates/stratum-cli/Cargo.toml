@@ -37,7 +37,9 @@ time                = { workspace = true }
 ratatui             = { workspace = true }
 crossterm           = { workspace = true }
 ureq                = { workspace = true }
+toml_edit           = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 serde_json          = { workspace = true }
 tempfile            = { workspace = true }
+toml_edit           = { workspace = true, features = ["serde"] }

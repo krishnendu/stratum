@@ -15,11 +15,12 @@ use stratum_runtime::{
     AnonInstallId, ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CpuArchTag,
     EchoProvider, EvalReport, EvalRunner, EvalSuite, Event, EventEmitter, EventRecord,
     GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadedModel, ManifestError,
-    MemoryEventSink, MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask,
-    ModelTier, OsTag, Paths, PlatformTag, Provider, ReleaseChannel, ReleaseVersion, SandboxReport,
-    ServeBind, ServeConfig, ServeHandler, ServeServer, SessionId, TelemetryConfig,
-    TelemetryEventKind, TelemetryPayload, Tier, Transcript, TranscriptBlock, TranscriptStore,
-    TranscriptTurn, UpdateChannel, UpdateDecision, UpdateManifest, DEFAULT_MARGIN_MIB,
+    McpServerConfig, McpServerSet, McpTransport, MemoryEventSink, MemoryGate, ModelCatalog,
+    ModelEntry, ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag, Paths, PlatformTag,
+    Provider, ReleaseChannel, ReleaseVersion, SandboxReport, ServeBind, ServeConfig, ServeHandler,
+    ServeServer, SessionId, TelemetryConfig, TelemetryEventKind, TelemetryPayload, Tier,
+    Transcript, TranscriptBlock, TranscriptStore, TranscriptTurn, UpdateChannel, UpdateDecision,
+    UpdateManifest, DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::format_description::well_known::Rfc3339;
@@ -80,6 +81,25 @@ enum Command {
     /// Start the JSON-RPC daemon (`stratum serve`) on a Unix socket or
     /// loopback TCP port.
     Serve(ServeArgs),
+    /// Inspect configured MCP (Model Context Protocol) upstream servers.
+    #[command(subcommand)]
+    Mcp(McpCommand),
+}
+
+/// Subcommands under `stratum mcp`.
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// List configured MCP servers from `<state>/mcp.toml`.
+    List(McpListArgs),
+}
+
+/// Arguments for `stratum mcp list`.
+#[derive(Debug, Args)]
+struct McpListArgs {
+    /// Emit the full [`McpServerSet`] as pretty JSON instead of the
+    /// human-readable table.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `stratum serve`.
@@ -834,6 +854,147 @@ where
         }
         Some(Command::Eval(EvalCommand::Run(eval_args))) => eval_run(&eval_args, &paths, out, err),
         Some(Command::Serve(serve_args)) => serve(&serve_args, &paths, out, err),
+        Some(Command::Mcp(McpCommand::List(mcp_args))) => mcp_list(&paths, &mcp_args, out, err),
+    }
+}
+
+fn mcp_config_path(paths: &Paths) -> PathBuf {
+    paths.state.join("mcp.toml")
+}
+
+/// Render the `transport` column for one [`McpServerConfig`].
+fn render_transport(cfg: &McpServerConfig) -> String {
+    match &cfg.transport {
+        McpTransport::Stdio { command, .. } => format!("stdio (cmd={command})"),
+        McpTransport::Http { url, .. } => format!("http ({url})"),
+    }
+}
+
+/// Render a `Vec<String>` capability list with commas, or `-` when empty.
+fn render_caps(caps: &[String]) -> String {
+    if caps.is_empty() {
+        "-".to_owned()
+    } else {
+        caps.join(", ")
+    }
+}
+
+fn mcp_list(
+    paths: &Paths,
+    args: &McpListArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let path = mcp_config_path(paths);
+    let set = match load_mcp_set_or_empty(&path, err) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    if args.json {
+        #[allow(
+            clippy::expect_used,
+            reason = "McpServerSet serialization is infallible (string/enum primitives)"
+        )]
+        let rendered =
+            serde_json::to_string_pretty(&set).expect("McpServerSet serialization is infallible");
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if set.is_empty() {
+        if writeln!(out, "no MCP servers configured").is_err() {
+            return ExitCode::from(74);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let rows: Vec<(String, String, String, String)> = set
+        .iter()
+        .map(|(name, cfg)| {
+            (
+                name.to_owned(),
+                render_transport(cfg),
+                render_caps(&cfg.allow),
+                render_caps(&cfg.deny),
+            )
+        })
+        .collect();
+    let name_w = rows
+        .iter()
+        .map(|(n, _, _, _)| n.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let xport_w = rows
+        .iter()
+        .map(|(_, x, _, _)| x.len())
+        .max()
+        .unwrap_or(9)
+        .max(9);
+    let allow_w = rows
+        .iter()
+        .map(|(_, _, a, _)| a.len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+
+    let h_name = "name";
+    let h_xport = "transport";
+    let h_allow = "allow";
+    let h_deny = "deny";
+    if writeln!(
+        out,
+        "{h_name:<name_w$}  {h_xport:<xport_w$}  {h_allow:<allow_w$}  {h_deny}"
+    )
+    .is_err()
+    {
+        return ExitCode::from(74);
+    }
+    let s_name = "-".repeat(name_w);
+    let s_xport = "-".repeat(xport_w);
+    let s_allow = "-".repeat(allow_w);
+    let s_deny = "-".repeat(4);
+    if writeln!(
+        out,
+        "{s_name:<name_w$}  {s_xport:<xport_w$}  {s_allow:<allow_w$}  {s_deny}"
+    )
+    .is_err()
+    {
+        return ExitCode::from(74);
+    }
+    for (name, xport, allow, deny) in &rows {
+        if writeln!(
+            out,
+            "{name:<name_w$}  {xport:<xport_w$}  {allow:<allow_w$}  {deny}"
+        )
+        .is_err()
+        {
+            return ExitCode::from(74);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Load `<state>/mcp.toml` into an [`McpServerSet`]. A missing file yields
+/// an empty set; a malformed file yields an `STRAT-E1001` diagnostic + exit 1.
+fn load_mcp_set_or_empty(path: &Path, err: &mut dyn Write) -> Result<McpServerSet, ExitCode> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(McpServerSet::new()),
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 cannot read {}: {e}", path.display());
+            return Err(ExitCode::from(1));
+        }
+    };
+    match toml_edit::de::from_str::<McpServerSet>(&body) {
+        Ok(set) => Ok(set),
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 malformed {}: {e}", path.display());
+            Err(ExitCode::from(1))
+        }
     }
 }
 
