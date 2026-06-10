@@ -11,14 +11,14 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use stratum_runtime::{
     build_payload as build_telemetry_payload, evaluate as evaluate_update,
-    payload_is_allowlisted as telemetry_payload_is_allowlisted, AnonInstallId,
-    ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CpuArchTag, EchoProvider, Event,
-    EventRecord, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadedModel,
-    ManifestError, MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask,
-    ModelTier, OsTag, Paths, PlatformTag, Provider, ReleaseChannel, ReleaseVersion, SandboxReport,
-    SessionId, TelemetryConfig, TelemetryEventKind, TelemetryPayload, Tier, Transcript,
-    TranscriptBlock, TranscriptStore, TranscriptTurn, UpdateChannel, UpdateDecision,
-    UpdateManifest, DEFAULT_MARGIN_MIB,
+    payload_is_allowlisted as telemetry_payload_is_allowlisted, AgentFactory, AnonInstallId,
+    ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CpuArchTag, EchoProvider,
+    EvalReport, EvalRunner, EvalSuite, Event, EventRecord, GenerateRequest, GpuBackend,
+    HardwareProbe, InstalledToml, LoadedModel, ManifestError, MemoryGate, ModelCatalog, ModelEntry,
+    ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag, Paths, PlatformTag, Provider,
+    ReleaseChannel, ReleaseVersion, SandboxReport, SessionId, TelemetryConfig, TelemetryEventKind,
+    TelemetryPayload, Tier, Transcript, TranscriptBlock, TranscriptStore, TranscriptTurn,
+    UpdateChannel, UpdateDecision, UpdateManifest, DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::format_description::well_known::Rfc3339;
@@ -73,6 +73,42 @@ enum Command {
     /// Inspect, list, or delete chat-session transcripts on disk.
     #[command(subcommand)]
     Sessions(SessionsCommand),
+    /// Run prompt-based eval suites against an [`AgentLoop`].
+    #[command(subcommand)]
+    Eval(EvalCommand),
+}
+
+/// Subcommands under `stratum eval`.
+#[derive(Debug, Subcommand)]
+enum EvalCommand {
+    /// Load an [`EvalSuite`] from disk, run it via [`EvalRunner`] wrapped
+    /// around [`AgentFactory::echo`], and save the resulting [`EvalReport`].
+    Run(EvalRunArgs),
+}
+
+/// Arguments for `stratum eval run`.
+///
+/// The runner currently wraps [`AgentFactory::echo`] (the Echo backbone) so
+/// `--model` is parsed but ignored — the field is reserved for the follow-up
+/// PR that wires real provider selection.
+#[derive(Debug, Args)]
+struct EvalRunArgs {
+    /// Path to the JSON [`EvalSuite`] file.
+    #[arg(long, value_name = "PATH")]
+    suite: PathBuf,
+    /// Destination for the JSON [`EvalReport`]. Defaults to
+    /// `<state>/eval-reports/<suite-name>-<timestamp>.json`.
+    #[arg(long, value_name = "PATH")]
+    out: Option<PathBuf>,
+    /// When set, emit the entire [`EvalReport`] as pretty JSON on stdout
+    /// (in addition to writing it to `--out`).
+    #[arg(long)]
+    json: bool,
+    /// Catalog slug for the model to evaluate. **Currently ignored**: the
+    /// runner always uses [`AgentFactory::echo`] until provider selection
+    /// lands. Parsed only so callers can write forward-compatible scripts.
+    #[arg(long, value_name = "SLUG")]
+    model: Option<String>,
 }
 
 /// Subcommands under `stratum sessions`.
@@ -749,6 +785,7 @@ where
         Some(Command::Sessions(SessionsCommand::Delete(del_args))) => {
             sessions_delete(&paths, &del_args, out, err)
         }
+        Some(Command::Eval(EvalCommand::Run(eval_args))) => eval_run(&eval_args, &paths, out, err),
     }
 }
 
@@ -3155,6 +3192,191 @@ fn sessions_delete(
             ExitCode::from(1)
         }
     }
+}
+
+/// Dispatcher for `stratum eval run`.
+///
+/// Loads the suite, wraps `AgentFactory::echo` in an `EvalRunner`, runs every
+/// case, writes the report to disk (default path:
+/// `<state>/eval-reports/<suite-name>-<timestamp>.json`), and emits either a
+/// prose summary or the entire pretty-printed JSON [`EvalReport`] on stdout.
+fn eval_run(
+    args: &EvalRunArgs,
+    paths: &Paths,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    // `--model` is parsed for forward compatibility but ignored by the Echo
+    // backbone; document by binding it (no-op) so clippy doesn't complain.
+    let _ = args.model.as_deref();
+
+    // Load + validate the suite file.
+    let suite = match EvalSuite::load(&args.suite) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "STRAT-E1001 cannot load eval suite {}: {e}",
+                args.suite.display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    // Build the Echo-backed AgentLoop and the runner. Any builder error
+    // surfaces as STRAT-E1001 with exit 1.
+    let agent_loop = match AgentFactory::echo() {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 cannot build echo agent loop: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let runner = EvalRunner::new(std::sync::Arc::new(agent_loop), ModelId::from("echo"));
+
+    let report = runner.run_suite(&suite);
+
+    // Resolve `--out` (or default into `<state>/eval-reports/...`) and write.
+    let out_path = args
+        .out
+        .clone()
+        .unwrap_or_else(|| default_eval_report_path(paths, &suite.name, &report));
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                let _ = writeln!(err, "STRAT-E1001 cannot create {}: {e}", parent.display());
+                return ExitCode::from(1);
+            }
+        }
+    }
+    if let Err(e) = report.save_atomic(&out_path) {
+        let _ = writeln!(
+            err,
+            "STRAT-E1001 cannot save eval report {}: {e}",
+            out_path.display()
+        );
+        return ExitCode::from(1);
+    }
+
+    if args.json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(rendered) => {
+                if writeln!(out, "{rendered}").is_err() {
+                    return ExitCode::from(74);
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 cannot serialize eval report: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else if let Err(code) = render_eval_report_prose(&suite, &report, &out_path, out) {
+        return code;
+    }
+
+    if report.failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// Compute the default `--out` path:
+/// `<paths.state>/eval-reports/<suite-name-slug>-<ran_at_unix_secs>.json`.
+///
+/// The suite name is slugified (whitespace and non-ASCII / non-`[A-Za-z0-9_-]`
+/// chars folded to `_`) so it is safe as a filename across platforms. The
+/// timestamp comes from the report's `ran_at` so re-runs against the same
+/// suite end up in different files.
+fn default_eval_report_path(paths: &Paths, suite_name: &str, report: &EvalReport) -> PathBuf {
+    let dir = paths.state.join("eval-reports");
+    let slug = slugify_suite_name(suite_name);
+    let ts = report
+        .ran_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    dir.join(format!("{slug}-{ts}.json"))
+}
+
+/// Replace any character outside `[A-Za-z0-9_-]` with `_`, then collapse runs
+/// of `_` so the result stays human-readable. Empty input falls back to
+/// `"suite"` to guarantee a non-empty filename stem.
+fn slugify_suite_name(raw: &str) -> String {
+    let mut slug = String::with_capacity(raw.len());
+    let mut last_was_us = false;
+    for ch in raw.chars() {
+        let ok = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_';
+        if ok {
+            slug.push(ch);
+            last_was_us = ch == '_';
+        } else if !last_was_us {
+            slug.push('_');
+            last_was_us = true;
+        }
+    }
+    let trimmed = slug.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        "suite".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Print the documented prose summary for a finished eval run.
+fn render_eval_report_prose(
+    suite: &EvalSuite,
+    report: &EvalReport,
+    out_path: &Path,
+    out: &mut dyn Write,
+) -> Result<(), ExitCode> {
+    let total = report.runs.len();
+    let pct = report.pass_rate() * 100.0;
+    let duration_s = format_seconds_three_decimals(report.total_duration_ms);
+
+    if writeln!(out, "suite: {}", suite.name).is_err() {
+        return Err(ExitCode::from(74));
+    }
+    if writeln!(out, "passed: {}/{total} ({pct:.1}%)", report.passed).is_err() {
+        return Err(ExitCode::from(74));
+    }
+    if writeln!(out, "failed: {}", report.failed).is_err() {
+        return Err(ExitCode::from(74));
+    }
+    if writeln!(out, "duration: {duration_s}s").is_err() {
+        return Err(ExitCode::from(74));
+    }
+    if writeln!(out, "----").is_err() {
+        return Err(ExitCode::from(74));
+    }
+    for run in &report.runs {
+        let tag = if run.passed { "pass" } else { "fail" };
+        let suffix = run
+            .failure_reason
+            .as_deref()
+            .map(|r| format!(" — {r}"))
+            .unwrap_or_default();
+        if writeln!(
+            out,
+            "[{tag}] {} ({}ms){suffix}",
+            run.case_id, run.duration_ms
+        )
+        .is_err()
+        {
+            return Err(ExitCode::from(74));
+        }
+    }
+    if writeln!(out, "report saved to: {}", out_path.display()).is_err() {
+        return Err(ExitCode::from(74));
+    }
+    Ok(())
+}
+
+/// Render `ms` as `"<int>.<3-digit-frac>"` seconds for the prose summary.
+fn format_seconds_three_decimals(ms: u64) -> String {
+    let whole = ms / 1_000;
+    let frac = ms % 1_000;
+    format!("{whole}.{frac:03}")
 }
 
 #[cfg(test)]
