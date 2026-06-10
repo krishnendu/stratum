@@ -20,11 +20,12 @@ use stratum_runtime::{
     EventEmitter, EventRecord, GenerateRequest, GpuBackend, HandoffPolicy, HardwareProbe,
     InstalledToml, LoadFailure, LoadedModel, ManifestError, McpServerConfig, McpServerSet,
     McpTransport, MemoryEventSink, MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug,
-    ModelTask, ModelTier, OsTag, Paths, PlatformTag, Provider, ReleaseChannel, ReleaseVersion,
-    RequestId, SandboxReport, ServeBind, ServeConfig, ServeHandler, ServeServer, SessionId,
-    SkipReason, SuggestedRole, TelemetryConfig, TelemetryEventKind, TelemetryPayload, Tier,
-    Transcript, TranscriptBlock, TranscriptStore, TranscriptTurn, UpdateChannel, UpdateDecision,
-    UpdateManifest, DEFAULT_CATALOG_MAX_BYTES, DEFAULT_MARGIN_MIB,
+    ModelTask, ModelTier, OsTag, Paths, PlatformTag, Provider, ProviderResolveError,
+    ProviderResolver, ReleaseChannel, ReleaseVersion, RequestId, SandboxReport, ServeBind,
+    ServeConfig, ServeHandler, ServeServer, SessionId, SkipReason, SuggestedRole, TelemetryConfig,
+    TelemetryEventKind, TelemetryPayload, Tier, Transcript, TranscriptBlock, TranscriptStore,
+    TranscriptTurn, UpdateChannel, UpdateDecision, UpdateManifest, DEFAULT_CATALOG_MAX_BYTES,
+    DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::format_description::well_known::Rfc3339;
@@ -2496,6 +2497,116 @@ fn chat_command(
     }
 }
 
+/// CLI-side [`ProviderResolver`] that maps each agent TOML's `model = "<slug>"`
+/// field to a concrete [`Provider`] using the on-disk [`ModelCatalog`] plus
+/// the same [`ModelInstaller`] flow used by `stratum chat --model`.
+///
+/// Resolution rules:
+///
+/// * `None` or `Some("echo")` (the default slug for agents) → returns a
+///   shared [`EchoProvider`]. This keeps the floor behaviour: any agent
+///   that doesn't declare a model still gets the echo provider so chat
+///   works without a populated catalog.
+/// * Any other slug:
+///   * Without `--features provider-llama-cpp` → returns
+///     [`ProviderResolveError::Backend`] with a hint pointing at the
+///     missing feature flag.
+///   * With the feature → looks up `slug` in the catalog. Missing →
+///     [`ProviderResolveError::UnknownSlug`]. Present → materialises the
+///     GGUF (downloading and SHA-verifying when needed) and opens a
+///     [`stratum_runtime::LlamaCppProvider`].
+struct CliProviderResolver {
+    catalog: Arc<ModelCatalog>,
+    /// Reserved for future per-resolver state (cache files, lockfiles).
+    /// Held so the resolver can settle alongside `<state>/` without
+    /// re-reading `Paths` at resolve time.
+    #[allow(dead_code)]
+    state_root: PathBuf,
+    /// On-disk directory for materialised GGUF files. Read by the
+    /// `provider-llama-cpp` path; unused otherwise (the feature-off
+    /// resolver short-circuits before touching disk).
+    #[allow(dead_code)]
+    models_root: PathBuf,
+    /// Context window forwarded to the llama.cpp provider when the
+    /// `provider-llama-cpp` feature is enabled. Ignored otherwise.
+    #[allow(dead_code)]
+    n_ctx: u32,
+}
+
+impl ProviderResolver for CliProviderResolver {
+    fn resolve(&self, model_slug: Option<&str>) -> Result<Arc<dyn Provider>, ProviderResolveError> {
+        // `None` and the literal "echo" slug both map to the shared
+        // EchoProvider — this is the "no real model wanted" path that
+        // keeps `--agents-dir` working without a populated catalog.
+        let slug = match model_slug {
+            None | Some("echo") => return Ok(Arc::new(EchoProvider::new(""))),
+            Some(s) => s,
+        };
+        let parsed: ModelSlug = slug
+            .parse()
+            .map_err(|e| ProviderResolveError::UnknownSlug(format!("{slug}: {e}")))?;
+        if self.catalog.get(&parsed).is_none() {
+            return Err(ProviderResolveError::UnknownSlug(slug.to_string()));
+        }
+        self.resolve_real(slug, &parsed)
+    }
+}
+
+impl CliProviderResolver {
+    #[cfg(not(feature = "provider-llama-cpp"))]
+    #[allow(clippy::unused_self)]
+    fn resolve_real(
+        &self,
+        _slug: &str,
+        _parsed: &ModelSlug,
+    ) -> Result<Arc<dyn Provider>, ProviderResolveError> {
+        Err(ProviderResolveError::Backend(
+            "requires --features provider-llama-cpp".to_string(),
+        ))
+    }
+
+    #[cfg(feature = "provider-llama-cpp")]
+    fn resolve_real(
+        &self,
+        slug: &str,
+        parsed: &ModelSlug,
+    ) -> Result<Arc<dyn Provider>, ProviderResolveError> {
+        use stratum_runtime::llama_provider::LlamaCppProviderConfig;
+        use stratum_runtime::LlamaCppProvider;
+
+        let entry = self
+            .catalog
+            .get(parsed)
+            .ok_or_else(|| ProviderResolveError::UnknownSlug(slug.to_string()))?;
+
+        let target = self
+            .models_root
+            .join(format!("{}.gguf", entry.artifact.sha256));
+        if needs_refetch(&target, &entry.artifact.sha256, entry.artifact.bytes) {
+            let dest_filename = format!("{}.gguf", entry.artifact.sha256);
+            let installer = ModelInstaller {
+                dest_dir: &self.models_root,
+                dest_filename: &dest_filename,
+                expected_sha256: Some(entry.artifact.sha256.as_str()),
+            };
+            installer
+                .install_from_url(entry.artifact.url.as_str())
+                .map_err(|e| ProviderResolveError::Backend(format!("download {slug}: {e}")))?;
+        }
+
+        let cfg = LlamaCppProviderConfig {
+            model_path: target,
+            n_ctx: self.n_ctx,
+            n_threads: None,
+            n_gpu_layers: 0,
+            seed: 42,
+        };
+        let provider = LlamaCppProvider::open(&cfg)
+            .map_err(|e| ProviderResolveError::Backend(format!("open {slug}: {e}")))?;
+        Ok(Arc::new(provider))
+    }
+}
+
 /// Load custom agents from `dir` via [`AgentRegistryLoader`], build an
 /// [`AgentHandoff`] with the [`SuggestedRole::Default`] fall-back, and route
 /// the chat through it.
@@ -2519,7 +2630,29 @@ fn chat_with_agents_dir(
     err: &mut dyn Write,
 ) -> ExitCode {
     let factory = Arc::new(AgentFactory::new().with_provider(Arc::new(EchoProvider::new(""))));
-    let loader = AgentRegistryLoader::new(dir.to_path_buf(), factory);
+    // Load the on-disk catalog so each agent TOML's `model` slug can be
+    // resolved to a real provider. A missing catalog file is the common
+    // first-run state — treat it as an empty catalog so unknown slugs
+    // surface as a clean "unknown slug" diagnostic.
+    let catalog_file = catalog_path(paths);
+    let catalog = match load_catalog_or_empty(&catalog_file, err) {
+        Ok(c) => c,
+        Err(code) => {
+            let _ = writeln!(
+                err,
+                "hint: run `stratum models sync` to refresh the catalog"
+            );
+            return code;
+        }
+    };
+    let resolver: Arc<dyn ProviderResolver> = Arc::new(CliProviderResolver {
+        catalog: Arc::new(catalog),
+        state_root: paths.state.clone(),
+        models_root: models_dir(paths),
+        n_ctx: args.ctx,
+    });
+    let loader =
+        AgentRegistryLoader::new(dir.to_path_buf(), factory).with_provider_resolver(resolver);
     let (registry, _report) = match loader.load() {
         Ok(pair) => pair,
         Err(AgentRegistryLoadError::Io(e)) => {
