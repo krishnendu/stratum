@@ -23,10 +23,10 @@ class StratumLlamaCpp < Formula
   desc "Stratum with provider-llama-cpp feature (real local LLM inference)"
   homepage "https://github.com/krishnendu/stratum"
   license any_of: ["Apache-2.0", "MIT"]
-  version "0.1.2"  # MAINTAINER: bump on each release; sourced from the same tag as `stratum`
+  version "0.2.0"  # MAINTAINER: bump on each release; sourced from the same tag as `stratum`
 
-  url "https://github.com/krishnendu/stratum/archive/refs/tags/v0.1.2.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"  # PLACEHOLDER
+  url "https://github.com/krishnendu/stratum/archive/refs/tags/v0.2.0.tar.gz"
+  sha256 "e1f47901c5905d6e8222dacb85f2fef26a612e0e1a6d97fa57c9f5820b8b15b3"
 
   depends_on "rust" => :build
   depends_on "cmake" => :build
