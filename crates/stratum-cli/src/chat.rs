@@ -25,7 +25,7 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -148,6 +148,21 @@ pub struct ChatState {
     /// Shared TUI permission prompter. Cloned into the [`AgentLoop`] as the
     /// responder and read by the event loop to surface pending requests.
     permission_prompter: Arc<TuiPromptResponder>,
+    /// Wall-clock instant at which the current in-flight turn started.
+    ///
+    /// `Some` while [`Self::submit`] is running; cleared back to `None` on
+    /// completion. Used by [`Self::status_bar_text`] to render the live
+    /// `[generating… <N>s]` indicator.
+    in_flight_since: Option<Instant>,
+    /// Approximate completion-token count from the most recent turn.
+    ///
+    /// Computed as `sum(Block::Text(text).len()) / 4` across the assistant
+    /// blocks: a coarse 4-chars-per-token heuristic that matches the ballpark
+    /// for English-prose tokenizers (GPT/Llama byte-pair encodings average
+    /// ~3.5–4.5 chars per token on natural-language text). Cheap, allocation-
+    /// free, and good enough for a status-bar gauge — the precise token count
+    /// from the provider's `Block::Usage` still flows through `TurnRecorder`.
+    last_token_count: u64,
 }
 
 impl Default for ChatState {
@@ -195,6 +210,8 @@ impl ChatState {
             plan_mode,
             resumed_count: 0,
             permission_prompter,
+            in_flight_since: None,
+            last_token_count: 0,
         }
     }
 
@@ -585,6 +602,10 @@ impl ChatState {
         let turn_id = TurnId(self.next_turn_id);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
 
+        // Mark the turn as in-flight so `status_bar_text` renders the live
+        // `[generating… <N>s]` indicator. Cleared unconditionally at the end.
+        self.in_flight_since = Some(Instant::now());
+
         let ctx = TurnContext {
             user_prompt: prompt.clone(),
             model: ModelId::from("echo"),
@@ -601,11 +622,65 @@ impl ChatState {
             recorder.record_block(block);
         }
         recorder.record_step("generate", step_ms);
+
+        // Coarse 4-chars-per-token approximation across assistant text blocks.
+        // Replaces (not accumulates) `last_token_count` so the status bar
+        // reflects only the most recent turn — matching `last_metrics`.
+        let tokens_generated = approximate_token_count(&blocks);
+        self.last_token_count = tokens_generated;
         self.last_metrics = Some(recorder.finish());
 
         self.transcript.push(Turn::User(prompt));
         self.transcript.push(Turn::Assistant(blocks));
         self.last_turn_result = Some(turn_result);
+
+        // Turn finished: drop the in-flight indicator.
+        self.in_flight_since = None;
+    }
+
+    /// Render the status-bar text for the current turn state.
+    ///
+    /// * While a turn is in flight: `[generating… <N>s]` where `<N>` is the
+    ///   wall-clock seconds since [`Self::submit`] started.
+    /// * After a completed turn (and no in-flight turn): a token-rate summary
+    ///   `"<count> tokens in <ms>ms (<tok/s> tok/s)"` derived from
+    ///   `last_token_count`, the most recent `TurnMetrics`, and
+    ///   [`format_tokens_per_second`].
+    /// * Otherwise (fresh state, no submit yet): the empty string.
+    ///
+    /// The in-flight branch wins over the completed branch — a fresh submit
+    /// after a previous turn renders `[generating…]` even though
+    /// `last_metrics` is still `Some`.
+    #[must_use]
+    pub fn status_bar_text(&self) -> String {
+        if let Some(started) = self.in_flight_since {
+            let elapsed = started.elapsed().as_secs();
+            return format!("[generating… {elapsed}s]");
+        }
+        if let Some(metrics) = self.last_metrics.as_ref() {
+            let role_ms = metrics
+                .role_steps
+                .iter()
+                .map(|step| step.duration_ms)
+                .fold(0_u32, u32::saturating_add);
+            // `format_tokens_per_second` takes `u32`; saturate the approximate
+            // count without panicking on the (impossible) overflow case.
+            let count_u32 = u32::try_from(self.last_token_count).unwrap_or(u32::MAX);
+            let tps = format_tokens_per_second(count_u32, role_ms);
+            return format!(
+                "{} tokens in {}ms ({tps:.1} tok/s)",
+                self.last_token_count, role_ms,
+            );
+        }
+        String::new()
+    }
+
+    /// Borrow the approximate token count from the most recent turn. Used by
+    /// tests; production callers prefer the precise `last_metrics` count.
+    #[must_use]
+    #[cfg(test)]
+    const fn last_token_count(&self) -> u64 {
+        self.last_token_count
     }
 
     /// Record a completed turn: emit structured events for the generated
@@ -689,6 +764,14 @@ impl ChatState {
                     "turn {} · prompt:{} compl:{} · {tps:.1} tok/s",
                     metrics.turn_id.0, metrics.prompt_tokens, metrics.completion_tokens,
                 ),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        let status_bar = self.status_bar_text();
+        if !status_bar.is_empty() {
+            status_spans.push(Span::raw(" · "));
+            status_spans.push(Span::styled(
+                status_bar,
                 Style::default().add_modifier(Modifier::DIM),
             ));
         }
@@ -849,6 +932,24 @@ fn describe_request(req: &PermissionRequest) -> String {
         PermissionRequest::FileWrite { path } => format!("write to {}", path.display()),
         PermissionRequest::ToolUse { tool_id } => format!("invoke tool {tool_id}"),
     }
+}
+
+/// Approximate the completion-token count from a slice of assistant blocks.
+///
+/// Sums character lengths of every [`Block::Text`] block and divides by 4,
+/// matching the 4-chars-per-token rough heuristic documented on
+/// [`ChatState::last_token_count`]. Non-text blocks (usage, tool calls, etc.)
+/// contribute nothing. Pure / allocation-free.
+fn approximate_token_count(blocks: &[Block]) -> u64 {
+    const CHARS_PER_TOKEN: u64 = 4;
+    let total_chars: u64 = blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Text { text } => Some(text.len() as u64),
+            _ => None,
+        })
+        .sum();
+    total_chars / CHARS_PER_TOKEN
 }
 
 fn render_block(block: &Block) -> Option<Line<'_>> {
@@ -2375,6 +2476,146 @@ mod tests {
         assert!(text.contains("permission"));
         assert!(text.contains("fs.write"));
         assert!(text.contains("[a]"));
+    }
+
+    // ---------- streaming-progress status bar ----------
+
+    #[test]
+    fn status_bar_text_initially_empty() {
+        let s = state();
+        assert_eq!(s.status_bar_text(), "");
+    }
+
+    #[test]
+    fn status_bar_text_after_submit_contains_tokens_and_tok_per_sec() {
+        // ScriptedProvider returns one Block::Text of length 11 ("hello world")
+        // so we can pin the approximate-token-count math.
+        let sink: Arc<dyn EventSink> = Arc::new(MemoryEventSink::new());
+        let events = Arc::new(EventEmitter::new(sink));
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            script: std::sync::Mutex::new(vec![
+                Block::Text {
+                    text: "hello world".into(),
+                },
+                Block::Done,
+            ]),
+        });
+        let loop_ = build_loop(provider, events);
+        let mut s = ChatState::with_agent_loop(loop_);
+        s.submit_with_prompt("go");
+        let bar = s.status_bar_text();
+        assert!(bar.contains("tokens"), "got: {bar}");
+        assert!(bar.contains("tok/s"), "got: {bar}");
+    }
+
+    #[test]
+    fn status_bar_last_token_count_uses_four_chars_per_token() {
+        // 11 chars / 4 = 2 (integer division). Pin a small bound to allow for
+        // a future tweak of the heuristic without rewriting this test.
+        let sink: Arc<dyn EventSink> = Arc::new(MemoryEventSink::new());
+        let events = Arc::new(EventEmitter::new(sink));
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider {
+            script: std::sync::Mutex::new(vec![Block::Text {
+                text: "hello world".into(),
+            }]),
+        });
+        let loop_ = build_loop(provider, events);
+        let mut s = ChatState::with_agent_loop(loop_);
+        s.submit_with_prompt("go");
+        let count = s.last_token_count();
+        assert!(
+            (2..=3).contains(&count),
+            "expected approximate count in [2, 3], got {count}",
+        );
+    }
+
+    #[test]
+    fn in_flight_since_cleared_after_submit_completes() {
+        let mut s = state();
+        s.submit_with_prompt("hi");
+        assert!(s.in_flight_since.is_none());
+    }
+
+    #[test]
+    fn status_bar_in_flight_shows_generating() {
+        let mut s = state();
+        // Pin a synthetic in-flight stamp 2 seconds in the past so the
+        // formatted elapsed seconds are deterministic.
+        s.in_flight_since = Instant::now().checked_sub(Duration::from_secs(2));
+        assert!(s.in_flight_since.is_some());
+        let bar = s.status_bar_text();
+        assert!(bar.contains("generating"), "got: {bar}");
+    }
+
+    #[test]
+    fn status_bar_in_flight_takes_precedence_over_last_metrics() {
+        // First, run a turn so `last_metrics` is populated.
+        let mut s = state();
+        s.submit_with_prompt("hi");
+        assert!(s.last_metrics().is_some());
+        // Now mark a fresh turn as in-flight — the in-flight indicator
+        // must win over the completed-turn summary.
+        s.in_flight_since = Some(Instant::now());
+        let bar = s.status_bar_text();
+        assert!(bar.contains("generating"), "got: {bar}");
+        assert!(!bar.contains("tok/s"), "got: {bar}");
+    }
+
+    #[test]
+    fn status_bar_multiple_submits_replace_last_metrics() {
+        let mut s = state();
+        s.submit_with_prompt("hi");
+        let first = s.last_metrics().expect("first metrics").turn_id;
+        s.submit_with_prompt("bye");
+        let second = s.last_metrics().expect("second metrics").turn_id;
+        // The most recent submit replaces — does not append.
+        assert_ne!(first, second);
+        assert_eq!(second.0, first.0 + 1);
+    }
+
+    #[test]
+    fn approximate_token_count_zero_for_empty_blocks() {
+        assert_eq!(approximate_token_count(&[]), 0);
+    }
+
+    #[test]
+    fn approximate_token_count_ignores_non_text_blocks() {
+        // Usage / Done / ToolCall must contribute nothing.
+        let blocks = vec![
+            Block::Usage {
+                prompt: 100,
+                completion: 200,
+            },
+            Block::Done,
+            Block::ToolCall {
+                id: "t1".into(),
+                tool: "fs.read".into(),
+                args: "{}".into(),
+            },
+        ];
+        assert_eq!(approximate_token_count(&blocks), 0);
+    }
+
+    #[test]
+    fn approximate_token_count_sums_text_lengths() {
+        // "abcd" + "efgh" = 8 chars / 4 = 2 tokens.
+        let blocks = vec![
+            Block::Text {
+                text: "abcd".into(),
+            },
+            Block::Text {
+                text: "efgh".into(),
+            },
+        ];
+        assert_eq!(approximate_token_count(&blocks), 2);
+    }
+
+    #[test]
+    fn render_shows_generating_indicator_when_in_flight() {
+        let mut s = state();
+        s.in_flight_since = Some(Instant::now());
+        let text = rendered_text(&s, 100, 12);
+        assert!(text.contains("generating"), "got render:\n{text}");
     }
 
     #[test]
