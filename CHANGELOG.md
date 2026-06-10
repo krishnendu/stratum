@@ -4,6 +4,13 @@ All notable changes to Stratum. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-11
+
+### Fixed
+- `print_greeting` hardcoded `tier=unknown`; now reads the real tier from `installed.toml` (#127).
+- `PlatformTag` serialized as `mac_os_aarch64` (auto-snake_case of `MacOs`); release manifest emits the conventional `macos_aarch64`. `stratum self-update --check` against the v0.1.0 release errored (#128). Per-variant `#[serde(rename)]` fixes the wire form.
+- `Paths::resolve_from` double-nested the state dir (`<base>/stratum/stratum/`). State files (`telemetry.json` opt-out, `models.json`, `transcripts/`, `anon_install_id`) lived at the wrong path and were silently ignored by the CLI (#129). Migration: v0.1.0 users with state files at the double-nested path should `mv` them up one level.
+
 ## [0.1.0] - 2026-06-11
 
 Initial public release.
