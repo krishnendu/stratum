@@ -26,6 +26,11 @@ pub mod agent_handoff;
 /// emitter, plan-mode fence, and capability matrix into a single
 /// `run_turn` entry point.
 pub mod agent_loop;
+/// `AgentRegistryLoader` — populates an [`agent_handoff::AgentRegistry`].
+///
+/// Walks `<state>/agents/*.toml` and builds one [`agent_loop::AgentLoop`]
+/// per file via [`agent_factory::AgentFactory`].
+pub mod agent_registry_loader;
 /// `AgentSession` — high-level conversation wrapper.
 ///
 /// Composes [`agent_loop::AgentLoop`], [`transcript::TranscriptStore`],
@@ -175,6 +180,9 @@ pub use agent_handoff::{
 pub use agent_loop::{
     AgentLoop, AgentLoopBuildError, AgentLoopBuilder, AgentLoopConfig, TurnContext, TurnResult,
     TurnResultError,
+};
+pub use agent_registry_loader::{
+    AgentRegistryLoadError, AgentRegistryLoader, LoadFailure, LoadReport, SkipReason,
 };
 pub use agent_session::{AgentSession, SessionError};
 pub use agents::{AgentBudget, AgentDef, AgentLoader};
