@@ -11,15 +11,16 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use stratum_runtime::{
     build_payload as build_telemetry_payload, evaluate as evaluate_update,
-    payload_is_allowlisted as telemetry_payload_is_allowlisted, AgentFactory, AgentServeHandler,
-    AnonInstallId, ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CpuArchTag,
-    EchoProvider, EvalReport, EvalRunner, EvalSuite, Event, EventEmitter, EventRecord,
-    GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadedModel, ManifestError,
-    MemoryEventSink, MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask,
-    ModelTier, OsTag, Paths, PlatformTag, Provider, ReleaseChannel, ReleaseVersion, SandboxReport,
-    ServeBind, ServeConfig, ServeHandler, ServeServer, SessionId, TelemetryConfig,
-    TelemetryEventKind, TelemetryPayload, Tier, Transcript, TranscriptBlock, TranscriptStore,
-    TranscriptTurn, UpdateChannel, UpdateDecision, UpdateManifest, DEFAULT_MARGIN_MIB,
+    payload_is_allowlisted as telemetry_payload_is_allowlisted, AgentDef, AgentFactory,
+    AgentRegistryLoader, AgentServeHandler, AnonInstallId, ArtifactRef as ModelArtifactRef,
+    CancelToken, CatalogError, CpuArchTag, EchoProvider, EvalReport, EvalRunner, EvalSuite, Event,
+    EventEmitter, EventRecord, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml,
+    LoadFailure, LoadedModel, ManifestError, MemoryEventSink, MemoryGate, ModelCatalog, ModelEntry,
+    ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag, Paths, PlatformTag, Provider,
+    ReleaseChannel, ReleaseVersion, SandboxReport, ServeBind, ServeConfig, ServeHandler,
+    ServeServer, SessionId, SkipReason, SuggestedRole, TelemetryConfig, TelemetryEventKind,
+    TelemetryPayload, Tier, Transcript, TranscriptBlock, TranscriptStore, TranscriptTurn,
+    UpdateChannel, UpdateDecision, UpdateManifest, DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::format_description::well_known::Rfc3339;
@@ -80,6 +81,38 @@ enum Command {
     /// Start the JSON-RPC daemon (`stratum serve`) on a Unix socket or
     /// loopback TCP port.
     Serve(ServeArgs),
+    /// Inspect user-authored agent definitions in `<state>/agents/*.toml`.
+    #[command(subcommand)]
+    Agents(AgentsCommand),
+}
+
+/// Subcommands under `stratum agents`.
+#[derive(Debug, Subcommand)]
+enum AgentsCommand {
+    /// List registered roles and report skipped / errored files.
+    List(AgentsListArgs),
+    /// Show the parsed [`AgentDef`] for a single role.
+    Show(AgentsShowArgs),
+}
+
+/// Arguments for `stratum agents list`.
+#[derive(Debug, Args)]
+struct AgentsListArgs {
+    /// Emit a structured JSON payload instead of prose.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments for `stratum agents show`.
+#[derive(Debug, Args)]
+struct AgentsShowArgs {
+    /// Role to look up (`coder`, `polisher`, `cavemanish`, `researcher`,
+    /// `default`).
+    #[arg(long)]
+    role: String,
+    /// Emit the [`AgentDef`] as pretty JSON instead of prose.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for `stratum serve`.
@@ -834,6 +867,12 @@ where
         }
         Some(Command::Eval(EvalCommand::Run(eval_args))) => eval_run(&eval_args, &paths, out, err),
         Some(Command::Serve(serve_args)) => serve(&serve_args, &paths, out, err),
+        Some(Command::Agents(AgentsCommand::List(list_args))) => {
+            agents_list(&list_args, &paths, out, err)
+        }
+        Some(Command::Agents(AgentsCommand::Show(show_args))) => {
+            agents_show(&show_args, &paths, out, err)
+        }
     }
 }
 
@@ -3550,6 +3589,277 @@ fn format_seconds_three_decimals(ms: u64) -> String {
     let whole = ms / 1_000;
     let frac = ms % 1_000;
     format!("{whole}.{frac:03}")
+}
+
+// ---------------------------------------------------------------------------
+// `stratum agents` subcommand
+// ---------------------------------------------------------------------------
+
+fn agents_dir(paths: &Paths) -> PathBuf {
+    paths.state.join("agents")
+}
+
+/// Build the shared `AgentRegistryLoader` over `<state>/agents` using the
+/// Echo provider. The loader runs the same factory backbone tests use, so
+/// any loop construction failure surfaces in `LoadReport.errors`.
+fn build_agents_loader(paths: &Paths) -> AgentRegistryLoader {
+    let factory = std::sync::Arc::new(
+        AgentFactory::new().with_provider(std::sync::Arc::new(EchoProvider::new(""))),
+    );
+    AgentRegistryLoader::new(agents_dir(paths), factory)
+}
+
+/// Render a `SuggestedRole` as its `snake_case` wire form (mirrors the
+/// serde derive on the enum).
+const fn role_as_wire(role: SuggestedRole) -> &'static str {
+    match role {
+        SuggestedRole::Default => "default",
+        SuggestedRole::Cavemanish => "cavemanish",
+        SuggestedRole::Polisher => "polisher",
+        SuggestedRole::Coder => "coder",
+        SuggestedRole::Researcher => "researcher",
+    }
+}
+
+/// Parse a user-supplied role string into a `SuggestedRole`. Returns `None`
+/// when the string does not match any known variant.
+fn parse_role_arg(s: &str) -> Option<SuggestedRole> {
+    match s {
+        "default" => Some(SuggestedRole::Default),
+        "cavemanish" => Some(SuggestedRole::Cavemanish),
+        "polisher" => Some(SuggestedRole::Polisher),
+        "coder" => Some(SuggestedRole::Coder),
+        "researcher" => Some(SuggestedRole::Researcher),
+        _ => None,
+    }
+}
+
+/// Brief one-line summary of a `SkipReason` for prose output.
+fn render_skip_reason(reason: &SkipReason) -> String {
+    match reason {
+        SkipReason::UnknownRole { file, role } => {
+            format!("file: {} — unknown role {role:?}", file.display())
+        }
+        SkipReason::MissingRoleField { file } => {
+            format!("file: {} — missing role field", file.display())
+        }
+        SkipReason::DuplicateRole {
+            role,
+            existing_file,
+            new_file,
+        } => format!(
+            "file: {} — duplicate role {} (already registered by {})",
+            new_file.display(),
+            role_as_wire(*role),
+            existing_file.display(),
+        ),
+    }
+}
+
+/// Brief one-line summary of a `LoadFailure` for prose output.
+fn render_load_failure(failure: &LoadFailure) -> String {
+    format!("file: {} — {}", failure.file.display(), failure.error)
+}
+
+/// JSON shape for `stratum agents list --json`.
+#[derive(Debug, Serialize)]
+struct AgentsListJson<'a> {
+    registered: Vec<&'static str>,
+    skipped: &'a [SkipReason],
+    errors: &'a [LoadFailure],
+}
+
+fn agents_list(
+    args: &AgentsListArgs,
+    paths: &Paths,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let loader = build_agents_loader(paths);
+    let (_registry, report) = match loader.load() {
+        Ok(pair) => pair,
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Sort registered roles by wire form for the prose surface.
+    let mut sorted_roles: Vec<SuggestedRole> = report.registered.clone();
+    sorted_roles.sort_by_key(|r| role_as_wire(*r));
+
+    if args.json {
+        let payload = AgentsListJson {
+            registered: sorted_roles.iter().copied().map(role_as_wire).collect(),
+            skipped: &report.skipped,
+            errors: &report.errors,
+        };
+        match serde_json::to_string_pretty(&payload) {
+            Ok(rendered) => {
+                if writeln!(out, "{rendered}").is_err() {
+                    return ExitCode::from(74);
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 cannot serialize agents list: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if writeln!(out, "registered roles (sorted):").is_err() {
+        return ExitCode::from(74);
+    }
+    for role in &sorted_roles {
+        if writeln!(out, "  - {}", role_as_wire(*role)).is_err() {
+            return ExitCode::from(74);
+        }
+    }
+    if writeln!(out, "skipped: {}", report.skipped.len()).is_err() {
+        return ExitCode::from(74);
+    }
+    for s in &report.skipped {
+        if writeln!(out, "  - {}", render_skip_reason(s)).is_err() {
+            return ExitCode::from(74);
+        }
+    }
+    if writeln!(out, "errors: {}", report.errors.len()).is_err() {
+        return ExitCode::from(74);
+    }
+    for e in &report.errors {
+        if writeln!(out, "  - {}", render_load_failure(e)).is_err() {
+            return ExitCode::from(74);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Locate the `AgentDef` whose first-role-or-stem matches `target_role`.
+/// Mirrors the registration logic in `AgentRegistryLoader::load`, so the
+/// file the loader would have registered is the one we surface.
+fn find_agent_for_role(dir: &Path, target_role: SuggestedRole) -> Result<Option<AgentDef>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read agents dir {}: {e}", dir.display())),
+    };
+    let mut paths_list: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+        })
+        .collect();
+    paths_list.sort();
+    for path in &paths_list {
+        let Ok(def) = stratum_runtime::AgentLoader::load_file(path) else {
+            continue;
+        };
+        let role_str = def
+            .roles
+            .first()
+            .map(|r| r.as_str().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty())
+            });
+        let Some(role_str) = role_str else {
+            continue;
+        };
+        if parse_role_arg(&role_str) == Some(target_role) {
+            return Ok(Some(def));
+        }
+    }
+    Ok(None)
+}
+
+fn write_show_prose(
+    target_role: SuggestedRole,
+    def: &AgentDef,
+    out: &mut dyn Write,
+) -> Result<(), ExitCode> {
+    if writeln!(out, "role: {}", role_as_wire(target_role)).is_err() {
+        return Err(ExitCode::from(74));
+    }
+    if writeln!(out, "name: {}", def.name).is_err() {
+        return Err(ExitCode::from(74));
+    }
+    if writeln!(out, "description: {}", def.description).is_err() {
+        return Err(ExitCode::from(74));
+    }
+    if writeln!(out, "model: {}", def.model.as_str()).is_err() {
+        return Err(ExitCode::from(74));
+    }
+    if writeln!(out, "sandbox: {}", def.sandbox).is_err() {
+        return Err(ExitCode::from(74));
+    }
+    let caps: Vec<&str> = def
+        .tools
+        .entries()
+        .map(stratum_runtime::CapabilityEntry::as_str)
+        .collect();
+    if writeln!(out, "capabilities: {}", caps.join(", ")).is_err() {
+        return Err(ExitCode::from(74));
+    }
+    Ok(())
+}
+
+fn agents_show(
+    args: &AgentsShowArgs,
+    paths: &Paths,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let Some(target_role) = parse_role_arg(&args.role) else {
+        let _ = writeln!(
+            err,
+            "STRAT-E1001 unknown role {:?} (expected one of: default, cavemanish, polisher, coder, researcher)",
+            args.role
+        );
+        return ExitCode::from(1);
+    };
+
+    let def = match find_agent_for_role(&agents_dir(paths), target_role) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            let _ = writeln!(
+                err,
+                "STRAT-E1001 no agent registered for role {:?}",
+                args.role
+            );
+            return ExitCode::from(1);
+        }
+        Err(diag) => {
+            let _ = writeln!(err, "STRAT-E1001 {diag}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if args.json {
+        match serde_json::to_string_pretty(&def) {
+            Ok(rendered) => {
+                if writeln!(out, "{rendered}").is_err() {
+                    return ExitCode::from(74);
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 cannot serialize agent def: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if let Err(code) = write_show_prose(target_role, &def, out) {
+        return code;
+    }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
