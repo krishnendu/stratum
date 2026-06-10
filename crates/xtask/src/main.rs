@@ -1,21 +1,28 @@
 // xtask-check-error-codes: ignore-file
+// xtask-check-sentinel-codes: ignore-file
 //
-// Reason: this binary's tests fabricate `STRAT-E####` literals in fixtures.
+// Reason: this binary's tests fabricate `STRAT-E####` and `E_*` literals
+// in fixtures. They are not real catalog codes or sentinel usages.
 
 //! `xtask` — workspace automation entry point.
 //!
 //! Subcommands:
 //!
-//! * `check-error-codes` (default): validate that every `STRAT-Exxxx` literal
-//!   used in the workspace is declared in
+//! * `check-error-codes`: validate that every `STRAT-Exxxx` literal used in
+//!   the workspace is declared in
 //!   [`stratum_types::error::codes`](../stratum_types/error/codes/index.html)
 //!   and that no catalog constant is orphaned.
+//! * `check-sentinel-codes`: audit short local `E_*` sentinel literals
+//!   (`E_NO_BLOCKS`, `E_TOOL_PANIC`, …) against a hardcoded allowlist.
+//!
+//! Running `xtask` with no subcommand executes **both** validators in order
+//! and aggregates the exit status — `0` only if both succeed.
 //!
 //! This binary intentionally does **not** use the Stratum error catalog — it
 //! is the tool that validates the catalog and so cannot depend on it without
 //! creating a chicken-and-egg loop. Errors are surfaced as plain
-//! [`check_error_codes::RunError`] values printed to `stderr`, and the process
-//! exits non-zero on any failure.
+//! `RunError` values printed to `stderr`, and the process exits non-zero on
+//! any failure.
 
 #![forbid(unsafe_code)]
 
@@ -25,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod check_error_codes;
+mod check_sentinel_codes;
 
 const USAGE: &str = "\
 xtask — Stratum workspace automation
@@ -33,9 +41,12 @@ USAGE:
     xtask [SUBCOMMAND]
 
 SUBCOMMANDS:
-    check-error-codes   Validate STRAT-E#### literals against the catalog
-                        (default if no subcommand is supplied)
-    help, --help, -h    Show this message
+    check-error-codes      Validate STRAT-E#### literals against the catalog
+    check-sentinel-codes   Validate local E_* sentinel literals against the
+                           hardcoded allowlist
+    (no subcommand)        Run both validators in order; exit non-zero if
+                           either fails
+    help, --help, -h       Show this message
 
 EXIT STATUS:
     0   success
@@ -53,20 +64,37 @@ fn main() -> ExitCode {
 }
 
 fn run<O: Write, E: Write>(args: &[String], out: &mut O, err: &mut E) -> ExitCode {
-    let subcommand = args.first().map_or("check-error-codes", String::as_str);
-    match subcommand {
-        "check-error-codes" => match dispatch_check_error_codes(out, err) {
+    match args.first().map(String::as_str) {
+        None => dispatch_all(out, err),
+        Some("check-error-codes") => match dispatch_check_error_codes(out, err) {
             Ok(()) => ExitCode::SUCCESS,
             Err(code) => code,
         },
-        "help" | "--help" | "-h" => {
+        Some("check-sentinel-codes") => match dispatch_check_sentinel_codes(out, err) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(code) => code,
+        },
+        Some("help" | "--help" | "-h") => {
             let _ = writeln!(out, "{USAGE}");
             ExitCode::SUCCESS
         }
-        other => {
+        Some(other) => {
             let _ = writeln!(err, "xtask: unknown subcommand '{other}'\n\n{USAGE}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// Run every validator in declaration order, surfacing the worst exit code.
+fn dispatch_all<O: Write, E: Write>(out: &mut O, err: &mut E) -> ExitCode {
+    // Run both validators unconditionally so the operator sees every report
+    // even when an earlier one fails.
+    let error_codes_failed = dispatch_check_error_codes(out, err).is_err();
+    let sentinel_failed = dispatch_check_sentinel_codes(out, err).is_err();
+    if error_codes_failed || sentinel_failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -111,6 +139,61 @@ fn dispatch_check_error_codes_at<O: Write, E: Write>(
         }
         Err(e) => {
             let _ = writeln!(err, "check-error-codes failed: {e}");
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+fn dispatch_check_sentinel_codes<O: Write, E: Write>(
+    out: &mut O,
+    err: &mut E,
+) -> Result<(), ExitCode> {
+    let root = workspace_root();
+    dispatch_check_sentinel_codes_at(&root, out, err)
+}
+
+fn dispatch_check_sentinel_codes_at<O: Write, E: Write>(
+    root: &Path,
+    out: &mut O,
+    err: &mut E,
+) -> Result<(), ExitCode> {
+    match check_sentinel_codes::run(root) {
+        Ok(report) => {
+            let usage_sites: usize = report.allowlisted.values().map(Vec::len).sum();
+            let _ = writeln!(
+                out,
+                "check-sentinel-codes: {} allowlisted sentinels in use ({} usage sites), {} orphans, {} unknown",
+                report.allowlisted.len(),
+                usage_sites,
+                report.orphans.len(),
+                report.unknown.len(),
+            );
+            for (sentinel, paths) in &report.allowlisted {
+                let _ = writeln!(out, "  ok  {sentinel} ({} site(s))", paths.len());
+            }
+            if !report.unknown.is_empty() {
+                let _ = writeln!(err, "error: sentinel literals not in the xtask allowlist:",);
+                for (path, sentinel) in &report.unknown {
+                    let _ = writeln!(err, "  {} -> {}", path.display(), sentinel);
+                }
+            }
+            if !report.orphans.is_empty() {
+                let _ = writeln!(
+                    err,
+                    "error: allowlisted sentinels with no references in source:",
+                );
+                for sentinel in &report.orphans {
+                    let _ = writeln!(err, "  {sentinel}");
+                }
+            }
+            if report.unknown.is_empty() && report.orphans.is_empty() {
+                Ok(())
+            } else {
+                Err(ExitCode::from(1))
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(err, "check-sentinel-codes failed: {e}");
             Err(ExitCode::from(1))
         }
     }
@@ -219,6 +302,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn run_check_sentinel_codes_against_workspace_succeeds() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run(&["check-sentinel-codes".to_string()], &mut out, &mut err);
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "stderr: {}",
+            String::from_utf8(err).unwrap_or_default()
+        );
+        let out_text = String::from_utf8(out).unwrap_or_default();
+        assert!(out_text.contains("check-sentinel-codes:"));
+    }
+
     fn write_min_workspace(root: &Path) {
         std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
         let error_rs = root.join("crates").join("stratum-types").join("src");
@@ -280,6 +378,73 @@ mod tests {
             err_text.contains("check-error-codes failed"),
             "stderr was: {err_text}",
         );
+    }
+
+    #[test]
+    fn dispatch_sentinel_at_reports_unknown_to_stderr() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let src = tmp.path().join("crates").join("u").join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // Plant every allowlist entry so orphans are empty, plus an
+        // unrecognised sentinel so unknown is non-empty.
+        let mut body = String::from("fn main() {\n");
+        for entry in check_sentinel_codes::ALLOWLIST {
+            use std::fmt::Write as _;
+            writeln!(body, "    let _ = \"{entry}\";").unwrap();
+        }
+        body.push_str("    let _ = \"E_FAKE_SENTINEL\";\n}\n");
+        std::fs::write(src.join("lib.rs"), body).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = dispatch_check_sentinel_codes_at(tmp.path(), &mut out, &mut err);
+        assert!(code.is_err());
+        let err_text = String::from_utf8(err).unwrap_or_default();
+        assert!(
+            err_text.contains("sentinel literals not in the xtask allowlist"),
+            "stderr was: {err_text}",
+        );
+    }
+
+    #[test]
+    fn dispatch_sentinel_at_reports_orphans_to_stderr() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        // Empty crates dir: every allowlist entry is an orphan.
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = dispatch_check_sentinel_codes_at(tmp.path(), &mut out, &mut err);
+        assert!(code.is_err());
+        let err_text = String::from_utf8(err).unwrap_or_default();
+        assert!(
+            err_text.contains("allowlisted sentinels with no references"),
+            "stderr was: {err_text}",
+        );
+    }
+
+    #[test]
+    fn dispatch_sentinel_at_succeeds_for_clean_fixture() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let src = tmp.path().join("crates").join("u").join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut body = String::from("fn main() {\n");
+        for entry in check_sentinel_codes::ALLOWLIST {
+            use std::fmt::Write as _;
+            writeln!(body, "    let _ = \"{entry}\";").unwrap();
+        }
+        body.push_str("}\n");
+        std::fs::write(src.join("lib.rs"), body).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = dispatch_check_sentinel_codes_at(tmp.path(), &mut out, &mut err);
+        assert!(
+            code.is_ok(),
+            "stderr: {}",
+            String::from_utf8(err).unwrap_or_default()
+        );
+        let out_text = String::from_utf8(out).unwrap_or_default();
+        assert!(out_text.contains("check-sentinel-codes:"));
     }
 
     #[test]
