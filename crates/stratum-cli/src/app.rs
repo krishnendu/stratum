@@ -94,6 +94,13 @@ enum Command {
     /// Inspect user-authored agent definitions under `<state>/agents/`.
     #[command(subcommand)]
     Agents(AgentsCommand),
+    /// Read or modify simple flat key/value pairs in `<state>/config.toml`.
+    ///
+    /// Keys are dot-separated paths (e.g. `chat.default_model`,
+    /// `serve.default_port`) that map onto nested TOML tables; the leaf
+    /// value carries an explicit TOML type (string / bool / int / float).
+    #[command(subcommand)]
+    Config(ConfigCommand),
     /// Print a shell tab-completion script to stdout.
     ///
     /// Pipe the output into your shell's completion directory, e.g.
@@ -193,6 +200,88 @@ struct McpListArgs {
     /// human-readable table.
     #[arg(long)]
     json: bool,
+}
+
+/// Explicit TOML value type for `stratum config set`.
+///
+/// String is the default — pass `--type` to coerce the value into a
+/// typed TOML / JSON primitive instead of a string literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum ConfigValueType {
+    /// Store the value as a TOML string (the default).
+    String,
+    /// Parse the value as a boolean (`true` / `false`).
+    Bool,
+    /// Parse the value as a signed 64-bit integer.
+    Int,
+    /// Parse the value as a 64-bit floating-point number.
+    Float,
+}
+
+impl Default for ConfigValueType {
+    fn default() -> Self {
+        Self::String
+    }
+}
+
+/// Subcommands under `stratum config`.
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Print the value at `KEY`. Missing keys exit 1 with STRAT-E1001.
+    Get(ConfigGetArgs),
+    /// Insert or replace the value at `KEY`. Creates `<state>/config.toml`
+    /// when it does not yet exist.
+    Set(ConfigSetArgs),
+    /// Print every configured key/value pair. The file may be absent —
+    /// that case prints nothing (or `{}` under `--json`) and exits 0.
+    List(ConfigListArgs),
+    /// Remove `KEY` from `<state>/config.toml`. Missing keys exit 1 with
+    /// STRAT-E1001.
+    Unset(ConfigUnsetArgs),
+}
+
+/// Arguments for `stratum config get`.
+#[derive(Debug, Args)]
+struct ConfigGetArgs {
+    /// Dot-separated key (e.g. `chat.default_model`).
+    #[arg(value_name = "KEY")]
+    key: String,
+    /// Emit the value as JSON (preserves the TOML type as a JSON
+    /// number / bool / string).
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments for `stratum config set`.
+#[derive(Debug, Args)]
+struct ConfigSetArgs {
+    /// Dot-separated key (e.g. `chat.default_model`). Intermediate
+    /// tables are created on demand.
+    #[arg(value_name = "KEY")]
+    key: String,
+    /// Raw value as typed on the command line. Coerced into the TOML
+    /// type selected by `--type`.
+    #[arg(value_name = "VALUE")]
+    value: String,
+    /// Explicit value type. Defaults to `string`.
+    #[arg(long = "type", value_name = "TYPE", default_value = "string")]
+    ty: ConfigValueType,
+}
+
+/// Arguments for `stratum config list`.
+#[derive(Debug, Args)]
+struct ConfigListArgs {
+    /// Emit a flat JSON object mapping each dot-key to its JSON value.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments for `stratum config unset`.
+#[derive(Debug, Args)]
+struct ConfigUnsetArgs {
+    /// Dot-separated key to remove.
+    #[arg(value_name = "KEY")]
+    key: String,
 }
 
 /// Arguments for `stratum serve`.
@@ -1036,6 +1125,18 @@ where
         }
         Some(Command::Agents(AgentsCommand::Show(agents_args))) => {
             agents_show(&paths, &agents_args, out, err)
+        }
+        Some(Command::Config(ConfigCommand::Get(cfg_args))) => {
+            config_get(&paths, &cfg_args, out, err)
+        }
+        Some(Command::Config(ConfigCommand::Set(cfg_args))) => {
+            config_set(&paths, &cfg_args, out, err)
+        }
+        Some(Command::Config(ConfigCommand::List(cfg_args))) => {
+            config_list(&paths, &cfg_args, out, err)
+        }
+        Some(Command::Config(ConfigCommand::Unset(cfg_args))) => {
+            config_unset(&paths, &cfg_args, out, err)
         }
         Some(Command::Completions(comp_args)) => completions(comp_args.shell, out),
     }
@@ -4772,6 +4873,369 @@ fn format_seconds_three_decimals(ms: u64) -> String {
     let whole = ms / 1_000;
     let frac = ms % 1_000;
     format!("{whole}.{frac:03}")
+}
+
+// ---------------------------------------------------------------------------
+// `stratum config …`
+// ---------------------------------------------------------------------------
+
+/// Resolve `<state>/config.toml`.
+fn config_path(paths: &Paths) -> PathBuf {
+    paths.state.join("config.toml")
+}
+
+/// Split a dot-separated key into a non-empty leaf plus the parent
+/// segments. Returns `None` if any segment is empty (e.g. `"a..b"`,
+/// `".x"`, `""`).
+fn split_key(key: &str) -> Option<(Vec<&str>, &str)> {
+    if key.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let (leaf, parents) = parts.split_last()?;
+    Some((parents.to_vec(), *leaf))
+}
+
+/// Load the on-disk TOML document. A missing file yields an empty
+/// document so callers can freely insert into it.
+fn load_config_doc(path: &Path) -> Result<toml_edit::DocumentMut, String> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => body
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| format!("malformed {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml_edit::DocumentMut::new()),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    }
+}
+
+/// Write the TOML document atomically-ish (best-effort: create parent
+/// dir, then `write`). Mirrors how other CLI subcommands persist state.
+fn save_config_doc(path: &Path, doc: &toml_edit::DocumentMut) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Walk `parents` from the document root, returning a reference to the
+/// leaf table when every intermediate segment exists and is a table.
+fn lookup_table<'a>(
+    doc: &'a toml_edit::DocumentMut,
+    parents: &[&str],
+) -> Option<&'a toml_edit::Table> {
+    let mut tbl: &toml_edit::Table = doc.as_table();
+    for seg in parents {
+        let item = tbl.get(seg)?;
+        tbl = item.as_table()?;
+    }
+    Some(tbl)
+}
+
+/// Walk `parents`, creating empty tables as needed, and return a
+/// mutable reference to the leaf table. Returns `Err` when an
+/// intermediate segment exists but is not a table (e.g. a scalar
+/// already lives there).
+fn ensure_table_mut<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    parents: &[&str],
+) -> Result<&'a mut toml_edit::Table, String> {
+    let mut tbl: &mut toml_edit::Table = doc.as_table_mut();
+    for seg in parents {
+        let entry = tbl
+            .entry(seg)
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        let next = entry
+            .as_table_mut()
+            .ok_or_else(|| format!("key segment {seg:?} is not a table"))?;
+        tbl = next;
+    }
+    Ok(tbl)
+}
+
+/// Parse `raw` as the chosen TOML value type. Returns a TOML scalar
+/// item ready to be inserted into a table.
+fn parse_typed_value(raw: &str, ty: ConfigValueType) -> Result<toml_edit::Item, String> {
+    let value: toml_edit::Value = match ty {
+        ConfigValueType::String => toml_edit::Value::from(raw),
+        ConfigValueType::Bool => {
+            let parsed: bool = raw
+                .parse()
+                .map_err(|_| format!("expected bool (`true` / `false`), got {raw:?}"))?;
+            toml_edit::Value::from(parsed)
+        }
+        ConfigValueType::Int => {
+            let parsed: i64 = raw
+                .parse()
+                .map_err(|_| format!("expected integer, got {raw:?}"))?;
+            toml_edit::Value::from(parsed)
+        }
+        ConfigValueType::Float => {
+            let parsed: f64 = raw
+                .parse()
+                .map_err(|_| format!("expected float, got {raw:?}"))?;
+            if !parsed.is_finite() {
+                return Err(format!("float must be finite, got {raw:?}"));
+            }
+            toml_edit::Value::from(parsed)
+        }
+    };
+    Ok(toml_edit::Item::Value(value))
+}
+
+/// Convert a TOML scalar value to its `serde_json::Value` mirror.
+/// Datetime and array/inline-table values become string fallbacks —
+/// `stratum config` only mints scalar leaves, so users only see this
+/// path if they hand-edited the file with richer TOML.
+fn toml_value_to_json(value: &toml_edit::Value) -> serde_json::Value {
+    match value {
+        toml_edit::Value::String(s) => serde_json::Value::String(s.value().clone()),
+        toml_edit::Value::Integer(i) => serde_json::Value::Number((*i.value()).into()),
+        toml_edit::Value::Float(f) => serde_json::Number::from_f64(*f.value())
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        toml_edit::Value::Boolean(b) => serde_json::Value::Bool(*b.value()),
+        other => serde_json::Value::String(other.to_string().trim().to_owned()),
+    }
+}
+
+/// Render a TOML scalar value as the prose form printed by `config
+/// get` / `config list`. Strings come out unquoted (so they paste
+/// cleanly into shell variables); other scalars use their TOML wire
+/// form.
+fn render_value_prose(value: &toml_edit::Value) -> String {
+    match value {
+        toml_edit::Value::String(s) => s.value().clone(),
+        toml_edit::Value::Integer(i) => i.value().to_string(),
+        toml_edit::Value::Float(f) => f.value().to_string(),
+        toml_edit::Value::Boolean(b) => b.value().to_string(),
+        other => other.to_string().trim().to_owned(),
+    }
+}
+
+/// Walk every leaf in `tbl`, appending dot-key + scalar value pairs to
+/// `out_pairs` in deterministic key order.
+fn collect_leaves<'a>(
+    tbl: &'a toml_edit::Table,
+    prefix: &mut Vec<String>,
+    out_pairs: &mut Vec<(String, &'a toml_edit::Value)>,
+) {
+    // Iterate in TOML document order; the file itself is the source of
+    // truth so users see the same ordering they wrote.
+    for (key, item) in tbl {
+        match item {
+            toml_edit::Item::Value(value) => {
+                prefix.push(key.to_owned());
+                out_pairs.push((prefix.join("."), value));
+                prefix.pop();
+            }
+            toml_edit::Item::Table(sub) => {
+                prefix.push(key.to_owned());
+                collect_leaves(sub, prefix, out_pairs);
+                prefix.pop();
+            }
+            toml_edit::Item::ArrayOfTables(_) | toml_edit::Item::None => {
+                // Skip array-of-tables (unsupported leaf shape) and
+                // None entries (deleted slots toml_edit may keep
+                // around).
+            }
+        }
+    }
+}
+
+fn config_get(
+    paths: &Paths,
+    args: &ConfigGetArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let path = config_path(paths);
+    let doc = match load_config_doc(&path) {
+        Ok(d) => d,
+        Err(msg) => {
+            let _ = writeln!(err, "STRAT-E1001 {msg}");
+            return ExitCode::from(1);
+        }
+    };
+    let Some((parents, leaf)) = split_key(&args.key) else {
+        let _ = writeln!(err, "STRAT-E1001 invalid key {:?}", args.key);
+        return ExitCode::from(1);
+    };
+    let Some(tbl) = lookup_table(&doc, &parents) else {
+        let _ = writeln!(err, "STRAT-E1001 missing key {:?}", args.key);
+        return ExitCode::from(1);
+    };
+    let Some(item) = tbl.get(leaf) else {
+        let _ = writeln!(err, "STRAT-E1001 missing key {:?}", args.key);
+        return ExitCode::from(1);
+    };
+    let Some(value) = item.as_value() else {
+        let _ = writeln!(err, "STRAT-E1001 key {:?} is not a scalar", args.key);
+        return ExitCode::from(1);
+    };
+
+    if args.json {
+        let json = toml_value_to_json(value);
+        match serde_json::to_string(&json) {
+            Ok(s) => {
+                if writeln!(out, "{s}").is_err() {
+                    return ExitCode::from(74);
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 json render failed: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else if writeln!(out, "{}", render_value_prose(value)).is_err() {
+        return ExitCode::from(74);
+    }
+    ExitCode::SUCCESS
+}
+
+fn config_set(
+    paths: &Paths,
+    args: &ConfigSetArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let path = config_path(paths);
+    let mut doc = match load_config_doc(&path) {
+        Ok(d) => d,
+        Err(msg) => {
+            let _ = writeln!(err, "STRAT-E1001 {msg}");
+            return ExitCode::from(1);
+        }
+    };
+    let Some((parents, leaf)) = split_key(&args.key) else {
+        let _ = writeln!(err, "STRAT-E1001 invalid key {:?}", args.key);
+        return ExitCode::from(1);
+    };
+    let item = match parse_typed_value(&args.value, args.ty) {
+        Ok(i) => i,
+        Err(msg) => {
+            let _ = writeln!(err, "STRAT-E1001 {msg}");
+            return ExitCode::from(1);
+        }
+    };
+    let tbl = match ensure_table_mut(&mut doc, &parents) {
+        Ok(t) => t,
+        Err(msg) => {
+            let _ = writeln!(err, "STRAT-E1001 {msg}");
+            return ExitCode::from(1);
+        }
+    };
+    tbl.insert(leaf, item);
+
+    if let Err(msg) = save_config_doc(&path, &doc) {
+        let _ = writeln!(err, "STRAT-E1001 {msg}");
+        return ExitCode::from(1);
+    }
+
+    if writeln!(out, "set {} in {}", args.key, path.display()).is_err() {
+        return ExitCode::from(74);
+    }
+    ExitCode::SUCCESS
+}
+
+fn config_list(
+    paths: &Paths,
+    args: &ConfigListArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let path = config_path(paths);
+    let doc = match load_config_doc(&path) {
+        Ok(d) => d,
+        Err(msg) => {
+            let _ = writeln!(err, "STRAT-E1001 {msg}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut pairs: Vec<(String, &toml_edit::Value)> = Vec::new();
+    let mut prefix: Vec<String> = Vec::new();
+    collect_leaves(doc.as_table(), &mut prefix, &mut pairs);
+
+    if args.json {
+        let mut obj = serde_json::Map::new();
+        for (k, v) in &pairs {
+            obj.insert(k.clone(), toml_value_to_json(v));
+        }
+        let rendered = match serde_json::to_string_pretty(&serde_json::Value::Object(obj)) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 json render failed: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    for (key, value) in &pairs {
+        let rendered = render_value_prose(value);
+        if writeln!(out, "{key} = {rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn config_unset(
+    paths: &Paths,
+    args: &ConfigUnsetArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let path = config_path(paths);
+    let mut doc = match load_config_doc(&path) {
+        Ok(d) => d,
+        Err(msg) => {
+            let _ = writeln!(err, "STRAT-E1001 {msg}");
+            return ExitCode::from(1);
+        }
+    };
+    let Some((parents, leaf)) = split_key(&args.key) else {
+        let _ = writeln!(err, "STRAT-E1001 invalid key {:?}", args.key);
+        return ExitCode::from(1);
+    };
+
+    // Walk to the leaf table mutably without auto-creating intermediates;
+    // a missing parent is the same diagnostic as a missing leaf.
+    let mut current: &mut toml_edit::Table = doc.as_table_mut();
+    for seg in &parents {
+        let Some(item) = current.get_mut(seg) else {
+            let _ = writeln!(err, "STRAT-E1001 missing key {:?}", args.key);
+            return ExitCode::from(1);
+        };
+        let Some(next) = item.as_table_mut() else {
+            let _ = writeln!(err, "STRAT-E1001 missing key {:?}", args.key);
+            return ExitCode::from(1);
+        };
+        current = next;
+    }
+
+    if current.remove(leaf).is_none() {
+        let _ = writeln!(err, "STRAT-E1001 missing key {:?}", args.key);
+        return ExitCode::from(1);
+    }
+
+    if let Err(msg) = save_config_doc(&path, &doc) {
+        let _ = writeln!(err, "STRAT-E1001 {msg}");
+        return ExitCode::from(1);
+    }
+
+    if writeln!(out, "unset {} in {}", args.key, path.display()).is_err() {
+        return ExitCode::from(74);
+    }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
