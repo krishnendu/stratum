@@ -19,6 +19,42 @@ brew tap krishnendu/stratum
 brew install stratum
 ```
 
+## Two formulas
+
+This tap ships TWO formulas:
+
+| Formula              | What you get                          | When to install                                            |
+|----------------------|---------------------------------------|------------------------------------------------------------|
+| `stratum`            | Prebuilt v0.1.2 binary, EchoProvider  | Fast install (~10 sec); fine for chat plumbing / eval / serve scaffolding |
+| `stratum-llama-cpp`  | Build-from-source with `provider-llama-cpp` feature | Real local LLM inference; cold build ~10-20 min on M1 Pro |
+
+Both install a binary named `stratum`. Pick ONE per machine. To switch:
+
+```bash
+# From prebuilt → LLM-enabled
+brew uninstall stratum
+brew install stratum-llama-cpp
+
+# Or vice versa
+brew uninstall stratum-llama-cpp
+brew install stratum
+```
+
+## Updating the LLM formula on each release
+
+```bash
+# Source-tarball sha256 is the GitHub-generated archive checksum, not the binary tarball:
+gh release view v0.X.Y --json tagName,tarballUrl --jq '.tarballUrl' \
+  | xargs curl -sSL \
+  | sha256sum
+
+# Edit dist/homebrew/stratum-llama-cpp.rb:
+#   - bump `version`
+#   - update `url` to point at the v0.X.Y archive
+#   - update `sha256`
+# Then sync to the published tap repo alongside the prebuilt formula bump.
+```
+
 ## Verifying
 
 ```bash
