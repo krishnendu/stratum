@@ -1318,6 +1318,14 @@ fn render_block(block: &Block) -> Option<Line<'_>> {
             format!("(cancelled: {reason})"),
             Style::default().add_modifier(Modifier::ITALIC),
         ))),
+        Block::Image { mime, .. } => Some(Line::from(Span::styled(
+            format!("(image: {mime})"),
+            Style::default().add_modifier(Modifier::DIM),
+        ))),
+        Block::Audio { mime, .. } => Some(Line::from(Span::styled(
+            format!("(audio: {mime})"),
+            Style::default().add_modifier(Modifier::DIM),
+        ))),
         Block::Done | Block::ToolCall { .. } | Block::ToolResult { .. } => None,
     }
 }
