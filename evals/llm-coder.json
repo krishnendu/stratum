@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "name": "llm-coder",
+  "cases": [
+    { "id": "fn-hello", "prompt": "Write a one-line Python function that returns 'hi'.", "expected_substrings": ["def"], "forbidden_substrings": [], "max_blocks": 16 },
+    { "id": "var-decl", "prompt": "Show a JavaScript variable declaration.", "expected_substrings": [], "forbidden_substrings": [], "max_blocks": 16 },
+    { "id": "loop-c", "prompt": "Write a for loop in C from 0 to 4.", "expected_substrings": ["for"], "forbidden_substrings": [], "max_blocks": 16 },
+    { "id": "rust-vec", "prompt": "Show how to create a Vec<i32> in Rust.", "expected_substrings": ["Vec"], "forbidden_substrings": [], "max_blocks": 16 },
+    { "id": "sql-select", "prompt": "Write a SQL SELECT statement.", "expected_substrings": ["SELECT"], "forbidden_substrings": [], "max_blocks": 16 },
+    { "id": "import-py", "prompt": "Import math in Python.", "expected_substrings": ["import"], "forbidden_substrings": [], "max_blocks": 16 }
+  ]
+}

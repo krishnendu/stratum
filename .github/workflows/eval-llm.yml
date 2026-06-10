@@ -1,0 +1,89 @@
+name: eval-llm
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 04:30 UTC nightly (30 min after eval-baseline).
+    - cron: '30 4 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: 1
+  STRATUM_LLAMA_MODEL_URL: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+  STRATUM_LLAMA_MODEL_SHA256: "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+
+permissions:
+  contents: read
+
+jobs:
+  llm-evals:
+    name: eval-llm baseline + coder
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: llm-evals-${{ hashFiles('Cargo.lock') }}
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - name: Cache GGUF
+        id: gguf-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/stratum-models
+          key: stratum-llama-gguf-${{ env.STRATUM_LLAMA_MODEL_SHA256 }}
+      - name: Download GGUF (if not cached)
+        if: steps.gguf-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/.cache/stratum-models"
+          dest="$HOME/.cache/stratum-models/${STRATUM_LLAMA_MODEL_SHA256}.gguf"
+          curl -fL --retry 3 --retry-delay 5 -o "$dest" "$STRATUM_LLAMA_MODEL_URL"
+      - name: Verify SHA
+        run: |
+          set -euxo pipefail
+          dest="$HOME/.cache/stratum-models/${STRATUM_LLAMA_MODEL_SHA256}.gguf"
+          actual=$(sha256sum "$dest" | awk '{print $1}')
+          if [ "$actual" != "$STRATUM_LLAMA_MODEL_SHA256" ]; then
+            echo "SHA mismatch" >&2; exit 1
+          fi
+          echo "STRATUM_LLAMA_GGUF_PATH=$dest" >> "$GITHUB_ENV"
+      - name: Build with feature
+        run: cargo build --release --features provider-llama-cpp --bin stratum
+      - name: Add model to catalog
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/state
+          ./target/release/stratum --storage-root /tmp/state models add \
+            --slug qwen-0.5b --family qwen --display-name "Qwen 0.5B" \
+            --tier low --task chat \
+            --size-mib 469 --quantization Q4_K_M \
+            --url "$STRATUM_LLAMA_MODEL_URL" \
+            --sha256 "$STRATUM_LLAMA_MODEL_SHA256" \
+            --bytes 491720608 --license apache-2.0
+          # Pre-stage GGUF at the canonical resolved path
+          mkdir -p /tmp/state/data/stratum/models
+          cp "$STRATUM_LLAMA_GGUF_PATH" "/tmp/state/data/stratum/models/${STRATUM_LLAMA_MODEL_SHA256}.gguf"
+      - name: Run llm-baseline
+        run: |
+          ./target/release/stratum --storage-root /tmp/state eval run \
+            --suite evals/llm-baseline.json \
+            --out /tmp/state/llm-baseline-report.json --json | tee llm-baseline.json
+      - name: Run llm-coder
+        run: |
+          ./target/release/stratum --storage-root /tmp/state eval run \
+            --suite evals/llm-coder.json \
+            --out /tmp/state/llm-coder-report.json --json | tee llm-coder.json
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: llm-eval-reports
+          path: |
+            /tmp/state/llm-baseline-report.json
+            /tmp/state/llm-coder-report.json
+            llm-baseline.json
+            llm-coder.json
