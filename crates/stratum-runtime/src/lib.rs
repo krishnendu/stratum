@@ -146,6 +146,13 @@ pub mod secrets;
 /// Wires real [`agent_session::AgentSession`]s behind the `stratum serve`
 /// JSON-RPC socket.
 pub mod serve_handler_agent;
+/// Composable middleware layers wrapping a [`serve_server::ServeHandler`].
+///
+/// Provides [`serve_middleware::RateLimitedHandler`],
+/// [`serve_middleware::AuthTokenHandler`],
+/// [`serve_middleware::LoggingHandler`], and the
+/// [`serve_middleware::chain`] helper for outermost-first composition.
+pub mod serve_middleware;
 /// `stratum serve` JSON-RPC 2.0 wire-protocol data shapes.
 pub mod serve_protocol;
 /// Synchronous `stratum serve` JSON-RPC dispatch server over Unix or TCP loopback.
@@ -303,6 +310,10 @@ pub use secrets::{
     SecretScope, SecretStore, SecretStoreError, SecretValue,
 };
 pub use serve_handler_agent::{AgentServeHandler, ServeHandlerError};
+pub use serve_middleware::{
+    chain as chain_serve_layers, AuthTokenHandler, LoggingHandler, RateLimitedHandler, ServeLayer,
+    DEFAULT_AUTH_HEADER, SERVE_ERR_RATE_LIMITED, SERVE_ERR_UNAUTHORIZED,
+};
 pub use serve_protocol::{
     parse_request as parse_serve_request, render_response as render_serve_response,
     ParseRequestError, RequestId, RunTurnParams, ServeMethod, ServeRequest, ServeResponse,
