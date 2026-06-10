@@ -303,6 +303,16 @@ struct ChatArgs {
     /// line; persists across runs).
     #[arg(long = "events-jsonl", value_name = "PATH")]
     events_jsonl: Option<PathBuf>,
+    /// Reload a prior session's on-disk transcript into the scrollback before
+    /// the chat starts.
+    ///
+    /// The value must be a 16-lowercase-hex session id as printed by
+    /// `stratum sessions list`. Resumed turns are folded into the chat state
+    /// via [`crate::chat::ChatState::with_resumed_transcript`] and (for the
+    /// non-interactive `--prompt` path) echoed to stdout in order before the
+    /// new turn's response is printed.
+    #[arg(long, value_name = "SESSION_ID")]
+    resume: Option<String>,
 }
 
 /// Clap-friendly mirror of the `kind` tag of [`Event`].
@@ -1767,11 +1777,21 @@ fn chat_command(
     let probe = HardwareProbe::run();
     let tier = Tier::classify(&probe);
 
+    // Resolve `--resume` up front so a bad / missing / malformed transcript
+    // fails before we spin up any provider or write to disk.
+    let resumed = match args.resume.as_deref() {
+        None => None,
+        Some(raw) => match load_resumed_transcript(raw, paths, err) {
+            Ok(t) => Some(t),
+            Err(code) => return code,
+        },
+    };
+
     // Model-resolution flow only runs when --model is set. Without the
     // `provider-llama-cpp` feature, the only legal mode is EchoProvider —
     // surface a clear STRAT-E1001 error instead of silently downgrading.
     if let Some(slug) = args.model.as_deref() {
-        return chat_with_model(slug, args, paths, tier, out, err);
+        return chat_with_model(slug, args, paths, tier, resumed, out, err);
     }
 
     // No --model: keep EchoProvider behavior. `--prompt` still works for
@@ -1785,17 +1805,41 @@ fn chat_command(
                 Err(code) => return code,
             };
         }
+        if let Some(t) = resumed {
+            print_resumed_transcript(&t, out);
+            state = state.with_resumed_transcript(t);
+        }
         state.submit_with_prompt(prompt);
         return print_assistant_text(&state, out, err);
     }
 
     if let Some(path) = args.events_jsonl.as_deref() {
         let provider = EchoProvider::new("echo: ");
-        let state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths));
-        let state = match attach_jsonl_events(state, path, err) {
+        let mut state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths));
+        state = match attach_jsonl_events(state, path, err) {
             Ok(s) => s,
             Err(code) => return code,
         };
+        if let Some(t) = resumed {
+            state = state.with_resumed_transcript(t);
+        }
+        return match crate::chat::run_with_state(state) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                let _ = writeln!(err, "{e}");
+                ExitCode::from(70)
+            }
+        };
+    }
+
+    // Interactive TUI without --events-jsonl. When `--resume` was passed we
+    // need to build the state ourselves so we can fold the transcript in
+    // before handing it to `run_with_state`; without `--resume` the existing
+    // `chat::run` helper still owns the default surface.
+    if let Some(t) = resumed {
+        let provider = EchoProvider::new("echo: ");
+        let state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths))
+            .with_resumed_transcript(t);
         return match crate::chat::run_with_state(state) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -1810,6 +1854,73 @@ fn chat_command(
         Err(e) => {
             let _ = writeln!(err, "{e}");
             ExitCode::from(70)
+        }
+    }
+}
+
+/// Resolve `raw` as a 16-hex session id, open the on-disk transcript store,
+/// and load the matching [`Transcript`]. Errors are mapped to the per-brief
+/// exit codes:
+///
+/// * `2` + STRAT-E1001 when `raw` is not a valid session id.
+/// * `1` + STRAT-E1001 + a "run `stratum sessions list`" hint when the file
+///   is missing.
+/// * `1` + STRAT-E1001 when the file exists but is malformed JSON or
+///   declares a strictly-newer schema.
+fn load_resumed_transcript(
+    raw: &str,
+    paths: &Paths,
+    err: &mut dyn Write,
+) -> Result<Transcript, ExitCode> {
+    let id = match SessionId::from_str(raw) {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 invalid --resume session id: {e}");
+            return Err(ExitCode::from(2));
+        }
+    };
+    let store = open_transcript_store(paths, err)?;
+    match store.load(&id) {
+        Ok(t) => Ok(t),
+        Err(stratum_runtime::TranscriptError::Io(io_err))
+            if io_err.kind() == std::io::ErrorKind::NotFound =>
+        {
+            let _ = writeln!(err, "STRAT-E1001 no transcript for session {raw}");
+            let _ = writeln!(
+                err,
+                "hint: run `stratum sessions list` to see saved sessions"
+            );
+            Err(ExitCode::from(1))
+        }
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 cannot load session {raw}: {e}");
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+/// Echo the resumed turns' user-visible text to `out` so the scripted
+/// `--prompt` flow surfaces the prior context before the fresh response.
+///
+/// Errors writing to `out` are ignored — the subsequent `print_assistant_text`
+/// call surfaces any persistent stdout failure with the canonical exit code.
+fn print_resumed_transcript(t: &Transcript, out: &mut dyn Write) {
+    for turn in &t.turns {
+        match turn {
+            TranscriptTurn::User { text, .. } => {
+                let _ = writeln!(out, "user: {text}");
+            }
+            TranscriptTurn::Assistant { blocks, .. } => {
+                for block in blocks {
+                    let _ = writeln!(out, "assistant: {}", block.text);
+                }
+            }
+            TranscriptTurn::System { text, .. } => {
+                let _ = writeln!(out, "system: {text}");
+            }
+            TranscriptTurn::Command { text, ok, .. } => {
+                let _ = writeln!(out, "command: {text} ok={ok}");
+            }
         }
     }
 }
@@ -1854,6 +1965,7 @@ fn chat_with_model(
     _args: &ChatArgs,
     _paths: &Paths,
     _tier: Tier,
+    _resumed: Option<Transcript>,
     _out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -1870,6 +1982,7 @@ fn chat_with_model(
     args: &ChatArgs,
     paths: &Paths,
     _tier: Tier,
+    resumed: Option<Transcript>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -1891,8 +2004,15 @@ fn chat_with_model(
 
     let mut state = crate::chat::ChatState::with_agent_loop(loop_);
     if let Some(prompt) = args.prompt.as_deref() {
+        if let Some(t) = resumed {
+            print_resumed_transcript(&t, out);
+            state = state.with_resumed_transcript(t);
+        }
         state.submit_with_prompt(prompt);
         return print_assistant_text(&state, out, err);
+    }
+    if let Some(t) = resumed {
+        state = state.with_resumed_transcript(t);
     }
     // No --prompt: drop into the interactive TUI. The state already wraps
     // the llama-backed loop so input is routed through real inference.
