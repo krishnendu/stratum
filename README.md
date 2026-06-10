@@ -75,6 +75,26 @@ PORT=$(stratum serve --tcp-port 0 --json | jq -r .tcp_port)   # from stderr/stdo
 stratum client --method ping --tcp 127.0.0.1:$PORT
 ```
 
+## Shell completions
+
+`stratum completions <shell>` prints a tab-completion script to stdout. Redirect the
+output into your shell's completion directory:
+
+```bash
+# Bash (system-wide)
+sudo stratum completions bash > /etc/bash_completion.d/stratum
+
+# Zsh
+mkdir -p ~/.zsh/completions
+stratum completions zsh > ~/.zsh/completions/_stratum
+# Add `fpath=(~/.zsh/completions $fpath)` and `autoload -Uz compinit && compinit` to ~/.zshrc
+
+# Fish
+stratum completions fish > ~/.config/fish/completions/stratum.fish
+```
+
+Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
+
 ## Architecture
 
 The runtime is built around a small set of core abstractions in `crates/stratum-runtime/`: `AgentLoop` drives the turn cycle; `Provider` is the inference trait (Echo, llama-cpp); `ToolDispatcher` invokes tools per-call with capability gating; `Sandbox` resolves and enforces filesystem/network profiles (`bwrap` on Linux, `sandbox-exec` on macOS); `EventEmitter` produces a structured, JSON-line audit stream consumed by the TUI and `events tail`.

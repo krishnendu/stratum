@@ -8,7 +8,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::{generate as generate_completion, Shell};
 use serde::Serialize;
 use stratum_runtime::{
     build_payload as build_telemetry_payload, evaluate as evaluate_update,
@@ -93,6 +94,19 @@ enum Command {
     /// Inspect user-authored agent definitions under `<state>/agents/`.
     #[command(subcommand)]
     Agents(AgentsCommand),
+    /// Print a shell tab-completion script to stdout.
+    ///
+    /// Pipe the output into your shell's completion directory, e.g.
+    /// `stratum completions bash > /etc/bash_completion.d/stratum`.
+    Completions(CompletionsArgs),
+}
+
+/// Arguments for `stratum completions <SHELL>`.
+#[derive(Debug, Args)]
+struct CompletionsArgs {
+    /// Target shell. One of `bash`, `zsh`, `fish`, `powershell`, `elvish`.
+    #[arg(value_name = "SHELL")]
+    shell: Shell,
 }
 
 /// Subcommands under `stratum agents`.
@@ -1023,7 +1037,20 @@ where
         Some(Command::Agents(AgentsCommand::Show(agents_args))) => {
             agents_show(&paths, &agents_args, out, err)
         }
+        Some(Command::Completions(comp_args)) => completions(comp_args.shell, out),
     }
+}
+
+/// Print a shell tab-completion script for `stratum` to `out`.
+///
+/// Delegates to [`clap_complete::generate`], which emits a script in
+/// the canonical format for the requested shell (bash, zsh, fish,
+/// powershell, elvish). The binary name baked into the script is
+/// `"stratum"`, matching the installed binary name.
+fn completions(shell: Shell, out: &mut dyn Write) -> ExitCode {
+    let mut cmd = Cli::command();
+    generate_completion(shell, &mut cmd, "stratum", out);
+    ExitCode::SUCCESS
 }
 
 fn mcp_config_path(paths: &Paths) -> PathBuf {
