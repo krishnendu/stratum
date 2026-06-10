@@ -1,0 +1,23 @@
+[Unit]
+Description=Stratum local-LLM agentic JSON-RPC daemon
+Documentation=https://github.com/krishnendu/stratum
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/stratum serve --tcp-port 47474 --max-connections 16
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/stratum %h/.local/state/stratum
+StandardOutput=journal
+StandardError=journal
+Environment="RUST_LOG=info"
+
+[Install]
+WantedBy=default.target
