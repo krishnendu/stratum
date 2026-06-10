@@ -28,6 +28,9 @@ class StratumLlamaCpp < Formula
   url "https://github.com/krishnendu/stratum/archive/refs/tags/v0.2.0.tar.gz"
   sha256 "e1f47901c5905d6e8222dacb85f2fef26a612e0e1a6d97fa57c9f5820b8b15b3"
 
+  conflicts_with "stratum",
+    because: "both install a `stratum` binary; pick the prebuilt or the LLM-enabled build"
+
   depends_on "rust" => :build
   depends_on "cmake" => :build
   depends_on "pkg-config" => :build

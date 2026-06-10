@@ -140,6 +140,33 @@ jobs:
           out["latest"] = entry
           out["history"] = [entry]
           pathlib.Path("release-files/stable.json").write_text(json.dumps(out, indent=2))
+
+          # Curated model catalog. Stratum doesn't bundle GGUFs (size + licensing),
+          # but ships an opinionated default catalog that `stratum models sync`
+          # pulls down. Entries point at HuggingFace mirrors users can fetch on
+          # demand via `stratum models recommend ...` + manual `stratum chat --model`.
+          catalog = {
+              "schema_version": 1,
+              "entries": {
+                  "qwen-0.5b": {
+                      "slug": "qwen-0.5b",
+                      "family": "qwen",
+                      "display_name": "Qwen2.5 0.5B Instruct (Q4_K_M)",
+                      "tier": "low",
+                      "task": ["chat"],
+                      "size_mib": 469,
+                      "quantization": "Q4_K_M",
+                      "artifact": {
+                          "url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+                          "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+                          "bytes": 491720608
+                      },
+                      "license": "apache-2.0",
+                      "homepage": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+                  }
+              }
+          }
+          pathlib.Path("release-files/catalog-stable.json").write_text(json.dumps(catalog, indent=2))
           PY
           ls -lh release-files
       - name: create github release
