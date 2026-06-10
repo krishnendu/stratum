@@ -1,79 +1,89 @@
 # Stratum
 
+> Local-LLM agentic TUI agent for laptop-class hardware.
+
 [![CI](https://github.com/krishnendu/stratum/actions/workflows/ci.yml/badge.svg)](https://github.com/krishnendu/stratum/actions/workflows/ci.yml)
 [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
 
-> **Status:** pre-alpha. Phase 1 of the build is in progress — the binary boots, probes hardware, classifies into a tier, installs model files (local + HTTP, SHA-256 verified), and drives an echo-backed TUI chat loop. Real LLM inference (`LlamaCppProvider`) is the next deliverable. The runtime is not yet useful for daily work; the API surface is unstable.
+**Status:** Phase 0-7 functionally complete (~117 PRs). v0.1.0 release pending.
 
-Stratum is a local, multi-LLM agentic TUI agent written in **Rust**, designed for the **8-16 GB laptop class** (recommended 12 GB+, optimal 16 GB+). The goal is **best-in-class local agentic outcomes** — entirely offline — by composing a crew of small/selective-load models instead of a single monolith.
+Stratum is a local, multi-LLM agentic TUI written in Rust, targeting the 8-16 GB laptop class. Entirely offline by default; composes a crew of small models instead of a single monolith.
 
-It is explicitly **not** a Claude Code clone, not a single-model wrapper, and not GPU-required.
-
-## What works today
+## Quick start (Echo provider)
 
 ```bash
-$ cargo run --quiet --bin stratum -- doctor
-stratum 0.0.0 · tier=high · gpu=metal · ram=24576 MiB · cores=10 · installed=false
-
-$ cargo run --quiet --bin stratum -- init
-installed · tier=high · gpu=metal · wrote ~/Library/.../installed.toml
-
-$ cargo run --quiet --bin stratum -- echo "hello stratum"
-echo: hello
-echo: stratum
-(usage: prompt=2 completion=2)
-(done)
-
-$ cargo run --quiet --bin stratum -- models add \
-    --from-url https://example.com/model.gguf \
-    --sha256 <hex>
-installed · …/model.gguf · N bytes · verified=true
-
-$ cargo run --quiet --bin stratum -- chat       # ratatui TUI; Esc/Ctrl-C exit
-```
-
-`stratum doctor`, `stratum init`, `stratum echo`, `stratum chat`, and `stratum models {list, add}` are wired and tested. See [`docs/`](docs/) for surface documentation and [`plan/07-implementation-phases.md`](plan/07-implementation-phases.md) (private, gitignored) for the full roadmap.
-
-## Architecture at a glance
-
-- **Resident tier (~6.7 GB hot):** Gemma 4 E4B + E2B (spec-dec draft), Qwen3-0.6B (caveman comms + polisher), Arctic-Embed-L MRL (router + RAG embeddings).
-- **Swap tier (one at a time, dense 7B):** Qwen2.5-Coder-7B (coder) and DeepSeek-R1-Distill-Qwen-7B (thinker) on the high tier; DeepSeek-R1-Distill-Qwen-1.5B on medium.
-- **Backend:** single embedded `llama-cpp-2` for LLM inference; `candle` for the embedder; subprocess `whisper.cpp` / `piper` for voice.
-- **TUI:** `ratatui` + `crossterm`.
-- **GPU detection:** Metal → CUDA → Vulkan → CPU.
-- **Memory-safety gate:** every load is sized against available RAM before it runs.
-
-The 30B-A3B MoE family (Qwen3-Coder-30B-A3B, Qwen3-30B-A3B-Thinking) is supported as an **opt-in tier-`xl`** profile for ≥24 GB boxes, **not** the v1 default.
-
-## Build
-
-```bash
+git clone https://github.com/krishnendu/stratum && cd stratum
 cargo build --workspace
-cargo test --workspace
-cargo llvm-cov --workspace --fail-under-lines 98   # coverage gate
+cargo run -- doctor
+cargo run -- chat --prompt hi
 ```
 
-Toolchain pinned at `1.90.0` via `rust-toolchain.toml`.
+## Real LLM (llama.cpp backend)
 
-## Status of the gates
+```bash
+cargo build --features provider-llama-cpp
+cargo run -- models list
+cargo run -- models add --from-url https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+    --sha256 <hex>
+cargo run --features provider-llama-cpp -- chat --model qwen-0.5b --prompt "hello"
+```
 
-Stratum's CI runs 12 verification gates per PR (build, test, 100% line-coverage target with documented carve-outs, fmt, clippy `-D warnings`, no `unsafe`/`unwrap`/`expect`/`panic` outside `#[cfg(test)]`, structured error codes, supply-chain audit, etc.). See [`docs/verification-gates.md`](docs/verification-gates.md).
+## TUI palette
 
-Current coverage: **98.30%** lines, gate `--fail-under-lines 98`.
+Run `stratum chat` (no `--prompt`) for the interactive TUI:
 
-## Roadmap (public)
+| Command | Effect |
+|---|---|
+| `/plan` | Toggle plan mode (read-only, no tool side-effects). |
+| `/cancel` | Cancel the in-flight turn. |
+| `/clear` | Clear the visible conversation buffer. |
+| `/quit` | Exit the TUI. |
+| `/help` | Show palette help. |
+| `/agents` | List available agents in the registry. |
 
-| Phase | Status | Deliverable |
-|---|---|---|
-| 0 | done | Repo skeleton, types, testkit, CLI scaffold |
-| 1 | in progress | Single-model TUI MVP (this branch ships pass 5 of 7+) |
-| 2 | next | `Provider` trait extraction + router + embedder + workspace concept |
-| 3 | later | Agent loop + dense 7B swap + sandbox profiles + user agents |
-| 4 | later | Compression + speculative decoding + OSS hardening |
-| 5 | later | Multimodal (vision + voice) |
-| 6 | later | OpenAI-compatible egress, MCP client/server, IDE integrations |
-| 7 | later | Eval suite + bench |
-| 8 | later | iOS + Android |
+## CLI surface
+
+```text
+stratum doctor                          # probe host: CPU, RAM, GPU, tier
+stratum models list                     # show installed + catalog models
+stratum models add --from-url <U> --sha256 <H>
+stratum models remove <id>
+stratum models recommend                # suggest models for current tier
+stratum models sync                     # refresh signed catalog over HTTPS
+stratum models validate                 # re-verify installed SHA-256s
+stratum chat [--model <id>] [--prompt <P>] [--resume <session>]
+stratum serve [--tcp-port N] [--socket P] [--json]   # JSON-RPC 2.0 daemon
+stratum client --method <m> [--tcp <addr> | --socket <p>]
+stratum self-update --check             # check for newer signed release
+stratum self-update --apply             # atomic swap, .bak rollback
+stratum mem-check                       # dry-run RAM gate for a model
+stratum events tail                     # follow structured event log
+stratum sessions list
+stratum sessions show <id>
+stratum sessions delete <id>
+stratum agents list
+stratum agents show <name>
+stratum eval run [--suite <s>]          # run eval pipeline (claude-cli judge)
+stratum mcp list                        # show MCP servers in config
+```
+
+## Daemon mode
+
+```bash
+stratum serve --tcp-port 0 --json &
+PORT=$(stratum serve --tcp-port 0 --json | jq -r .tcp_port)   # from stderr/stdout banner
+stratum client --method ping --tcp 127.0.0.1:$PORT
+```
+
+## Architecture
+
+The runtime is built around a small set of core abstractions in `crates/stratum-runtime/`: `AgentLoop` drives the turn cycle; `Provider` is the inference trait (Echo, llama-cpp); `ToolDispatcher` invokes tools per-call with capability gating; `Sandbox` resolves and enforces filesystem/network profiles (`bwrap` on Linux, `sandbox-exec` on macOS); `EventEmitter` produces a structured, JSON-line audit stream consumed by the TUI and `events tail`.
+
+Deeper design notes live in `plan/` (gitignored, not published). Architecture docs intended for public consumption land under [`docs/`](docs/).
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Branch protection on `main`: PR required, 5 CI checks, local review gate, squash merge, linear history.
 
 ## License
 
@@ -83,17 +93,3 @@ Dual-licensed under either of:
 - MIT license ([`LICENSE-MIT`](LICENSE-MIT))
 
 at your option. Third-party attributions in [`NOTICE`](NOTICE).
-
-## Contributing
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). All commits go through PRs; `main` is protected with required review and green CI.
-
-By contributing you agree your work is dual-licensed under Apache-2.0 OR MIT.
-
-## Code of Conduct
-
-This project follows the Contributor Covenant v2.1. See [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
-
-## Security
-
-See [`SECURITY.md`](SECURITY.md) for the vulnerability disclosure policy. Do not file public issues for security problems.
