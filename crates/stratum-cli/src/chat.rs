@@ -39,14 +39,22 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as TuiBlock, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use stratum_runtime::{
-    format_tokens_per_second, AgentLoop, AgentLoopConfig, AllowAllResponder, CancelToken,
-    CapabilityMatrix, EchoProvider, Event as RtEvent, EventEmitter, EventRecord, IntentRouter,
-    MemoryEventSink, Paths, PermissionStore, PlanMode, PromptIdGen, Provider, RoleTimer, Tier,
-    Transcript, TranscriptTurn, TurnContext, TurnId, TurnMetrics, TurnRecorder, TurnResult,
+    format_tokens_per_second, AgentLoop, AgentLoopConfig, CancelToken, CapabilityMatrix,
+    EchoProvider, Event as RtEvent, EventEmitter, EventRecord, IntentRouter, MemoryEventSink,
+    Paths, PendingPrompt, PermissionDecision, PermissionRequest, PermissionStore, PlanMode,
+    PromptId, PromptIdGen, Provider, RoleTimer, Tier, Transcript, TranscriptTurn, TurnContext,
+    TurnId, TurnMetrics, TurnRecorder, TurnResult,
 };
 use stratum_types::{Block, ModelId, StratumResult};
 
 use crate::palette::{self, Palette};
+
+// Permission-prompt responder lives as a sibling file; declare it inline so
+// the binary crate root (`main.rs`) does not have to mention it.
+#[path = "permission_prompter.rs"]
+mod permission_prompter;
+
+pub use permission_prompter::TuiPromptResponder;
 
 /// Multi-line `/help` body listing every wired palette command.
 const HELP_TEXT: &str = "available commands:\n\
@@ -137,6 +145,9 @@ pub struct ChatState {
     /// callers render a "Resumed N turns" banner without re-walking the
     /// transcript to count.
     resumed_count: usize,
+    /// Shared TUI permission prompter. Cloned into the [`AgentLoop`] as the
+    /// responder and read by the event loop to surface pending requests.
+    permission_prompter: Arc<TuiPromptResponder>,
 }
 
 impl Default for ChatState {
@@ -152,13 +163,19 @@ impl ChatState {
         let sink = Arc::new(MemoryEventSink::new());
         let events = Arc::new(EventEmitter::new(sink.clone()));
         let plan_mode = Arc::new(PlanMode::new());
+        let permission_prompter = Arc::new(TuiPromptResponder::default());
         #[allow(
             clippy::expect_used,
             reason = "default_agent_loop sets all nine required builder fields; build() cannot return MissingField on this code path"
         )]
         let agent_loop = Arc::new(
-            default_agent_loop(provider.clone(), events.clone(), plan_mode.clone())
-                .expect("default AgentLoop builder sets every required field"),
+            default_agent_loop(
+                provider.clone(),
+                events.clone(),
+                plan_mode.clone(),
+                permission_prompter.clone(),
+            )
+            .expect("default AgentLoop builder sets every required field"),
         );
         Self {
             transcript: Vec::new(),
@@ -177,6 +194,7 @@ impl ChatState {
             last_turn_result: None,
             plan_mode,
             resumed_count: 0,
+            permission_prompter,
         }
     }
 
@@ -211,6 +229,7 @@ impl ChatState {
                 self.provider.clone(),
                 events.clone(),
                 self.plan_mode.clone(),
+                self.permission_prompter.clone(),
             )
             .expect("default AgentLoop builder sets every required field"),
         );
@@ -218,6 +237,31 @@ impl ChatState {
         self.events = events;
         self.memory_sink = None;
         self
+    }
+
+    /// Pop the next pending permission request from the shared TUI prompter,
+    /// if any. The event loop polls this each tick; `Some` triggers the
+    /// modal overlay path in [`Self::render`].
+    ///
+    /// This consumes the request from the queue — callers that need a
+    /// non-destructive view should use [`Self::peek_pending_permission`].
+    #[must_use]
+    pub fn pending_permission_request(&self) -> Option<PendingPrompt> {
+        self.permission_prompter.pending_request()
+    }
+
+    /// Non-destructively look at the next pending permission request.
+    /// Used by the modal-render path so the queue is observable across
+    /// multiple paint frames.
+    #[must_use]
+    pub fn peek_pending_permission(&self) -> Option<PendingPrompt> {
+        self.permission_prompter.peek_request()
+    }
+
+    /// Record the user's answer for `id` on the shared TUI prompter, waking
+    /// the worker thread that is blocked inside [`stratum_runtime::PromptResponder::ask`].
+    pub fn answer_permission(&self, id: PromptId, decision: PermissionDecision) {
+        self.permission_prompter.submit_decision(id, decision);
     }
 
     /// Pre-populate the scrollback with the turns from a previously persisted
@@ -331,6 +375,20 @@ impl ChatState {
 
     /// Apply a keyboard event.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // Permission modal owns the keyboard while a request is pending.
+        if let Some(pending) = self.permission_prompter.peek_request() {
+            if let KeyCode::Char(c) = key.code {
+                if let Some(decision) = decision_from_key(c) {
+                    // Drain the request from the queue and answer it.
+                    let _ = self.permission_prompter.pending_request();
+                    self.permission_prompter
+                        .submit_decision(pending.id, decision);
+                }
+            }
+            // Unknown / non-char keys are swallowed while the modal is open
+            // so they don't leak into the input buffer.
+            return;
+        }
         // Palette mode owns the keyboard while open.
         if let Some(palette) = self.palette.as_mut() {
             match palette.handle_key(key) {
@@ -596,6 +654,10 @@ impl ChatState {
     }
 
     /// Render the entire TUI into the given frame.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "render walks every overlay (status, chat, palette, modal); splitting fragments the buffer plumbing for no gain"
+    )]
     pub fn render(&self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
         let palette_height = if self.palette.is_some() { 10 } else { 3 };
         let chunks = Layout::default()
@@ -669,6 +731,32 @@ impl ChatState {
             .wrap(Wrap { trim: false });
         ratatui::widgets::Widget::render(chat, chunks[1], buf);
 
+        // Permission-request modal renders as an overlay inside the chat
+        // pane when a request is pending. We peek without popping so the
+        // modal persists across re-renders until a decision is supplied.
+        if let Some(pending) = self.peek_pending_permission() {
+            let modal_lines: Vec<Line<'_>> = vec![
+                Line::from(Span::styled(
+                    "permission request",
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::raw(describe_request(&pending.request))),
+                Line::from(Span::styled(
+                    "[a] allow once  [s] allow session  [f] allow forever  [d] deny  [F] deny forever",
+                    Style::default().add_modifier(Modifier::DIM),
+                )),
+            ];
+            let modal = Paragraph::new(modal_lines)
+                .block(
+                    TuiBlock::default()
+                        .borders(Borders::ALL)
+                        .title("permission"),
+                )
+                .wrap(Wrap { trim: false });
+            // Overlay across the chat pane only (chunks[1]).
+            ratatui::widgets::Widget::render(modal, chunks[1], buf);
+        }
+
         if let Some(palette) = self.palette.as_ref() {
             let matches = palette.matches();
             let mut palette_lines: Vec<Line<'_>> = Vec::new();
@@ -707,19 +795,60 @@ fn default_agent_loop(
     provider: EchoProvider,
     events: Arc<EventEmitter>,
     plan_mode: Arc<PlanMode>,
+    prompter: Arc<TuiPromptResponder>,
 ) -> Result<AgentLoop, stratum_runtime::AgentLoopBuildError> {
     let provider_arc: Arc<dyn Provider> = Arc::new(provider);
+    let responder: Arc<dyn stratum_runtime::PromptResponder> = prompter;
     AgentLoop::builder()
         .with_provider(provider_arc)
         .with_router(IntentRouter::default())
         .with_permission_store(Arc::new(PermissionStore::new()))
         .with_prompt_gen(Arc::new(PromptIdGen::new()))
-        .with_responder(Arc::new(AllowAllResponder))
+        .with_responder(responder)
         .with_events(events)
         .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
         .with_plan_mode(plan_mode)
         .with_config(AgentLoopConfig::default())
         .build()
+}
+
+/// Map a single keystroke to a [`PermissionDecision`] for the modal.
+///
+/// `a` → `AllowOnce`, `s` → `AllowSession`, `f` → `AllowForever`,
+/// `d` → `Deny`, `F` → `DenyForever`. Returns `None` for unknown keys so
+/// the caller can re-display the modal.
+const fn decision_from_key(c: char) -> Option<PermissionDecision> {
+    match c {
+        'a' => Some(PermissionDecision::AllowOnce),
+        's' => Some(PermissionDecision::AllowSession),
+        'f' => Some(PermissionDecision::AllowForever),
+        'd' => Some(PermissionDecision::Deny),
+        'F' => Some(PermissionDecision::DenyForever),
+        _ => None,
+    }
+}
+
+/// Render `request` into a short human-readable label for the modal.
+fn describe_request(req: &PermissionRequest) -> String {
+    match req {
+        PermissionRequest::CapabilityGrant {
+            capability,
+            target,
+            reason,
+        } => target.as_ref().map_or_else(
+            || format!("grant {capability} ({reason})"),
+            |t| format!("grant {capability} on {t} ({reason})"),
+        ),
+        PermissionRequest::SecretAccess { secret_ref, scope } => {
+            format!("access secret {secret_ref} [{scope}]")
+        }
+        PermissionRequest::NetworkHost { host, port } => port.as_ref().map_or_else(
+            || format!("connect to {host}"),
+            |p| format!("connect to {host}:{p}"),
+        ),
+        PermissionRequest::FileWrite { path } => format!("write to {}", path.display()),
+        PermissionRequest::ToolUse { tool_id } => format!("invoke tool {tool_id}"),
+    }
 }
 
 fn render_block(block: &Block) -> Option<Line<'_>> {
@@ -1921,6 +2050,331 @@ mod tests {
         let s = ChatState::default().with_resumed_transcript(t);
         assert_eq!(s.resumed_count(), 0);
         assert!(s.transcript().is_empty());
+    }
+
+    // ---------- TuiPromptResponder integration ----------
+
+    /// Dispatcher that handles `fs.write` invocations by returning a
+    /// trivial success. Used by the permission-flow tests.
+    #[derive(Debug)]
+    struct FsWriteDispatcher;
+    impl stratum_runtime::ToolDispatcher for FsWriteDispatcher {
+        fn invoke(&self, inv: &stratum_runtime::ToolInvocation) -> stratum_runtime::ToolResult {
+            let body = serde_json::Value::Bool(true);
+            let bytes = body.to_string().len() as u64;
+            stratum_runtime::ToolResult::Ok {
+                tool_id: inv.tool_id.clone(),
+                body,
+                bytes,
+            }
+        }
+        fn supports(&self, tool_id: &str) -> bool {
+            tool_id == "fs.write"
+        }
+        fn id(&self) -> &'static str {
+            "fs.write"
+        }
+    }
+
+    fn loop_with_prompter(
+        provider: Arc<dyn Provider>,
+        prompter: Arc<TuiPromptResponder>,
+    ) -> Arc<AgentLoop> {
+        let sink: Arc<dyn EventSink> = Arc::new(MemoryEventSink::new());
+        let events = Arc::new(EventEmitter::new(sink));
+        let mut dispatcher = stratum_runtime::RegistryDispatcher::new();
+        dispatcher
+            .register(Box::new(FsWriteDispatcher))
+            .expect("register");
+        let responder: Arc<dyn stratum_runtime::PromptResponder> = prompter;
+        Arc::new(
+            AgentLoop::builder()
+                .with_provider(provider)
+                .with_router(stratum_runtime::IntentRouter::default())
+                .with_permission_store(Arc::new(stratum_runtime::PermissionStore::new()))
+                .with_prompt_gen(Arc::new(stratum_runtime::PromptIdGen::new()))
+                .with_responder(responder)
+                .with_events(events)
+                .with_capability_matrix(Arc::new(stratum_runtime::CapabilityMatrix::new()))
+                .with_plan_mode(Arc::new(stratum_runtime::PlanMode::new()))
+                .with_config(stratum_runtime::AgentLoopConfig::default())
+                .with_dispatcher(Arc::new(dispatcher))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn pending_permission_request_initially_none() {
+        let s = state();
+        assert!(s.pending_permission_request().is_none());
+        assert!(s.peek_pending_permission().is_none());
+    }
+
+    #[test]
+    fn answer_permission_unblocks_agent_loop_with_allow_once() {
+        // ScriptedProvider yields one ToolCall for "fs.write". The
+        // AgentLoop will dispatch the permission flow through the shared
+        // TuiPromptResponder; the main thread answers AllowOnce; the
+        // background `submit` thread completes successfully.
+        let prompter = Arc::new(TuiPromptResponder::new(Duration::from_secs(2)));
+        let provider = ScriptedProvider {
+            script: std::sync::Mutex::new(vec![Block::ToolCall {
+                id: "fs.write".into(),
+                tool: "fs.write".into(),
+                args: "{}".into(),
+            }]),
+        };
+        let provider_arc: Arc<dyn Provider> = Arc::new(provider);
+        let loop_ = loop_with_prompter(provider_arc, prompter.clone());
+
+        // Inject the same prompter into a ChatState alongside the loop.
+        let mut s = ChatState::with_agent_loop(loop_);
+        s.permission_prompter = prompter.clone();
+
+        let s_arc = Arc::new(std::sync::Mutex::new(s));
+        let s_bg = s_arc.clone();
+        let bg = thread::spawn(move || {
+            let mut guard = s_bg.lock().expect("lock");
+            guard.submit_with_prompt("write a file");
+        });
+
+        // Wait until the worker has enqueued its request.
+        let pending = loop {
+            if let Some(p) = prompter.peek_request() {
+                break p;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        prompter.submit_decision(pending.id, PermissionDecision::AllowOnce);
+
+        bg.join().expect("background submit completes");
+        let outcome = {
+            let guard = s_arc.lock().expect("lock");
+            guard
+                .last_turn_result()
+                .expect("turn result")
+                .outcome
+                .clone()
+        };
+        assert!(
+            matches!(outcome, stratum_runtime::TurnOutcome::Success),
+            "expected Success, got {outcome:?}",
+        );
+    }
+
+    #[test]
+    fn answer_permission_deny_short_circuits_turn() {
+        let prompter = Arc::new(TuiPromptResponder::new(Duration::from_secs(2)));
+        let provider = ScriptedProvider {
+            script: std::sync::Mutex::new(vec![Block::ToolCall {
+                id: "fs.write".into(),
+                tool: "fs.write".into(),
+                args: "{}".into(),
+            }]),
+        };
+        let provider_arc: Arc<dyn Provider> = Arc::new(provider);
+        let loop_ = loop_with_prompter(provider_arc, prompter.clone());
+
+        let mut s = ChatState::with_agent_loop(loop_);
+        s.permission_prompter = prompter.clone();
+        let s_arc = Arc::new(std::sync::Mutex::new(s));
+        let s_bg = s_arc.clone();
+        let bg = thread::spawn(move || {
+            let mut guard = s_bg.lock().expect("lock");
+            guard.submit_with_prompt("write a file");
+        });
+
+        let pending = loop {
+            if let Some(p) = prompter.peek_request() {
+                break p;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        // Use the public delegate.
+        {
+            let guard = s_arc.lock().expect("lock");
+            guard.answer_permission(pending.id, PermissionDecision::Deny);
+        }
+
+        bg.join().expect("background submit completes");
+        let outcome = {
+            let guard = s_arc.lock().expect("lock");
+            guard
+                .last_turn_result()
+                .expect("turn result")
+                .outcome
+                .clone()
+        };
+        assert!(
+            matches!(
+                outcome,
+                stratum_runtime::TurnOutcome::ToolFailure { ref code, .. } if code == "STRAT-E5004"
+            ),
+            "expected ToolFailure with STRAT-E5004, got {outcome:?}",
+        );
+    }
+
+    #[test]
+    fn prompter_times_out_to_deny_when_unanswered() {
+        // Wire a short-timeout prompter and never answer; the AgentLoop
+        // should see a Deny and short-circuit the turn.
+        let prompter = Arc::new(TuiPromptResponder::new(Duration::from_millis(100)));
+        let provider = ScriptedProvider {
+            script: std::sync::Mutex::new(vec![Block::ToolCall {
+                id: "fs.write".into(),
+                tool: "fs.write".into(),
+                args: "{}".into(),
+            }]),
+        };
+        let provider_arc: Arc<dyn Provider> = Arc::new(provider);
+        let loop_ = loop_with_prompter(provider_arc, prompter.clone());
+        let mut s = ChatState::with_agent_loop(loop_);
+        s.permission_prompter = prompter;
+        s.submit_with_prompt("write a file");
+        let tr = s.last_turn_result().expect("turn result");
+        assert!(
+            matches!(
+                tr.outcome,
+                stratum_runtime::TurnOutcome::ToolFailure { ref code, .. } if code == "STRAT-E5004"
+            ),
+            "expected ToolFailure with STRAT-E5004, got {:?}",
+            tr.outcome,
+        );
+    }
+
+    #[test]
+    fn submit_decision_then_pending_returns_none_after_consumed() {
+        // Submitting a decision is independent of the queue; once
+        // pending_request has popped the request, a subsequent call
+        // returns None even after a decision was recorded.
+        let prompter = TuiPromptResponder::new(Duration::from_secs(1));
+        let p = PendingPrompt {
+            id: PromptId(99),
+            request: PermissionRequest::ToolUse {
+                tool_id: "fs.write".into(),
+            },
+            issued_at: SystemTime::UNIX_EPOCH,
+        };
+        // Manually enqueue + drain (no waiter).
+        prompter.requeue_for_redisplay(p);
+        let popped = prompter.pending_request().expect("popped");
+        assert_eq!(popped.id, PromptId(99));
+        prompter.submit_decision(PromptId(99), PermissionDecision::AllowOnce);
+        // Queue is empty: the recorded decision does not put the request
+        // back into the queue.
+        assert!(prompter.pending_request().is_none());
+    }
+
+    #[test]
+    fn decision_from_key_maps_all_documented_keys() {
+        assert_eq!(decision_from_key('a'), Some(PermissionDecision::AllowOnce));
+        assert_eq!(
+            decision_from_key('s'),
+            Some(PermissionDecision::AllowSession)
+        );
+        assert_eq!(
+            decision_from_key('f'),
+            Some(PermissionDecision::AllowForever)
+        );
+        assert_eq!(decision_from_key('d'), Some(PermissionDecision::Deny));
+        assert_eq!(
+            decision_from_key('F'),
+            Some(PermissionDecision::DenyForever)
+        );
+        assert_eq!(decision_from_key('x'), None);
+        assert_eq!(decision_from_key('A'), None);
+    }
+
+    #[test]
+    fn describe_request_covers_every_variant() {
+        let cap = PermissionRequest::CapabilityGrant {
+            capability: "net".into(),
+            target: Some("example.com".into()),
+            reason: "fetch".into(),
+        };
+        assert!(describe_request(&cap).contains("net"));
+        assert!(describe_request(&cap).contains("example.com"));
+        let cap_no_target = PermissionRequest::CapabilityGrant {
+            capability: "shell".into(),
+            target: None,
+            reason: "run".into(),
+        };
+        assert!(describe_request(&cap_no_target).contains("shell"));
+        let secret = PermissionRequest::SecretAccess {
+            secret_ref: "p/k".into(),
+            scope: "read".into(),
+        };
+        assert!(describe_request(&secret).contains("p/k"));
+        let net = PermissionRequest::NetworkHost {
+            host: "api.example".into(),
+            port: Some(443),
+        };
+        assert!(describe_request(&net).contains("443"));
+        let net_anyport = PermissionRequest::NetworkHost {
+            host: "api.example".into(),
+            port: None,
+        };
+        assert!(describe_request(&net_anyport).contains("api.example"));
+        let file = PermissionRequest::FileWrite {
+            path: std::path::PathBuf::from("/tmp/x"),
+        };
+        assert!(describe_request(&file).contains("/tmp/x"));
+        let tool = PermissionRequest::ToolUse {
+            tool_id: "fs.write".into(),
+        };
+        assert!(describe_request(&tool).contains("fs.write"));
+    }
+
+    #[test]
+    fn handle_key_with_pending_request_swallows_unknown_char() {
+        let mut s = state();
+        let pending = PendingPrompt {
+            id: PromptId(5),
+            request: PermissionRequest::ToolUse {
+                tool_id: "fs.write".into(),
+            },
+            issued_at: SystemTime::UNIX_EPOCH,
+        };
+        s.permission_prompter.requeue_for_redisplay(pending);
+        // 'z' is not one of the modal keys: input must stay clean.
+        s.handle_key(key(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(s.input().is_empty());
+        // Modal still pending.
+        assert!(s.peek_pending_permission().is_some());
+    }
+
+    #[test]
+    fn handle_key_with_pending_request_dispatches_known_decision_key() {
+        let mut s = state();
+        let pending = PendingPrompt {
+            id: PromptId(6),
+            request: PermissionRequest::ToolUse {
+                tool_id: "fs.write".into(),
+            },
+            issued_at: SystemTime::UNIX_EPOCH,
+        };
+        s.permission_prompter.requeue_for_redisplay(pending);
+        s.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE));
+        // Queue drained; no further pending.
+        assert!(s.peek_pending_permission().is_none());
+    }
+
+    #[test]
+    fn render_shows_permission_modal_when_pending() {
+        let s = state();
+        let pending = PendingPrompt {
+            id: PromptId(7),
+            request: PermissionRequest::ToolUse {
+                tool_id: "fs.write".into(),
+            },
+            issued_at: SystemTime::UNIX_EPOCH,
+        };
+        s.permission_prompter.requeue_for_redisplay(pending);
+        let text = rendered_text(&s, 100, 14);
+        assert!(text.contains("permission"));
+        assert!(text.contains("fs.write"));
+        assert!(text.contains("[a]"));
     }
 
     #[test]
