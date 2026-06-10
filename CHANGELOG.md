@@ -4,6 +4,24 @@ All notable changes to Stratum. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-11
+
+First minor bump. Bundles UX polish + secondary brew formula for real-LLM build.
+
+### Added
+- `stratum doctor --strict` validates `--json` output against `docs/schemas/doctor.v1.json` (#141).
+- `stratum config get|set|list|unset` for `<state>/config.toml` (#134).
+- `stratum --version` long form now includes the build git SHA + build date (#137).
+- `dist/homebrew/stratum-llama-cpp.rb` — second Homebrew formula that builds-from-source with `--features provider-llama-cpp` for real local LLM inference (#139).
+- Eval suites expanded: `baseline.json` 10 → 20 cases + new `coder.json` (10) + `polisher.json` (10), all green against EchoProvider (#141).
+- `/budget` palette command shows current `TurnMetrics` (#141).
+- `dist/systemd/stratum.service` + `dist/launchd/dev.stratum.serve.plist` + `docs/service-install.md` (#131).
+- `docs/architecture.md` — Mermaid diagrams + module map (#132).
+- `InstalledMigrator` trait + chain dispatch in `install.rs` (#138).
+
+### Fixed
+- Default `--manifest-url` / catalog URLs no longer point at unregistered domains; now resolve to GitHub Releases artifacts (#135).
+
 ## [0.1.2] - 2026-06-11
 
 ### Fixed
