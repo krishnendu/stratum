@@ -16,7 +16,8 @@ use stratum_runtime::{
     EventRecord, GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadedModel,
     ManifestError, MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask,
     ModelTier, OsTag, Paths, PlatformTag, Provider, ReleaseChannel, ReleaseVersion, SandboxReport,
-    TelemetryConfig, TelemetryEventKind, TelemetryPayload, Tier, UpdateChannel, UpdateDecision,
+    SessionId, TelemetryConfig, TelemetryEventKind, TelemetryPayload, Tier, Transcript,
+    TranscriptBlock, TranscriptStore, TranscriptTurn, UpdateChannel, UpdateDecision,
     UpdateManifest, DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
@@ -69,6 +70,36 @@ enum Command {
     /// Read the on-disk JSONL event log written by `JsonlEventSink`.
     #[command(subcommand)]
     Events(EventsCommand),
+    /// Inspect, list, or delete chat-session transcripts on disk.
+    #[command(subcommand)]
+    Sessions(SessionsCommand),
+}
+
+/// Subcommands under `stratum sessions`.
+#[derive(Debug, Subcommand)]
+enum SessionsCommand {
+    /// List session ids currently on disk in sorted order.
+    List,
+    /// Pretty-print the transcript for a given session id.
+    Show(SessionsShowArgs),
+    /// Delete the on-disk transcript for a given session id.
+    Delete(SessionsDeleteArgs),
+}
+
+/// Arguments for `stratum sessions show`.
+#[derive(Debug, Args)]
+struct SessionsShowArgs {
+    /// Session id to load. Must be 16 lowercase hex characters.
+    #[arg(long)]
+    id: String,
+}
+
+/// Arguments for `stratum sessions delete`.
+#[derive(Debug, Args)]
+struct SessionsDeleteArgs {
+    /// Session id to delete. Must be 16 lowercase hex characters.
+    #[arg(long)]
+    id: String,
 }
 
 /// Subcommands under `stratum events`.
@@ -710,6 +741,13 @@ where
         Some(Command::SelfUpdate(su_args)) => self_update(cli.json, &su_args, out, err),
         Some(Command::Events(EventsCommand::Tail(tail_args))) => {
             events_tail(&paths, &tail_args, out, err)
+        }
+        Some(Command::Sessions(SessionsCommand::List)) => sessions_list(cli.json, &paths, out, err),
+        Some(Command::Sessions(SessionsCommand::Show(show_args))) => {
+            sessions_show(cli.json, &paths, &show_args, out, err)
+        }
+        Some(Command::Sessions(SessionsCommand::Delete(del_args))) => {
+            sessions_delete(&paths, &del_args, out, err)
         }
     }
 }
@@ -2914,6 +2952,207 @@ fn events_tail(
         std::thread::sleep(Duration::from_millis(200));
         if deadline_reached(deadline) {
             return ExitCode::SUCCESS;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sessions
+// ---------------------------------------------------------------------------
+
+/// Filesystem location of the transcript directory under the configured
+/// state root. Mirrors what the future chat persistence layer writes to.
+fn transcripts_dir(paths: &Paths) -> PathBuf {
+    paths.state.join("transcripts")
+}
+
+/// Open the on-disk [`TranscriptStore`] rooted at `<state>/transcripts/`,
+/// writing a STRAT-E1001 diagnostic to `err` on failure.
+fn open_transcript_store(paths: &Paths, err: &mut dyn Write) -> Result<TranscriptStore, ExitCode> {
+    let dir = transcripts_dir(paths);
+    match TranscriptStore::open(dir.clone()) {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "STRAT-E1001 cannot open transcripts dir {}: {e}",
+                dir.display()
+            );
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+/// Parse a CLI-supplied session id. Bad format → exit 2 + STRAT-E1001.
+fn parse_session_id(raw: &str, err: &mut dyn Write) -> Result<SessionId, ExitCode> {
+    match SessionId::from_str(raw) {
+        Ok(id) => Ok(id),
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 invalid --id: {e}");
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+fn sessions_list(json: bool, paths: &Paths, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let store = match open_transcript_store(paths, err) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let ids = match store.list() {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 cannot list transcripts: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if json {
+        let strings: Vec<&str> = ids.iter().map(SessionId::as_str).collect();
+        #[allow(
+            clippy::expect_used,
+            reason = "Vec<&str> serialization is infallible (primitives only)"
+        )]
+        let rendered =
+            serde_json::to_string_pretty(&strings).expect("Vec<&str> serialization is infallible");
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+    } else {
+        for id in &ids {
+            if writeln!(out, "{}", id.as_str()).is_err() {
+                return ExitCode::from(74);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn sessions_show(
+    json: bool,
+    paths: &Paths,
+    args: &SessionsShowArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let id = match parse_session_id(&args.id, err) {
+        Ok(i) => i,
+        Err(code) => return code,
+    };
+    let store = match open_transcript_store(paths, err) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let transcript = match store.load(&id) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 cannot load session {}: {e}", id.as_str());
+            return ExitCode::from(1);
+        }
+    };
+    if json {
+        match serde_json::to_string_pretty(&transcript) {
+            Ok(rendered) => {
+                if writeln!(out, "{rendered}").is_err() {
+                    return ExitCode::from(74);
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 cannot serialize transcript: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        ExitCode::SUCCESS
+    } else {
+        render_transcript_prose(&transcript, out)
+    }
+}
+
+/// Format `t` as the documented prose body, writing each line to `out`.
+fn render_transcript_prose(t: &Transcript, out: &mut dyn Write) -> ExitCode {
+    let created = OffsetDateTime::from(t.created_at)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| String::from("?"));
+    if writeln!(out, "session: {}", t.session_id.as_str()).is_err() {
+        return ExitCode::from(74);
+    }
+    if writeln!(out, "created: {created}").is_err() {
+        return ExitCode::from(74);
+    }
+    if writeln!(out, "turns: {}", t.turns.len()).is_err() {
+        return ExitCode::from(74);
+    }
+    if writeln!(out, "----").is_err() {
+        return ExitCode::from(74);
+    }
+    for (idx, turn) in t.turns.iter().enumerate() {
+        let line = render_turn_line(idx + 1, turn);
+        if writeln!(out, "{line}").is_err() {
+            return ExitCode::from(74);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// One-line prose summary of a single transcript turn.
+fn render_turn_line(idx: usize, turn: &TranscriptTurn) -> String {
+    let (at, role, body) = match turn {
+        TranscriptTurn::User { at, text } => (at, "user", text.clone()),
+        TranscriptTurn::Assistant { at, blocks } => {
+            (at, "assistant", render_assistant_summary(blocks))
+        }
+        TranscriptTurn::System { at, text } => (at, "system", text.clone()),
+        TranscriptTurn::Command { at, text, ok } => (at, "command", format!("{text} ok={ok}")),
+    };
+    let at_str = OffsetDateTime::from(*at)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| String::from("?"));
+    format!("[{idx}] {at_str} {role}: {body}")
+}
+
+/// Render the assistant body: the first block's text, optionally annotated
+/// with how many more blocks follow.
+fn render_assistant_summary(blocks: &[TranscriptBlock]) -> String {
+    let first = blocks.first().map_or("", |b| b.text.as_str());
+    let head = first.lines().next().unwrap_or("");
+    if blocks.len() <= 1 {
+        head.to_string()
+    } else {
+        format!("{head} ({} blocks)", blocks.len())
+    }
+}
+
+fn sessions_delete(
+    paths: &Paths,
+    args: &SessionsDeleteArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let id = match parse_session_id(&args.id, err) {
+        Ok(i) => i,
+        Err(code) => return code,
+    };
+    let store = match open_transcript_store(paths, err) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    match store.delete(&id) {
+        Ok(true) => {
+            if writeln!(out, "deleted · {}", id.as_str()).is_err() {
+                return ExitCode::from(74);
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            let _ = writeln!(err, "STRAT-E1001 no such session: {}", id.as_str());
+            ExitCode::from(1)
+        }
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "STRAT-E1001 cannot delete session {}: {e}",
+                id.as_str()
+            );
+            ExitCode::from(1)
         }
     }
 }
