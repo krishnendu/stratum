@@ -111,7 +111,7 @@ jobs:
         # `docs/coverage-exclusions.md`.
         run: |
           set -euxo pipefail
-          cargo llvm-cov --workspace --exclude xtask --fail-under-lines 95
+          cargo llvm-cov --workspace --exclude xtask --fail-under-lines 96
       - name: cargo llvm-cov (lcov artifact)
         shell: bash
         # Excludes the `provider-llama-cpp` feature; see clippy job comment.
