@@ -188,7 +188,7 @@ pub use agent_factory::{
 };
 pub use agent_handoff::{
     parse_handoff_marker, AgentHandoff, AgentRegistry, HandoffError, HandoffPolicy, HandoffResult,
-    HandoffStep,
+    HandoffStep, OrdRole, ParallelPolicy, ParallelResult, RoleResult,
 };
 pub use agent_loop::{
     AgentLoop, AgentLoopBuildError, AgentLoopBuilder, AgentLoopConfig, TurnContext, TurnResult,

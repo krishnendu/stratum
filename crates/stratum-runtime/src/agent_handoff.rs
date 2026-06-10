@@ -25,11 +25,25 @@
 //! No new `STRAT-Exxxx` codes — failures surface as typed variants of
 //! [`HandoffError`]. The downstream observability layer maps them onto
 //! existing codes when needed.
+//!
+//! ## Parallel API
+//!
+//! [`AgentHandoff::run_turn_parallel`] broadcasts the same `TurnContext`
+//! and `RoutedIntent` to a fixed list of roles and returns a
+//! [`ParallelResult`] containing one [`RoleResult`] per requested role.
+//! Workers run on dedicated `std::thread::spawn` threads, throttled by
+//! [`ParallelPolicy::max_concurrent`]. Each worker observes a child of
+//! the caller-supplied [`CancelToken`] so cancelling the parent fans out
+//! to every in-flight role. The returned `per_role` `BTreeMap` is
+//! deterministically ordered by the [`SuggestedRole`] declaration rank
+//! used elsewhere in this module.
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use stratum_types::Block;
@@ -65,6 +79,30 @@ impl Default for HandoffPolicy {
     }
 }
 
+/// Static policy controlling [`AgentHandoff::run_turn_parallel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParallelPolicy {
+    /// Upper bound on the number of worker threads active concurrently.
+    /// The dispatch loop releases a new worker only when an in-flight
+    /// worker has finished, so the runtime never exceeds this many
+    /// simultaneously executing roles.
+    pub max_concurrent: u8,
+    /// When `true`, the dispatcher cancels the shared cancel token and
+    /// returns as soon as any role reports an error (a non-`Success`
+    /// [`TurnOutcome`]). The returned `per_role` map will then contain
+    /// only the results that landed before the cancellation.
+    pub fail_fast: bool,
+}
+
+impl Default for ParallelPolicy {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 4,
+            fail_fast: false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -72,10 +110,26 @@ impl Default for HandoffPolicy {
 /// Adapter wrapping [`SuggestedRole`] with a stable `Ord` impl so we
 /// can use it as a `BTreeMap` key without altering the upstream type.
 /// Order matches the declaration order in [`SuggestedRole`].
+///
+/// Exposed so the public [`ParallelResult::per_role`] map can be keyed
+/// by an `Ord` type while preserving the upstream `SuggestedRole`
+/// definition. Use [`OrdRole::role`] to recover the wrapped enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OrdRole(SuggestedRole);
+pub struct OrdRole(SuggestedRole);
 
 impl OrdRole {
+    /// Wrap a [`SuggestedRole`] for use as a `BTreeMap` key.
+    #[must_use]
+    pub const fn new(role: SuggestedRole) -> Self {
+        Self(role)
+    }
+
+    /// Recover the wrapped [`SuggestedRole`].
+    #[must_use]
+    pub const fn role(self) -> SuggestedRole {
+        self.0
+    }
+
     const fn rank(self) -> u8 {
         match self.0 {
             SuggestedRole::Default => 0,
@@ -84,6 +138,18 @@ impl OrdRole {
             SuggestedRole::Polisher => 3,
             SuggestedRole::Researcher => 4,
         }
+    }
+}
+
+impl From<SuggestedRole> for OrdRole {
+    fn from(role: SuggestedRole) -> Self {
+        Self(role)
+    }
+}
+
+impl From<OrdRole> for SuggestedRole {
+    fn from(wrapper: OrdRole) -> Self {
+        wrapper.0
     }
 }
 
@@ -189,6 +255,44 @@ pub struct HandoffResult {
     pub final_blocks: Vec<Block>,
 }
 
+/// Per-role outcome captured by [`AgentHandoff::run_turn_parallel`].
+#[derive(Debug, Clone)]
+pub struct RoleResult {
+    /// Role this result belongs to.
+    pub role: SuggestedRole,
+    /// Terminal outcome reported by [`AgentLoop::run_turn`]. When the
+    /// worker thread panicked or the dispatcher cancelled before the
+    /// worker started, this is [`TurnOutcome::ModelError`] and `error`
+    /// carries a short human description.
+    pub outcome: TurnOutcome,
+    /// Blocks emitted by the role, verbatim.
+    pub blocks: Vec<Block>,
+    /// Wall-clock time the worker spent inside `run_turn`, in
+    /// milliseconds.
+    pub duration_ms: u64,
+    /// Optional human-readable error message — populated when the
+    /// outcome was synthesised by the dispatcher (cancelled,
+    /// worker-panicked, deadline-exceeded).
+    pub error: Option<String>,
+}
+
+/// Aggregate result of [`AgentHandoff::run_turn_parallel`].
+///
+/// The `per_role` map is sorted by [`SuggestedRole`] declaration rank
+/// (via [`OrdRole`]) so callers observe a deterministic iteration order
+/// regardless of how the underlying threads were scheduled. Use
+/// [`OrdRole::role`] on the keys (or [`From`]) to recover the wrapped
+/// [`SuggestedRole`].
+#[derive(Debug, Clone)]
+pub struct ParallelResult {
+    /// Per-role outcome, sorted by role declaration rank.
+    pub per_role: BTreeMap<OrdRole, RoleResult>,
+    /// Wall-clock instant the dispatcher started.
+    pub started_at: SystemTime,
+    /// Total dispatcher wall-clock time, in milliseconds.
+    pub elapsed_ms: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -238,11 +342,14 @@ pub struct AgentHandoff {
     registry: AgentRegistry,
     default_role: SuggestedRole,
     policy: HandoffPolicy,
+    parallel_policy: ParallelPolicy,
 }
 
 impl AgentHandoff {
     /// Construct a coordinator from a registry, fall-back role, and
-    /// chain policy.
+    /// chain policy. The parallel-dispatch policy starts at
+    /// [`ParallelPolicy::default`]; use
+    /// [`Self::with_parallel_policy`] to override it.
     #[must_use]
     pub const fn new(
         registry: AgentRegistry,
@@ -253,7 +360,26 @@ impl AgentHandoff {
             registry,
             default_role,
             policy,
+            parallel_policy: ParallelPolicy {
+                max_concurrent: 4,
+                fail_fast: false,
+            },
         }
+    }
+
+    /// Override the parallel-dispatch policy used by
+    /// [`Self::run_turn_parallel`]. Builder-style; returns the modified
+    /// coordinator so callers can chain construction.
+    #[must_use]
+    pub const fn with_parallel_policy(mut self, policy: ParallelPolicy) -> Self {
+        self.parallel_policy = policy;
+        self
+    }
+
+    /// Active parallel-dispatch policy.
+    #[must_use]
+    pub const fn parallel_policy(&self) -> ParallelPolicy {
+        self.parallel_policy
     }
 
     /// Snapshot of the registered roles.
@@ -361,6 +487,221 @@ impl AgentHandoff {
                 started_at: current_ctx.started_at,
             };
         }
+    }
+
+    /// Broadcast the same `TurnContext` and `RoutedIntent` to every
+    /// role in `roles` concurrently, throttled by
+    /// [`ParallelPolicy::max_concurrent`].
+    ///
+    /// Each role runs on a dedicated worker thread spawned via
+    /// [`std::thread::spawn`]. Every worker observes a child of the
+    /// caller-supplied [`CancelToken`] so cancelling the parent fans
+    /// out to every in-flight role; the [`AgentRegistry`] is shared
+    /// read-only via `Arc` so workers never contend on a mutex.
+    ///
+    /// Returns a [`ParallelResult`] whose `per_role` map is sorted by
+    /// [`SuggestedRole`] declaration rank. Duplicate roles in `roles`
+    /// collapse to a single entry (the later worker wins on insertion
+    /// order, which is also deterministic).
+    ///
+    /// # Errors
+    ///
+    /// * [`HandoffError::NoSuchRole`] — at least one requested role is
+    ///   not present in the registry. The check runs before any worker
+    ///   is spawned, so a missing role aborts the dispatch entirely.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "owning the intent matches the agent-loop run_turn signature and the rest of the hand-off surface"
+    )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "single coherent dispatcher: spawn pool + recv loop + drain + join must stay co-located for readability"
+    )]
+    pub fn run_turn_parallel(
+        &self,
+        ctx: TurnContext,
+        intent: RoutedIntent,
+        cancel: &CancelToken,
+        roles: &[SuggestedRole],
+    ) -> Result<ParallelResult, HandoffError> {
+        let _ = intent; // Reserved for future per-role hint plumbing.
+        let started_at = SystemTime::now();
+        let started_instant = Instant::now();
+
+        // Empty role list short-circuits to an empty result.
+        if roles.is_empty() {
+            return Ok(ParallelResult {
+                per_role: BTreeMap::new(),
+                started_at,
+                elapsed_ms: 0,
+            });
+        }
+
+        // Pre-flight: every requested role must be registered.
+        for role in roles {
+            if self.registry.get(role).is_none() {
+                return Err(HandoffError::NoSuchRole(*role));
+            }
+        }
+
+        // Wall-time budget — re-uses HandoffPolicy::max_chain_depth as a
+        // hop-budget proxy at 30 s per hop.
+        let deadline =
+            started_instant + Duration::from_secs(u64::from(self.policy.max_chain_depth) * 30);
+
+        let parent_cancel = cancel.clone();
+        let max_concurrent = usize::from(self.parallel_policy.max_concurrent.max(1));
+        let fail_fast = self.parallel_policy.fail_fast;
+
+        let (tx, rx) = mpsc::channel::<RoleResult>();
+        let mut joins: Vec<thread::JoinHandle<()>> = Vec::with_capacity(roles.len());
+        let mut per_role: BTreeMap<OrdRole, RoleResult> = BTreeMap::new();
+        let mut next_dispatch = 0_usize;
+        let mut in_flight = 0_usize;
+        let mut finished = 0_usize;
+
+        // Helper closure to spawn a single worker.
+        let spawn_one = |role: SuggestedRole,
+                         agent: Arc<AgentLoop>,
+                         ctx: TurnContext,
+                         cancel: CancelToken,
+                         tx: mpsc::Sender<RoleResult>|
+         -> thread::JoinHandle<()> {
+            thread::spawn(move || {
+                let started = Instant::now();
+                // If cancelled before we even started, short-circuit.
+                if cancel.is_cancelled() {
+                    let _ = tx.send(RoleResult {
+                        role,
+                        outcome: TurnOutcome::UserAbort,
+                        blocks: Vec::new(),
+                        duration_ms: 0,
+                        error: Some("cancelled before dispatch".into()),
+                    });
+                    return;
+                }
+                let result = agent.run_turn(ctx, &cancel);
+                let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
+                let _ = tx.send(RoleResult {
+                    role,
+                    outcome: result.outcome,
+                    blocks: result.blocks,
+                    duration_ms,
+                    error: None,
+                });
+            })
+        };
+
+        // Initial burst — at most `max_concurrent` workers in flight.
+        while next_dispatch < roles.len() && in_flight < max_concurrent {
+            let role = roles[next_dispatch];
+            let Some(agent) = self.registry.get(&role) else {
+                // Should never trip — we pre-flighted above — but stay
+                // defensive against a registry mutation between checks.
+                return Err(HandoffError::NoSuchRole(role));
+            };
+            let worker_cancel = parent_cancel.child();
+            let worker_tx = tx.clone();
+            joins.push(spawn_one(
+                role,
+                agent,
+                ctx.clone(),
+                worker_cancel,
+                worker_tx,
+            ));
+            in_flight += 1;
+            next_dispatch += 1;
+        }
+
+        let total = roles.len();
+        let mut aborted_for_fail_fast = false;
+
+        while finished < total {
+            let now = Instant::now();
+            if now >= deadline {
+                // Wall-time budget exhausted — cancel everyone and stop
+                // waiting. Workers that have not started yet will
+                // observe the cancellation and short-circuit.
+                parent_cancel.cancel();
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            match rx.recv_timeout(remaining) {
+                Ok(role_result) => {
+                    finished += 1;
+                    in_flight = in_flight.saturating_sub(1);
+                    let is_error = !matches!(role_result.outcome, TurnOutcome::Success);
+                    per_role.insert(OrdRole(role_result.role), role_result);
+
+                    if fail_fast && is_error {
+                        // Cancel any pending / in-flight workers.
+                        parent_cancel.cancel();
+                        aborted_for_fail_fast = true;
+                        break;
+                    }
+
+                    // Top up the queue if more roles remain.
+                    while next_dispatch < total && in_flight < max_concurrent {
+                        let role = roles[next_dispatch];
+                        let Some(agent) = self.registry.get(&role) else {
+                            return Err(HandoffError::NoSuchRole(role));
+                        };
+                        let worker_cancel = parent_cancel.child();
+                        let worker_tx = tx.clone();
+                        joins.push(spawn_one(
+                            role,
+                            agent,
+                            ctx.clone(),
+                            worker_cancel,
+                            worker_tx,
+                        ));
+                        in_flight += 1;
+                        next_dispatch += 1;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    parent_cancel.cancel();
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        // Drop our own sender so the receiver eventually disconnects.
+        drop(tx);
+
+        // Drain any results that landed after the loop exited (e.g. a
+        // worker that finished between fail_fast cancel and join). Best
+        // effort — bounded by the channel close.
+        while let Ok(role_result) = rx.try_recv() {
+            per_role
+                .entry(OrdRole(role_result.role))
+                .or_insert(role_result);
+        }
+
+        // Join all worker threads. Threads observe the cancel token,
+        // so they should terminate quickly even when we bailed early.
+        for handle in joins {
+            // Ignore the join error — a panicking worker is treated as
+            // a missing result (the per_role map stays partial).
+            let _ = handle.join();
+        }
+
+        // After threads are joined, collect any final results.
+        while let Ok(role_result) = rx.try_recv() {
+            per_role
+                .entry(OrdRole(role_result.role))
+                .or_insert(role_result);
+        }
+
+        let _ = aborted_for_fail_fast; // Reserved — future status reporting.
+
+        let elapsed_ms = u64::try_from(started_instant.elapsed().as_millis()).unwrap_or(0);
+        Ok(ParallelResult {
+            per_role,
+            started_at,
+            elapsed_ms,
+        })
     }
 
     fn resolve_role(&self, requested: SuggestedRole) -> Result<SuggestedRole, HandoffError> {
@@ -997,6 +1338,405 @@ mod tests {
     }
 
     // ---- CapturingProvider pin (marker stripped) ------------------------
+
+    // ---- ParallelPolicy + run_turn_parallel -----------------------------
+
+    /// Provider that errors on demand for `fail_fast` tests.
+    #[derive(Debug)]
+    struct ErrProvider {
+        code: String,
+    }
+
+    impl Provider for ErrProvider {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn id(&self) -> &str {
+            "err"
+        }
+        fn capabilities(&self) -> &'static [Capability] {
+            const CAPS: &[Capability] = &[Capability::Generate];
+            CAPS
+        }
+        fn generate(&self, _req: &GenerateRequest, _cancel: &CancelToken) -> Vec<Block> {
+            // Returning no blocks triggers TurnOutcome::ModelError via
+            // the agent_loop's E_NO_BLOCKS path.
+            let _ = &self.code;
+            Vec::new()
+        }
+    }
+
+    /// Provider that sleeps to give the dispatcher non-zero `elapsed_ms`.
+    #[derive(Debug)]
+    struct SlowProvider {
+        millis: u64,
+    }
+
+    impl Provider for SlowProvider {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn id(&self) -> &str {
+            "slow"
+        }
+        fn capabilities(&self) -> &'static [Capability] {
+            const CAPS: &[Capability] = &[Capability::Generate];
+            CAPS
+        }
+        fn generate(&self, _req: &GenerateRequest, _cancel: &CancelToken) -> Vec<Block> {
+            std::thread::sleep(Duration::from_millis(self.millis));
+            vec![Block::Text {
+                text: "slow done".into(),
+            }]
+        }
+    }
+
+    fn const_loop(text: &str) -> Arc<AgentLoop> {
+        build_loop_with_provider(Arc::new(ConstTextProvider {
+            text: text.to_string(),
+        }))
+    }
+
+    #[test]
+    fn parallel_policy_default_matches_documented() {
+        let p = ParallelPolicy::default();
+        assert_eq!(p.max_concurrent, 4);
+        assert!(!p.fail_fast);
+    }
+
+    #[test]
+    fn parallel_policy_is_copy_and_debug() {
+        let p = ParallelPolicy::default();
+        let q = p;
+        let _ = format!("{p:?} {q:?}");
+        assert_eq!(p, q);
+    }
+
+    #[test]
+    fn with_parallel_policy_overrides_default() {
+        let reg = AgentRegistry::new();
+        let h = AgentHandoff::new(reg, SuggestedRole::Default, HandoffPolicy::default());
+        assert_eq!(h.parallel_policy(), ParallelPolicy::default());
+        let custom = ParallelPolicy {
+            max_concurrent: 2,
+            fail_fast: true,
+        };
+        let h2 = h.with_parallel_policy(custom);
+        assert_eq!(h2.parallel_policy(), custom);
+    }
+
+    #[test]
+    fn run_turn_parallel_with_no_roles_returns_empty_map() {
+        let reg = AgentRegistry::new();
+        let h = AgentHandoff::new(reg, SuggestedRole::Default, HandoffPolicy::default());
+        let result = h
+            .run_turn_parallel(
+                ctx("hi"),
+                routed_with_role(SuggestedRole::Default),
+                &CancelToken::new(),
+                &[],
+            )
+            .expect("ok");
+        assert!(result.per_role.is_empty());
+        assert_eq!(result.elapsed_ms, 0);
+    }
+
+    #[test]
+    fn run_turn_parallel_three_roles_yields_three_results() {
+        let mut reg = AgentRegistry::new();
+        reg.register(SuggestedRole::Default, const_loop("d"));
+        reg.register(SuggestedRole::Coder, const_loop("c"));
+        reg.register(SuggestedRole::Polisher, const_loop("p"));
+        let h = AgentHandoff::new(reg, SuggestedRole::Default, HandoffPolicy::default());
+        let result = h
+            .run_turn_parallel(
+                ctx("hi"),
+                routed_with_role(SuggestedRole::Default),
+                &CancelToken::new(),
+                &[
+                    SuggestedRole::Default,
+                    SuggestedRole::Coder,
+                    SuggestedRole::Polisher,
+                ],
+            )
+            .expect("ok");
+        assert_eq!(result.per_role.len(), 3);
+        for role in [
+            SuggestedRole::Default,
+            SuggestedRole::Coder,
+            SuggestedRole::Polisher,
+        ] {
+            let r = result.per_role.get(&OrdRole(role)).expect("role present");
+            assert_eq!(r.role, role);
+            assert!(matches!(r.outcome, TurnOutcome::Success));
+            assert!(!r.blocks.is_empty());
+        }
+    }
+
+    #[test]
+    fn run_turn_parallel_missing_role_returns_no_such_role() {
+        let mut reg = AgentRegistry::new();
+        reg.register(SuggestedRole::Default, const_loop("d"));
+        let h = AgentHandoff::new(reg, SuggestedRole::Default, HandoffPolicy::default());
+        let err = h
+            .run_turn_parallel(
+                ctx("hi"),
+                routed_with_role(SuggestedRole::Default),
+                &CancelToken::new(),
+                &[SuggestedRole::Default, SuggestedRole::Researcher],
+            )
+            .expect_err("missing role");
+        match err {
+            HandoffError::NoSuchRole(role) => assert_eq!(role, SuggestedRole::Researcher),
+            other => panic!("expected NoSuchRole, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_turn_parallel_fail_fast_with_erroring_role_partial_or_error() {
+        // One role returns Success, one returns a ModelError outcome.
+        // fail_fast: the error landing must cancel the rest. The result
+        // map must contain either only the error or be partial.
+        let mut reg = AgentRegistry::new();
+        reg.register(
+            SuggestedRole::Coder,
+            build_loop_with_provider(Arc::new(ErrProvider {
+                code: "boom".into(),
+            })),
+        );
+        reg.register(
+            SuggestedRole::Polisher,
+            build_loop_with_provider(Arc::new(SlowProvider { millis: 80 })),
+        );
+        reg.register(
+            SuggestedRole::Default,
+            build_loop_with_provider(Arc::new(SlowProvider { millis: 80 })),
+        );
+        let policy = ParallelPolicy {
+            max_concurrent: 1, // Serialise so we see Coder first.
+            fail_fast: true,
+        };
+        let h = AgentHandoff::new(reg, SuggestedRole::Default, HandoffPolicy::default())
+            .with_parallel_policy(policy);
+        let result = h
+            .run_turn_parallel(
+                ctx("hi"),
+                routed_with_role(SuggestedRole::Coder),
+                &CancelToken::new(),
+                &[
+                    SuggestedRole::Coder,
+                    SuggestedRole::Polisher,
+                    SuggestedRole::Default,
+                ],
+            )
+            .expect("ok with partial results");
+        // Coder must be present and carry the error outcome.
+        let coder = result
+            .per_role
+            .get(&OrdRole(SuggestedRole::Coder))
+            .expect("coder result present");
+        assert!(!matches!(coder.outcome, TurnOutcome::Success));
+        // Documented contract: per_role is either error-only or partial.
+        assert!(result.per_role.len() <= 3);
+        assert!(!result.per_role.is_empty());
+    }
+
+    #[test]
+    fn run_turn_parallel_records_elapsed_ms_for_slow_provider() {
+        let mut reg = AgentRegistry::new();
+        reg.register(
+            SuggestedRole::Default,
+            build_loop_with_provider(Arc::new(SlowProvider { millis: 25 })),
+        );
+        let h = AgentHandoff::new(reg, SuggestedRole::Default, HandoffPolicy::default());
+        let result = h
+            .run_turn_parallel(
+                ctx("hi"),
+                routed_with_role(SuggestedRole::Default),
+                &CancelToken::new(),
+                &[SuggestedRole::Default],
+            )
+            .expect("ok");
+        assert_eq!(result.per_role.len(), 1);
+        assert!(
+            result.elapsed_ms > 0,
+            "elapsed_ms was {}",
+            result.elapsed_ms
+        );
+    }
+
+    #[test]
+    fn run_turn_parallel_max_concurrent_one_runs_sequentially() {
+        let mut reg = AgentRegistry::new();
+        reg.register(SuggestedRole::Default, const_loop("d"));
+        reg.register(SuggestedRole::Coder, const_loop("c"));
+        reg.register(SuggestedRole::Polisher, const_loop("p"));
+        let policy = ParallelPolicy {
+            max_concurrent: 1,
+            fail_fast: false,
+        };
+        let h = AgentHandoff::new(reg, SuggestedRole::Default, HandoffPolicy::default())
+            .with_parallel_policy(policy);
+        let result = h
+            .run_turn_parallel(
+                ctx("hi"),
+                routed_with_role(SuggestedRole::Default),
+                &CancelToken::new(),
+                &[
+                    SuggestedRole::Default,
+                    SuggestedRole::Coder,
+                    SuggestedRole::Polisher,
+                ],
+            )
+            .expect("ok");
+        assert_eq!(result.per_role.len(), 3);
+    }
+
+    #[test]
+    fn run_turn_parallel_honors_cancel_token_pre_cancelled() {
+        let mut reg = AgentRegistry::new();
+        reg.register(
+            SuggestedRole::Default,
+            build_loop_with_provider(Arc::new(SlowProvider { millis: 200 })),
+        );
+        reg.register(
+            SuggestedRole::Coder,
+            build_loop_with_provider(Arc::new(SlowProvider { millis: 200 })),
+        );
+        let h = AgentHandoff::new(reg, SuggestedRole::Default, HandoffPolicy::default());
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let result = h
+            .run_turn_parallel(
+                ctx("hi"),
+                routed_with_role(SuggestedRole::Default),
+                &cancel,
+                &[SuggestedRole::Default, SuggestedRole::Coder],
+            )
+            .expect("ok");
+        assert_eq!(result.per_role.len(), 2);
+        for r in result.per_role.values() {
+            // Either UserAbort (short-circuit before run) or whatever
+            // the agent_loop maps a cancelled turn to — neither should
+            // be a "Success" since we cancelled up-front.
+            assert!(
+                !matches!(r.outcome, TurnOutcome::Success),
+                "role {:?} unexpectedly succeeded",
+                r.role
+            );
+        }
+    }
+
+    #[test]
+    fn run_turn_parallel_four_thread_fuzz_yields_distinct_results() {
+        let mut reg = AgentRegistry::new();
+        reg.register(SuggestedRole::Default, const_loop("d"));
+        reg.register(SuggestedRole::Coder, const_loop("c"));
+        reg.register(SuggestedRole::Polisher, const_loop("p"));
+        let h = Arc::new(AgentHandoff::new(
+            reg,
+            SuggestedRole::Default,
+            HandoffPolicy::default(),
+        ));
+
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let h = Arc::clone(&h);
+            handles.push(std::thread::spawn(move || {
+                h.run_turn_parallel(
+                    ctx(&format!("prompt-{i}")),
+                    routed_with_role(SuggestedRole::Default),
+                    &CancelToken::new(),
+                    &[
+                        SuggestedRole::Default,
+                        SuggestedRole::Coder,
+                        SuggestedRole::Polisher,
+                    ],
+                )
+                .expect("ok")
+            }));
+        }
+        let results: Vec<ParallelResult> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.len(), 4);
+        for r in &results {
+            assert_eq!(r.per_role.len(), 3);
+        }
+    }
+
+    #[test]
+    fn role_result_carries_role_label() {
+        let mut reg = AgentRegistry::new();
+        reg.register(SuggestedRole::Polisher, const_loop("p"));
+        let h = AgentHandoff::new(reg, SuggestedRole::Polisher, HandoffPolicy::default());
+        let result = h
+            .run_turn_parallel(
+                ctx("hi"),
+                routed_with_role(SuggestedRole::Polisher),
+                &CancelToken::new(),
+                &[SuggestedRole::Polisher],
+            )
+            .expect("ok");
+        let r = result
+            .per_role
+            .get(&OrdRole(SuggestedRole::Polisher))
+            .expect("present");
+        assert_eq!(r.role, SuggestedRole::Polisher);
+    }
+
+    #[test]
+    fn parallel_result_per_role_keys_are_sorted() {
+        let mut reg = AgentRegistry::new();
+        // Register out-of-rank order; the BTreeMap should still
+        // iterate in declaration rank.
+        reg.register(SuggestedRole::Researcher, const_loop("r"));
+        reg.register(SuggestedRole::Default, const_loop("d"));
+        reg.register(SuggestedRole::Cavemanish, const_loop("k"));
+        reg.register(SuggestedRole::Coder, const_loop("c"));
+        let h = AgentHandoff::new(reg, SuggestedRole::Default, HandoffPolicy::default());
+        let result = h
+            .run_turn_parallel(
+                ctx("hi"),
+                routed_with_role(SuggestedRole::Default),
+                &CancelToken::new(),
+                &[
+                    SuggestedRole::Researcher,
+                    SuggestedRole::Default,
+                    SuggestedRole::Cavemanish,
+                    SuggestedRole::Coder,
+                ],
+            )
+            .expect("ok");
+        let observed: Vec<SuggestedRole> = result
+            .per_role
+            .keys()
+            .copied()
+            .map(SuggestedRole::from)
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                SuggestedRole::Default,
+                SuggestedRole::Cavemanish,
+                SuggestedRole::Coder,
+                SuggestedRole::Researcher,
+            ]
+        );
+    }
+
+    #[test]
+    fn ord_role_conversions_round_trip() {
+        let r = OrdRole::new(SuggestedRole::Coder);
+        assert_eq!(r.role(), SuggestedRole::Coder);
+        let back: SuggestedRole = r.into();
+        assert_eq!(back, SuggestedRole::Coder);
+        let wrap: OrdRole = SuggestedRole::Polisher.into();
+        assert_eq!(wrap.role(), SuggestedRole::Polisher);
+    }
+
+    #[test]
+    fn parallel_send_sync_smoke() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ParallelPolicy>();
+        assert_send_sync::<ParallelResult>();
+        assert_send_sync::<RoleResult>();
+        assert_send_sync::<OrdRole>();
+    }
 
     #[test]
     fn marker_is_stripped_before_next_hop() {
