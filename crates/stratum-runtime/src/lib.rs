@@ -132,6 +132,11 @@ pub mod sandbox_profile;
 pub mod sandbox_resolve;
 /// Secrets / keyring data shape (Phase 1 scaffold; real OS backend lands later).
 pub mod secrets;
+/// `AgentServeHandler` — first production [`serve_server::ServeHandler`].
+///
+/// Wires real [`agent_session::AgentSession`]s behind the `stratum serve`
+/// JSON-RPC socket.
+pub mod serve_handler_agent;
 /// `stratum serve` JSON-RPC 2.0 wire-protocol data shapes.
 pub mod serve_protocol;
 /// Synchronous `stratum serve` JSON-RPC dispatch server over Unix or TCP loopback.
@@ -279,6 +284,7 @@ pub use secrets::{
     redact_for_log, InMemorySecretStore, ProjectId, SecretId, SecretIdError, SecretRef,
     SecretScope, SecretStore, SecretStoreError, SecretValue,
 };
+pub use serve_handler_agent::{AgentServeHandler, ServeHandlerError};
 pub use serve_protocol::{
     parse_request as parse_serve_request, render_response as render_serve_response,
     ParseRequestError, RequestId, RunTurnParams, ServeMethod, ServeRequest, ServeResponse,
