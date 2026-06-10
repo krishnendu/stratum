@@ -29,6 +29,7 @@ provider-llama-cpp = ["stratum-runtime/provider-llama-cpp"]
 stratum-types       = { path = "../stratum-types" }
 stratum-runtime     = { path = "../stratum-runtime" }
 clap                = { workspace = true }
+clap_complete       = { workspace = true }
 serde               = { workspace = true }
 serde_json          = { workspace = true }
 tracing             = { workspace = true }
