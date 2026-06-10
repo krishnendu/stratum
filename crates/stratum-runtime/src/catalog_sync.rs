@@ -5,7 +5,7 @@
 //! catalog over HTTPS, validate it, and atomically replace the on-disk file.
 //!
 //! Per `plan/05-models-and-installer.md` §4 the catalog ships as JSON from
-//! `https://catalog.stratum.dev/<channel>.json`. This module is Phase 1
+//! `https://github.com/krishnendu/stratum/releases/latest/download/catalog-<channel>.json`. This module is Phase 1
 //! scaffold: it stabilises the wire surface for the installer + future
 //! `stratum catalog sync` CLI command. The body is bounded
 //! (`max_bytes`, default 4 MiB), `https://` is mandatory in release builds,
@@ -27,8 +27,11 @@ use crate::retry::{
     retry_with_clock_seeded, Clock, RetryDecision, RetryError, RetryPolicy, SystemClock,
 };
 
-/// Default channel sync URL — matches the documented production endpoint.
-pub const DEFAULT_CATALOG_URL: &str = "https://catalog.stratum.dev/stable.json";
+/// Default channel sync URL — points at the GitHub Releases artifact
+/// published by `.github/workflows/release.yml`. The original
+/// `catalog.stratum.dev` placeholder was never registered.
+pub const DEFAULT_CATALOG_URL: &str =
+    "https://github.com/krishnendu/stratum/releases/latest/download/catalog-stable.json";
 /// Default release channel name.
 pub const DEFAULT_CATALOG_CHANNEL: &str = "stable";
 /// Default fetch timeout (10s) — generous enough for slow networks, short
@@ -442,7 +445,10 @@ mod tests {
     #[test]
     fn config_default_matches_documented_values() {
         let c = CatalogSyncConfig::default();
-        assert_eq!(c.url, "https://catalog.stratum.dev/stable.json");
+        assert_eq!(
+            c.url,
+            "https://github.com/krishnendu/stratum/releases/latest/download/catalog-stable.json"
+        );
         assert_eq!(c.channel, "stable");
         assert_eq!(c.timeout, Duration::from_secs(10));
         assert_eq!(c.max_bytes, 4 * 1024 * 1024);

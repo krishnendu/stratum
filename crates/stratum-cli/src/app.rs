@@ -592,7 +592,7 @@ struct SelfUpdateArgs {
     #[arg(long)]
     dry_run: bool,
     /// HTTPS URL of the channel manifest. Defaults to
-    /// `https://updates.stratum.dev/<channel>.json`. Mutually exclusive with
+    /// `https://github.com/krishnendu/stratum/releases/latest/download/<channel>.json`. Mutually exclusive with
     /// `--manifest-file`.
     #[arg(long, value_name = "URL", conflicts_with = "manifest_file")]
     manifest_url: Option<String>,
@@ -903,7 +903,7 @@ struct RecommendArgs {
 ///    Used for offline runs and the integration tests.
 /// 2. `--manifest-url <URL>` — fetch over HTTPS via [`CatalogSync::fetch`].
 /// 3. Neither flag set — fetch the default
-///    `https://catalog.stratum.dev/<channel>.json`.
+///    `https://github.com/krishnendu/stratum/releases/latest/download/catalog-<channel>.json`.
 ///
 /// The two source flags are mutually exclusive.
 #[derive(Debug, Args)]
@@ -913,7 +913,7 @@ struct SyncArgs {
     #[arg(long, value_enum, default_value_t = ChannelArg::Stable)]
     channel: ChannelArg,
     /// HTTPS URL of the channel catalog JSON. Defaults to
-    /// `https://catalog.stratum.dev/<channel>.json`. Mutually exclusive
+    /// `https://github.com/krishnendu/stratum/releases/latest/download/catalog-<channel>.json`. Mutually exclusive
     /// with `--manifest-file`.
     #[arg(long, value_name = "URL", conflicts_with = "manifest_file")]
     manifest_url: Option<String>,
@@ -1865,10 +1865,13 @@ fn models_sync(
             }
         }
     } else {
-        let url = args
-            .manifest_url
-            .clone()
-            .unwrap_or_else(|| format!("https://catalog.stratum.dev/{channel_wire}.json"));
+        let url = args.manifest_url.clone().unwrap_or_else(|| {
+            // `catalog.stratum.dev` is not owned/operated. Default at the
+            // GitHub Releases artifact published by the release workflow.
+            format!(
+                "https://github.com/krishnendu/stratum/releases/latest/download/catalog-{channel_wire}.json"
+            )
+        });
         // CLI-level https-only guard. The runtime also enforces this, but
         // checking up front gives a uniform diagnostic regardless of which
         // transport step would have rejected the URL.
@@ -4147,7 +4150,15 @@ fn load_self_update_manifest(
         }),
         (None, url_opt) => {
             let url = url_opt.clone().unwrap_or_else(|| {
-                format!("https://updates.stratum.dev/{}.json", channel_arg.as_wire())
+                // Defaults point at GitHub Releases since `updates.stratum.dev`
+                // is not owned/operated. Stable channel: always the latest
+                // release's `stable.json`. Beta / nightly are not yet
+                // published — they fall back to the same `stable.json` for
+                // now; the channel string ends up in the chosen artifact.
+                format!(
+                    "https://github.com/krishnendu/stratum/releases/latest/download/{}.json",
+                    channel_arg.as_wire()
+                )
             });
             fetch_manifest_https(&url).map_err(|e| {
                 let _ = writeln!(err, "STRAT-E1001 {e}");
