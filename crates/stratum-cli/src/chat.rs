@@ -62,6 +62,7 @@ const HELP_TEXT: &str = "available commands:\n\
     /cancel — cancel the in-flight turn\n\
     /clear — clear the transcript\n\
     /agents — list registered roles (multi-agent mode only)\n\
+    /budget — show the latest turn metrics (tokens · ms · tok/s · turn id)\n\
     /help — show this message\n\
     /quit, /exit — exit the TUI";
 
@@ -599,6 +600,7 @@ impl ChatState {
                 message: HELP_TEXT.to_string(),
             },
             "agents" => self.dispatch_agents(),
+            "budget" => self.dispatch_budget(),
             "quit" | "exit" => {
                 self.quit = true;
                 PaletteOutcome::Acknowledged {
@@ -632,6 +634,32 @@ impl ChatState {
         let current = self.current_role.map_or("default", |role| role_name(role));
         PaletteOutcome::Acknowledged {
             message: format!("roles: {joined} (current: {current})"),
+        }
+    }
+
+    /// Render the `/budget` palette command output.
+    ///
+    /// Without recorded [`TurnMetrics`] (no submit yet), acknowledges with the
+    /// sentinel string `"no turn metrics yet"`. With metrics in hand, formats
+    /// the latest turn's completion tokens, summed role-step wall-clock, and
+    /// tok/s (via [`format_tokens_per_second`]) alongside the turn id.
+    fn dispatch_budget(&self) -> PaletteOutcome {
+        let Some(metrics) = self.last_metrics.as_ref() else {
+            return PaletteOutcome::Acknowledged {
+                message: "no turn metrics yet".to_string(),
+            };
+        };
+        let wall_ms = metrics
+            .role_steps
+            .iter()
+            .map(|step| step.duration_ms)
+            .fold(0_u32, u32::saturating_add);
+        let tps = format_tokens_per_second(metrics.completion_tokens, wall_ms);
+        PaletteOutcome::Acknowledged {
+            message: format!(
+                "metrics: {} tokens · {wall_ms}ms · {tps:.1} tok/s · turn id {}",
+                metrics.completion_tokens, metrics.turn_id.0,
+            ),
         }
     }
 
@@ -2051,7 +2079,40 @@ mod tests {
         assert!(message.contains("/plan"));
         assert!(message.contains("/cancel"));
         assert!(message.contains("/clear"));
+        assert!(message.contains("/budget"));
         assert!(message.contains("/quit"));
+    }
+
+    #[test]
+    fn help_text_const_advertises_budget() {
+        assert!(HELP_TEXT.contains("/budget"));
+    }
+
+    #[test]
+    fn execute_budget_with_no_metrics_returns_sentinel() {
+        let mut s = state();
+        let outcome = s.execute_palette_command("/budget");
+        let PaletteOutcome::Acknowledged { message } = outcome else {
+            panic!("expected acknowledged");
+        };
+        assert_eq!(message, "no turn metrics yet");
+    }
+
+    #[test]
+    fn execute_budget_after_submit_reports_formatted_metrics() {
+        let mut s = state();
+        s.submit_with_prompt("hello world");
+        let outcome = s.execute_palette_command("/budget");
+        let PaletteOutcome::Acknowledged { message } = outcome else {
+            panic!("expected acknowledged");
+        };
+        // Format: "metrics: <tokens> tokens · <wall_ms>ms · <tps> tok/s · turn id <N>"
+        assert!(message.starts_with("metrics: "), "got: {message}");
+        assert!(message.contains(" tokens · "), "got: {message}");
+        assert!(message.contains("ms · "), "got: {message}");
+        assert!(message.contains(" tok/s · turn id "), "got: {message}");
+        // After one submit, turn id 0 was recorded.
+        assert!(message.ends_with("turn id 0"), "got: {message}");
     }
 
     #[test]

@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "name": "polisher",
+  "cases": [
+    {
+      "id": "polisher-greeting",
+      "prompt": "Hello, world. Welcome to Stratum.",
+      "expected_substrings": ["Hello,", "world.", "Welcome", "Stratum."],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "polisher-em-dash",
+      "prompt": "This sentence — note the em dash — should round-trip cleanly.",
+      "expected_substrings": ["sentence", "—", "round-trip", "cleanly."],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "polisher-comma-clauses",
+      "prompt": "First, we plan; then, we build; finally, we ship.",
+      "expected_substrings": ["First,", "plan;", "build;", "ship."],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "polisher-rhetorical-question",
+      "prompt": "Why ship now? Because the users are waiting.",
+      "expected_substrings": ["Why", "ship", "now?", "users", "waiting."],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "polisher-quoted-aphorism",
+      "prompt": "The author wrote \"clarity beats cleverness\" and meant it.",
+      "expected_substrings": ["author", "clarity", "cleverness\"", "meant"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "polisher-paragraph-break",
+      "prompt": "First paragraph ends here.\n\nSecond paragraph begins here.",
+      "expected_substrings": ["First", "paragraph", "ends", "Second", "begins"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "polisher-numbered-list",
+      "prompt": "1. read the brief. 2. draft the doc. 3. ship it.",
+      "expected_substrings": ["1.", "2.", "3.", "brief.", "draft", "ship"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "polisher-bullets",
+      "prompt": "- one - two - three",
+      "expected_substrings": ["-", "one", "two", "three"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "polisher-contractions",
+      "prompt": "We don't ship what we can't test.",
+      "expected_substrings": ["don't", "can't", "ship", "test."],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "polisher-mixed-punct",
+      "prompt": "Ready? Yes! Let's go.",
+      "expected_substrings": ["Ready?", "Yes!", "Let's", "go."],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    }
+  ]
+}
