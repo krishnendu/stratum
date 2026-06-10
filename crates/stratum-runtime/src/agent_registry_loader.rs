@@ -53,6 +53,7 @@ use crate::agent_factory::{AgentFactory, AgentFactoryError};
 use crate::agent_handoff::AgentRegistry;
 use crate::agents::{AgentDef, AgentLoader};
 use crate::intent_router::SuggestedRole;
+use crate::provider::{EchoProvider, Provider};
 
 const TOML_SUFFIX: &str = ".toml";
 
@@ -168,6 +169,89 @@ impl From<AgentFactoryError> for AgentRegistryLoadError {
 }
 
 // ---------------------------------------------------------------------------
+// Per-role provider resolution
+// ---------------------------------------------------------------------------
+
+/// Resolves an agent's declared model slug onto a concrete [`Provider`].
+///
+/// Pluggable so different roles can be backed by different GGUFs (e.g.
+/// `cavemanish` → `qwen-0.5b`, `coder` → `phi`) without the loader
+/// knowing anything about the model catalog.
+///
+/// Implementations are typically wired against a `ModelResolver` /
+/// `ProviderCache` pair, but the loader does not assume that.
+///
+/// `model_slug` is `Some` when the TOML's `model` field is non-empty; the
+/// loader currently always supplies the value, but the `Option` shape is
+/// kept so future callers can ask for "give me the default" with `None`.
+pub trait ProviderResolver: Send + Sync {
+    /// Resolve `model_slug` to a concrete [`Provider`].
+    ///
+    /// # Errors
+    ///
+    /// * [`ProviderResolveError::UnknownSlug`] — the slug is not in this
+    ///   resolver's catalog.
+    /// * [`ProviderResolveError::Backend`] — the slug is known but the
+    ///   backing model/provider could not be constructed.
+    fn resolve(&self, model_slug: Option<&str>) -> Result<Arc<dyn Provider>, ProviderResolveError>;
+}
+
+/// Errors surfaced by [`ProviderResolver::resolve`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderResolveError {
+    /// The supplied slug does not match any model the resolver knows
+    /// about. Carries the offending slug for diagnostics.
+    UnknownSlug(String),
+    /// The slug resolved, but constructing the backing provider failed.
+    /// Carries a stringified underlying cause.
+    Backend(String),
+}
+
+impl fmt::Display for ProviderResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownSlug(s) => write!(f, "unknown model slug: {s}"),
+            Self::Backend(msg) => write!(f, "provider backend error: {msg}"),
+        }
+    }
+}
+
+impl Error for ProviderResolveError {}
+
+/// Default [`ProviderResolver`] used when the caller does not plug in a
+/// real one. Always returns the same [`EchoProvider`] regardless of slug,
+/// matching the runtime's "echo is the floor" posture.
+#[derive(Debug, Clone)]
+pub struct EchoProviderResolver {
+    default: Arc<EchoProvider>,
+}
+
+impl EchoProviderResolver {
+    /// Build a resolver backed by the supplied echo provider.
+    #[must_use]
+    pub const fn new(default: Arc<EchoProvider>) -> Self {
+        Self { default }
+    }
+}
+
+impl Default for EchoProviderResolver {
+    fn default() -> Self {
+        Self {
+            default: Arc::new(EchoProvider::new("")),
+        }
+    }
+}
+
+impl ProviderResolver for EchoProviderResolver {
+    fn resolve(
+        &self,
+        _model_slug: Option<&str>,
+    ) -> Result<Arc<dyn Provider>, ProviderResolveError> {
+        Ok(self.default.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Loader
 // ---------------------------------------------------------------------------
 
@@ -184,6 +268,7 @@ impl From<AgentFactoryError> for AgentRegistryLoadError {
 pub struct AgentRegistryLoader {
     dir: PathBuf,
     factory: Arc<AgentFactory>,
+    provider_resolver: Option<Arc<dyn ProviderResolver>>,
 }
 
 impl fmt::Debug for AgentRegistryLoader {
@@ -191,6 +276,7 @@ impl fmt::Debug for AgentRegistryLoader {
         f.debug_struct("AgentRegistryLoader")
             .field("dir", &self.dir)
             .field("factory", &self.factory)
+            .field("provider_resolver_set", &self.provider_resolver.is_some())
             .finish()
     }
 }
@@ -198,9 +284,30 @@ impl fmt::Debug for AgentRegistryLoader {
 impl AgentRegistryLoader {
     /// Build a new loader over `dir`. Both arguments are stored as-is;
     /// no I/O is performed until [`Self::load`] is called.
+    ///
+    /// When no [`ProviderResolver`] is plugged in via
+    /// [`Self::with_provider_resolver`], the loader defaults to an
+    /// [`EchoProviderResolver`] internally, preserving the prior
+    /// behaviour where every loop shared the factory's single provider.
     #[must_use]
     pub const fn new(dir: PathBuf, factory: Arc<AgentFactory>) -> Self {
-        Self { dir, factory }
+        Self {
+            dir,
+            factory,
+            provider_resolver: None,
+        }
+    }
+
+    /// Plug in a [`ProviderResolver`] so each agent's TOML `model` field
+    /// gets resolved to its own [`Provider`]. The resolved provider is
+    /// layered onto the shared factory via [`AgentFactory::with_provider`]
+    /// before [`AgentFactory::build`] is called — i.e. every loop ends up
+    /// with its own backing provider while still inheriting every other
+    /// dependency from the shared factory.
+    #[must_use]
+    pub fn with_provider_resolver(mut self, provider_resolver: Arc<dyn ProviderResolver>) -> Self {
+        self.provider_resolver = Some(provider_resolver);
+        self
     }
 
     /// The directory this loader scans.
@@ -233,6 +340,12 @@ impl AgentRegistryLoader {
             Err(ListError::Missing) => return Ok((registry, report)),
             Err(ListError::Io(e)) => return Err(AgentRegistryLoadError::Io(e)),
         };
+
+        // Default to EchoProviderResolver when no resolver was plugged
+        // in — keeps backward compat with pre-resolver callers.
+        let default_resolver: Arc<dyn ProviderResolver> = Arc::new(EchoProviderResolver::default());
+        let resolver: &Arc<dyn ProviderResolver> =
+            self.provider_resolver.as_ref().unwrap_or(&default_resolver);
 
         for path in paths {
             let def = match AgentLoader::load_file(&path) {
@@ -270,7 +383,31 @@ impl AgentRegistryLoader {
                 continue;
             }
 
-            let loop_ = match self.factory.as_ref().clone().build() {
+            // Per-role provider resolution. `AgentDef::model` always carries
+            // *some* slug (defaults to `"echo"` per `AgentDef::default`), so
+            // we pass `Some(&str)` — the resolver decides what to do with
+            // the default echo slug.
+            let slug = def.model.as_str();
+            let provider = match resolver.resolve(Some(slug)) {
+                Ok(p) => p,
+                Err(e) => {
+                    report.errors.push(LoadFailure {
+                        file: path.clone(),
+                        error: format!("provider resolve: {e}"),
+                    });
+                    continue;
+                }
+            };
+
+            // Clone the shared factory, layer the per-role provider on top,
+            // then build. Each loop ends up with its own backing provider.
+            let loop_ = match self
+                .factory
+                .as_ref()
+                .clone()
+                .with_provider(provider)
+                .build()
+            {
                 Ok(l) => l,
                 Err(e) => {
                     report.errors.push(LoadFailure {
@@ -782,5 +919,268 @@ sandbox = "passthrough"
         };
         let extracted = extract_role_string(&def, &path).unwrap();
         assert_eq!(extracted, "coder");
+    }
+
+    // -- per-role provider resolution ---------------------------------------
+
+    use crate::agent_loop::TurnContext;
+    use crate::cancel::CancelToken;
+    use crate::conversation::TurnOutcome;
+    use crate::observability::TurnId;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, UNIX_EPOCH};
+    use stratum_types::{Block, ModelId};
+
+    fn body_with_model(role: &str, model: &str) -> String {
+        format!(
+            r#"
+schema_version = 1
+description = "x"
+roles = ["{role}"]
+model = "{model}"
+tools = []
+sandbox = "passthrough"
+"#
+        )
+    }
+
+    fn ctx_for(prompt: &str) -> TurnContext {
+        TurnContext {
+            user_prompt: prompt.into(),
+            model: ModelId::from("echo"),
+            turn_id: TurnId(1),
+            started_at: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        }
+    }
+
+    /// Test resolver returning a different `EchoProvider` (with a unique
+    /// prefix) per slug. Records every slug it was asked about, so a test
+    /// can assert the loader queried the resolver exactly once per file.
+    #[derive(Debug)]
+    struct ScriptedProviderResolver {
+        by_slug: HashMap<String, Arc<EchoProvider>>,
+        seen: Mutex<Vec<Option<String>>>,
+    }
+
+    impl ScriptedProviderResolver {
+        fn new() -> Self {
+            Self {
+                by_slug: HashMap::new(),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn insert(mut self, slug: &str, prefix: &str) -> Self {
+            self.by_slug
+                .insert(slug.to_string(), Arc::new(EchoProvider::new(prefix)));
+            self
+        }
+    }
+
+    impl ProviderResolver for ScriptedProviderResolver {
+        fn resolve(
+            &self,
+            model_slug: Option<&str>,
+        ) -> Result<Arc<dyn Provider>, ProviderResolveError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(model_slug.map(str::to_string));
+            let slug =
+                model_slug.ok_or_else(|| ProviderResolveError::UnknownSlug("<none>".into()))?;
+            self.by_slug
+                .get(slug)
+                .map(|p| Arc::clone(p) as Arc<dyn Provider>)
+                .ok_or_else(|| ProviderResolveError::UnknownSlug(slug.to_string()))
+        }
+    }
+
+    fn first_text(blocks: &[Block]) -> Option<&str> {
+        blocks.iter().find_map(|b| match b {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn echo_provider_resolver_returns_same_arc_for_any_slug() {
+        let inner = Arc::new(EchoProvider::new(""));
+        let r = EchoProviderResolver::new(inner.clone());
+        let a = r.resolve(Some("anything")).unwrap();
+        let b = r.resolve(None).unwrap();
+        let c = r.resolve(Some("other")).unwrap();
+        // All three must be the same underlying allocation.
+        assert!(Arc::ptr_eq(
+            &(a.clone() as Arc<dyn Provider>),
+            &(b.clone() as Arc<dyn Provider>),
+        ));
+        assert!(Arc::ptr_eq(&b, &c));
+        // And it matches the configured default.
+        let default_dyn: Arc<dyn Provider> = inner;
+        assert!(Arc::ptr_eq(&a, &default_dyn));
+    }
+
+    #[test]
+    fn echo_provider_resolver_default_is_usable() {
+        let r = EchoProviderResolver::default();
+        let p = r.resolve(Some("whatever")).unwrap();
+        assert_eq!(p.id(), "echo");
+    }
+
+    #[test]
+    fn with_provider_resolver_honors_per_role_binding() {
+        // Two roles, two distinct providers — verify each loop returns
+        // text prefixed with its own slug's marker.
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "cavemanish",
+            &body_with_model("cavemanish", "qwen-0.5b"),
+        );
+        write(tmp.path(), "coder", &body_with_model("coder", "phi"));
+
+        let resolver = Arc::new(
+            ScriptedProviderResolver::new()
+                .insert("qwen-0.5b", "alpha:")
+                .insert("phi", "beta:"),
+        );
+        let loader = AgentRegistryLoader::new(tmp.path().to_path_buf(), factory())
+            .with_provider_resolver(resolver.clone());
+        let (registry, report) = loader.load().unwrap();
+
+        assert_eq!(registry.len(), 2);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+
+        let cancel = CancelToken::new();
+        let cavemanish_loop = registry.get(&SuggestedRole::Cavemanish).unwrap();
+        let outcome_a = cavemanish_loop.run_turn(ctx_for("ping"), &cancel);
+        assert!(matches!(outcome_a.outcome, TurnOutcome::Success));
+        assert_eq!(first_text(&outcome_a.blocks), Some("alpha:ping"));
+
+        let coder_loop = registry.get(&SuggestedRole::Coder).unwrap();
+        let outcome_b = coder_loop.run_turn(ctx_for("ping"), &cancel);
+        assert!(matches!(outcome_b.outcome, TurnOutcome::Success));
+        assert_eq!(first_text(&outcome_b.blocks), Some("beta:ping"));
+
+        // Resolver must have been asked exactly twice — once per file, in
+        // file-stem alphabetical order (cavemanish, coder).
+        let seen = resolver.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![Some("qwen-0.5b".to_string()), Some("phi".to_string()),]
+        );
+    }
+
+    #[test]
+    fn unknown_slug_lands_as_load_failure_other_files_still_register() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "cavemanish",
+            &body_with_model("cavemanish", "ghost"),
+        );
+        write(tmp.path(), "coder", &body_with_model("coder", "phi"));
+
+        let resolver = Arc::new(ScriptedProviderResolver::new().insert("phi", "beta:"));
+        let loader = AgentRegistryLoader::new(tmp.path().to_path_buf(), factory())
+            .with_provider_resolver(resolver);
+        let (registry, report) = loader.load().unwrap();
+
+        // `coder` registers, `cavemanish` becomes a LoadFailure.
+        assert_eq!(registry.len(), 1);
+        assert_eq!(report.registered, vec![SuggestedRole::Coder]);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].file.ends_with("cavemanish.toml"));
+        assert!(
+            report.errors[0].error.contains("provider resolve"),
+            "error: {}",
+            report.errors[0].error
+        );
+        assert!(report.errors[0].error.contains("ghost"));
+    }
+
+    #[test]
+    fn no_resolver_falls_back_to_echo_resolver() {
+        // Backward-compat: a loader constructed without a resolver still
+        // produces a working echo-backed loop.
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "coder", &body_for("coder"));
+        let loader = AgentRegistryLoader::new(tmp.path().to_path_buf(), factory());
+        let (registry, report) = loader.load().unwrap();
+        assert_eq!(registry.len(), 1);
+        assert!(report.errors.is_empty());
+        let cancel = CancelToken::new();
+        let loop_ = registry.get(&SuggestedRole::Coder).unwrap();
+        let outcome = loop_.run_turn(ctx_for("hi"), &cancel);
+        assert!(matches!(outcome.outcome, TurnOutcome::Success));
+    }
+
+    #[test]
+    fn factory_without_provider_plus_default_resolver_still_builds() {
+        // Pin the "default resolver always supplies an echo provider"
+        // contract: even if the shared factory has no provider set, the
+        // default EchoProviderResolver fills it in per-agent.
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "coder", &body_for("coder"));
+        let bare_factory = Arc::new(AgentFactory::new());
+        let loader = AgentRegistryLoader::new(tmp.path().to_path_buf(), bare_factory);
+        let (registry, report) = loader.load().unwrap();
+        assert_eq!(registry.len(), 1, "report: {report:?}");
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+    }
+
+    #[test]
+    fn provider_resolve_error_display_unknown_slug() {
+        let s = ProviderResolveError::UnknownSlug("phi-xyz".into()).to_string();
+        assert!(s.contains("unknown model slug"));
+        assert!(s.contains("phi-xyz"));
+    }
+
+    #[test]
+    fn provider_resolve_error_display_backend() {
+        let s = ProviderResolveError::Backend("oom".into()).to_string();
+        assert!(s.contains("backend"));
+        assert!(s.contains("oom"));
+    }
+
+    #[test]
+    fn provider_resolve_error_is_an_error_type() {
+        fn assert_error<T: Error>(_: &T) {}
+        assert_error(&ProviderResolveError::UnknownSlug("x".into()));
+        assert_error(&ProviderResolveError::Backend("y".into()));
+    }
+
+    #[test]
+    fn debug_includes_provider_resolver_flag() {
+        let tmp = TempDir::new().unwrap();
+        let loader = AgentRegistryLoader::new(tmp.path().to_path_buf(), factory());
+        let no_res = format!("{loader:?}");
+        assert!(no_res.contains("provider_resolver_set: false"));
+        let loader = loader.with_provider_resolver(Arc::new(EchoProviderResolver::default()));
+        let with_res = format!("{loader:?}");
+        assert!(with_res.contains("provider_resolver_set: true"));
+    }
+
+    #[test]
+    fn scripted_provider_resolver_returns_unknown_for_missing_slug() {
+        // Cover the None branch + missing-key branch of the test helper so
+        // the helper itself is fully exercised.
+        let r = ScriptedProviderResolver::new();
+        let err = r.resolve(None).unwrap_err();
+        match err {
+            ProviderResolveError::UnknownSlug(s) => assert_eq!(s, "<none>"),
+            ProviderResolveError::Backend(msg) => {
+                panic!("expected UnknownSlug, got Backend({msg})")
+            }
+        }
+        let err = r.resolve(Some("missing")).unwrap_err();
+        match err {
+            ProviderResolveError::UnknownSlug(s) => assert_eq!(s, "missing"),
+            ProviderResolveError::Backend(msg) => {
+                panic!("expected UnknownSlug, got Backend({msg})")
+            }
+        }
     }
 }
