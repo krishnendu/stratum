@@ -15,17 +15,36 @@
 //! are buffered for future drainage but the skeleton just discards
 //! them).
 //!
-//! ## Surface gap: why `wrap` cannot drive RPC
+//! ## Two carrier shapes
 //!
-//! [`crate::mcp::McpStdioSession`] does not expose its child's stdin
-//! handle, and its stdout reader thread consumes the pipe one line at
-//! a time into a closed `mpsc::Receiver`. Without the ability to
-//! touch `mcp.rs` directly we cannot reach those handles. So this
-//! module ships [`McpJsonRpcClient::spawn`] as the real entry point
-//! (it owns its own [`std::process::Child`] and keeps the stdio
-//! handles), and [`McpJsonRpcClient::wrap`] only retains the session
-//! for shutdown/metadata — calling RPC on a `wrap`-built client
-//! surfaces [`McpRpcError::Session`].
+//! [`McpJsonRpcClient::spawn`] owns its own [`std::process::Child`] and
+//! drives the stdio pipes directly. [`McpJsonRpcClient::wrap`] takes an
+//! existing [`McpStdioSession`] (shared via [`Arc`]) and delegates every
+//! pipe operation to that session's [`McpStdioSession::write_line`] and
+//! [`McpStdioSession::recv_line`] methods. Both carriers now drive the
+//! full RPC surface: `initialize`, `list_tools`, `call_tool`, and
+//! `shutdown` all work against either.
+//!
+//! ## Lock order
+//!
+//! The owned (`Carrier::Owned`) path uses local mutexes (`stdin`,
+//! `stdout_rx`) that are leaves with no cross-locking dependencies.
+//!
+//! The wrapped (`Carrier::Wrapped`) path piggybacks on the locks owned
+//! by [`McpStdioSession`]. Per `crate::mcp`'s module header the
+//! session's lock order is:
+//!
+//! 1. `stdout_buffer` (paired with its `Condvar`).
+//! 2. `stdin` (the `Mutex<Option<ChildStdin>>`).
+//! 3. `child` (the `Mutex<Option<Child>>`).
+//!
+//! This client never holds a wrapped-session lock while taking another;
+//! each `write_line` / `recv_line` / `shutdown` call into the session
+//! acquires exactly one of those mutexes and releases it before this
+//! module advances. So no inversion is possible from inside
+//! `McpJsonRpcClient` itself. Callers that combine this client with
+//! additional session calls in the same thread must keep that same
+//! discipline.
 
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
@@ -38,7 +57,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::mcp::{McpStdioConfig, McpStdioSession};
+use crate::mcp::{McpSessionError, McpStdioConfig, McpStdioSession};
 
 /// JSON-RPC `initialize` request parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,8 +251,8 @@ enum StdoutEvent {
     Closed,
 }
 
-/// Internal carrier: either a directly-owned child process (real RPC
-/// path) or a wrapped pre-existing session (degraded path).
+/// Internal carrier: either a directly-owned child process or a
+/// wrapped pre-existing session. Both drive the full RPC surface.
 enum Carrier {
     /// Directly-owned `Child` plus its stdio handles. Real RPC works.
     Owned {
@@ -243,10 +262,16 @@ enum Carrier {
         name: String,
         stderr_tail: Arc<Mutex<Vec<String>>>,
     },
-    /// Wrapped pre-existing session. RPC calls return [`McpRpcError::Session`];
-    /// `shutdown` defers to the session.
+    /// Wrapped pre-existing session. Delegates writes to
+    /// [`McpStdioSession::write_line`] and reads to
+    /// [`McpStdioSession::recv_line`]; `shutdown` defers to the session.
     Wrapped {
-        session: Mutex<Option<McpStdioSession>>,
+        /// Shared handle to the underlying session. Wrapped in `Arc` so
+        /// the same session can be referenced elsewhere (e.g. by the
+        /// supervisor) while this client uses it; wrapped in
+        /// `Mutex<Option<…>>` so [`McpJsonRpcClient::shutdown`] can take
+        /// ownership exactly once for the best-effort tear-down.
+        session: Mutex<Option<Arc<McpStdioSession>>>,
     },
 }
 
@@ -274,16 +299,30 @@ pub struct McpJsonRpcClient {
 impl McpJsonRpcClient {
     /// Wrap an existing session.
     ///
-    /// This is a degraded constructor: it does NOT touch the session's
-    /// stdin or stdout. The session's own stdout reader has already
-    /// consumed the first response line and the underlying handles are
-    /// private — so RPC calls on a wrapped client return
-    /// [`McpRpcError::Session`]. The only thing the client can do
-    /// against a wrap-built instance is forward
-    /// [`Self::shutdown`] to the session.
+    /// Drives full RPC against `session` by delegating writes to
+    /// [`McpStdioSession::write_line`] and reads to
+    /// [`McpStdioSession::recv_line`]. The wrapped client supports the
+    /// same RPC surface as a `spawn`-built client: `initialize`,
+    /// `list_tools`, `call_tool`, and `shutdown`.
+    ///
+    /// Internally the session is held behind an [`Arc`]; the
+    /// constructor takes the session by value (callers who already
+    /// have it shared should use [`Self::wrap_shared`]).
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
     pub fn wrap(session: McpStdioSession) -> Self {
+        Self::wrap_shared(Arc::new(session))
+    }
+
+    /// Wrap an existing session that is already shared via [`Arc`].
+    ///
+    /// Equivalent to [`Self::wrap`] but lets the caller keep its own
+    /// reference (e.g. a supervisor that still wants to query
+    /// `is_alive` / `stderr_tail`) while this client holds the handle
+    /// needed to issue RPC and tear it down.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn wrap_shared(session: Arc<McpStdioSession>) -> Self {
         Self {
             carrier: Carrier::Wrapped {
                 session: Mutex::new(Some(session)),
@@ -539,9 +578,18 @@ impl McpJsonRpcClient {
                 stdin.write_all(b"\n").map_err(McpRpcError::Io)?;
                 stdin.flush().map_err(McpRpcError::Io)
             }
-            Carrier::Wrapped { .. } => Err(McpRpcError::Session(
-                "wrapped session cannot drive RPC (stdin/stdout handles are private)".into(),
-            )),
+            Carrier::Wrapped { session } => {
+                let session_arc = session
+                    .lock()
+                    .map_err(|_| McpRpcError::Session("session mutex poisoned".into()))?
+                    .as_ref()
+                    .map(Arc::clone)
+                    .ok_or_else(|| McpRpcError::Session("session closed".into()))?;
+                session_arc.write_line(line).map_err(|err| match err {
+                    McpSessionError::WriteFailed(io) => McpRpcError::Io(io),
+                    other => McpRpcError::Session(other.to_string()),
+                })
+            }
         }
     }
 
@@ -571,9 +619,42 @@ impl McpJsonRpcClient {
                     }
                 }
             }
-            Carrier::Wrapped { .. } => Err(McpRpcError::Session(
-                "wrapped session cannot drive RPC (stdin/stdout handles are private)".into(),
-            )),
+            Carrier::Wrapped { session } => {
+                let session_arc = session
+                    .lock()
+                    .map_err(|_| McpRpcError::Session("session mutex poisoned".into()))?
+                    .as_ref()
+                    .map(Arc::clone)
+                    .ok_or_else(|| McpRpcError::Session("session closed".into()))?;
+                let now = Instant::now();
+                let remaining = deadline.saturating_duration_since(now);
+                if remaining.is_zero() {
+                    return Ok(None);
+                }
+                match session_arc.recv_line(remaining) {
+                    Ok(Some(mut line)) => {
+                        // The session preserves the trailing '\n'; strip
+                        // it so the framing matches the Owned path's
+                        // BufRead::lines() (which strips line endings).
+                        if line.ends_with('\n') {
+                            line.pop();
+                            if line.ends_with('\r') {
+                                line.pop();
+                            }
+                        }
+                        Ok(Some(line))
+                    }
+                    // The session timed out without a line — surface as
+                    // `Ok(None)` so the caller maps it to
+                    // `HandshakeTimeout` or `ResponseTimeout` depending
+                    // on the originating RPC. Mirrors the Owned path.
+                    Ok(None) => Ok(None),
+                    Err(McpSessionError::RecvLineClosed) => {
+                        Err(McpRpcError::Session("session closed".into()))
+                    }
+                    Err(other) => Err(McpRpcError::Session(other.to_string())),
+                }
+            }
         }
     }
 
@@ -827,9 +908,11 @@ mod tests {
     }
 
     #[test]
-    fn wrap_constructor_is_noop_without_session_io() {
-        // Build a session against /bin/true (or any quick exit) on unix.
-        // On non-unix we just skip the live spawn.
+    fn wrap_constructor_smoke_against_silent_session() {
+        // Build a session whose child does nothing (sleep) so the
+        // wrap-built client has no data on stdout. RPC calls should
+        // surface a timeout (not a "wrapped session cannot perform RPC"
+        // error — that degraded path is gone).
         #[cfg(unix)]
         {
             let cfg = McpStdioConfig {
@@ -839,13 +922,18 @@ mod tests {
                 workdir: None,
                 init_timeout: Duration::from_millis(100),
             };
-            let session = McpStdioSession::spawn("wrap-noop".into(), &cfg).expect("spawn");
-            let client = McpJsonRpcClient::wrap(session);
-            // Trying to drive RPC on a wrapped client returns Session.
+            let session =
+                Arc::new(McpStdioSession::spawn("wrap-smoke".into(), &cfg).expect("spawn"));
+            let client = McpJsonRpcClient::wrap_shared(session);
+            // Wrapped RPC now drives the session: a silent server times
+            // out the handshake instead of returning Session.
             let err = client
-                .list_tools(Duration::from_millis(50))
-                .expect_err("must be session error");
-            assert!(matches!(err, McpRpcError::Session(_)));
+                .initialize(&sample_params(), Duration::from_millis(80))
+                .expect_err("must time out");
+            assert!(
+                matches!(err, McpRpcError::HandshakeTimeout { .. }),
+                "expected handshake timeout, got {err:?}"
+            );
             // Shutdown is still functional (it forwards to the session).
             let _ = client.shutdown();
         }
@@ -1251,8 +1339,8 @@ done"#;
             workdir: None,
             init_timeout: Duration::from_millis(100),
         };
-        let session = McpStdioSession::spawn("wrapped-name".into(), &cfg).expect("spawn");
-        let client = McpJsonRpcClient::wrap(session);
+        let session = Arc::new(McpStdioSession::spawn("wrapped-name".into(), &cfg).expect("spawn"));
+        let client = McpJsonRpcClient::wrap_shared(session);
         assert_eq!(client.name(), "wrapped-name");
         let tail = client.stderr_tail(10);
         // Wrapped session has no stderr yet.
@@ -1270,8 +1358,8 @@ done"#;
             workdir: None,
             init_timeout: Duration::from_millis(100),
         };
-        let session = McpStdioSession::spawn("wrap-stderr".into(), &cfg).expect("spawn");
-        let client = McpJsonRpcClient::wrap(session);
+        let session = Arc::new(McpStdioSession::spawn("wrap-stderr".into(), &cfg).expect("spawn"));
+        let client = McpJsonRpcClient::wrap_shared(session);
         std::thread::sleep(Duration::from_millis(120));
         // Returns Vec<String> via the wrapped session.
         let _ = client.stderr_tail(5);
@@ -1279,12 +1367,11 @@ done"#;
     }
 
     #[test]
-    fn read_line_with_deadline_on_wrapped_returns_session() {
-        // Use a non-unix-safe path: build a wrapped client via mock.
-        // We can't easily construct a Wrapped without a real session
-        // here, so we only exercise via the unix path above; on unix
-        // build a wrapped client and call list_tools to force the
-        // wrapped read path.
+    fn read_line_with_deadline_on_wrapped_times_out_cleanly() {
+        // Silent session: recv_line on the wrapped path should surface
+        // as `Ok(None)` (timeout) — promoted by `request_inner` to
+        // HandshakeTimeout / ResponseTimeout. The legacy "Session
+        // cannot perform RPC" short-circuit is gone.
         #[cfg(unix)]
         {
             let cfg = McpStdioConfig {
@@ -1294,13 +1381,16 @@ done"#;
                 workdir: None,
                 init_timeout: Duration::from_millis(100),
             };
-            let session = McpStdioSession::spawn("wread".into(), &cfg).expect("spawn");
-            let client = McpJsonRpcClient::wrap(session);
-            // list_tools will call write_line on Wrapped which returns Session.
+            let session = Arc::new(McpStdioSession::spawn("wread".into(), &cfg).expect("spawn"));
+            let client = McpJsonRpcClient::wrap_shared(session);
+            // initialize against a silent session — should time out.
             let err = client
-                .list_tools(Duration::from_millis(50))
-                .expect_err("session err");
-            assert!(matches!(err, McpRpcError::Session(_)));
+                .initialize(&sample_params(), Duration::from_millis(60))
+                .expect_err("must time out");
+            assert!(
+                matches!(err, McpRpcError::HandshakeTimeout { .. }),
+                "expected handshake timeout, got {err:?}"
+            );
             let _ = client.shutdown();
         }
     }
@@ -1356,9 +1446,11 @@ done"#;
 
     #[cfg(unix)]
     #[test]
-    fn wrapped_carrier_read_line_returns_session_directly() {
+    fn wrapped_carrier_read_line_returns_timeout_on_silent_session() {
         // Construct a wrapped client and call the internal read path
-        // directly to hit the `Carrier::Wrapped` branch.
+        // directly to hit the `Carrier::Wrapped` branch. A silent
+        // session has no buffered lines and the deadline is short, so
+        // the call returns `Ok(None)`.
         let cfg = McpStdioConfig {
             command: PathBuf::from("/bin/sh"),
             args: vec!["-c".into(), "sleep 1".into()],
@@ -1366,13 +1458,13 @@ done"#;
             workdir: None,
             init_timeout: Duration::from_millis(100),
         };
-        let session = McpStdioSession::spawn("wrr".into(), &cfg).expect("spawn");
-        let client = McpJsonRpcClient::wrap(session);
-        let deadline = Instant::now() + Duration::from_millis(10);
-        let err = client
+        let session = Arc::new(McpStdioSession::spawn("wrr".into(), &cfg).expect("spawn"));
+        let client = McpJsonRpcClient::wrap_shared(session);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let result = client
             .read_line_with_deadline(deadline)
-            .expect_err("wrapped path must err");
-        assert!(matches!(err, McpRpcError::Session(_)));
+            .expect("wrapped read must not error on silent session");
+        assert!(result.is_none(), "expected timeout, got {result:?}");
         let _ = client.shutdown();
     }
 
@@ -1433,6 +1525,181 @@ done"#
         assert!(
             buffered.len() >= 5,
             "expected >=5 buffered, got {buffered:?}"
+        );
+        let _ = client.shutdown();
+    }
+
+    // ---- Wrapped-carrier live subprocess tests ---------------------
+    // These tests prove the wrap() carrier drives the full RPC surface
+    // through `McpStdioSession::write_line` / `recv_line`, the methods
+    // introduced in PR #89. They replace the prior tests that pinned
+    // the "wrapped session cannot perform RPC" degradation from PR #81.
+
+    #[cfg(unix)]
+    #[test]
+    fn wrap_by_value_constructor_drives_real_rpc() {
+        // The by-value `wrap` constructor is a thin shim over
+        // `wrap_shared`. Exercise it end-to-end so the shim is covered.
+        let respond = r#"echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"v","serverInfo":{"name":"f","version":"0"},"capabilities":{}}}'"#;
+        let script = format!("while IFS= read -r line; do {respond}; done");
+        let cfg = fake_server_cfg(&script, 200);
+        let session = McpStdioSession::spawn("wbv".into(), &cfg).expect("session spawn");
+        let client = McpJsonRpcClient::wrap(session);
+        let result = client
+            .initialize(&sample_params(), Duration::from_secs(2))
+            .expect("init");
+        assert_eq!(result.server_info.name, "f");
+        let _ = client.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapped_initialize_succeeds_against_fake_server() {
+        let respond = r#"echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"fake","version":"0.0.1"},"capabilities":{}}}'"#;
+        let script = format!("while IFS= read -r line; do {respond}; done");
+        let cfg = fake_server_cfg(&script, 200);
+        let session = Arc::new(McpStdioSession::spawn("wfs".into(), &cfg).expect("session spawn"));
+        let client = McpJsonRpcClient::wrap_shared(session);
+        let result = client
+            .initialize(&sample_params(), Duration::from_secs(2))
+            .expect("initialize ok");
+        assert_eq!(result.protocol_version, "2024-11-05");
+        assert_eq!(result.server_info.name, "fake");
+        assert!(client.server_capabilities().is_some());
+        let _ = client.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapped_list_tools_parses_array() {
+        let script = r#"i=0
+while IFS= read -r line; do
+  i=$((i+1))
+  case "$line" in
+    *'"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"v","serverInfo":{"name":"f","version":"0"},"capabilities":{}}}' ;;
+    *'"tools/list"'*) echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"read","description":"r","inputSchema":{"type":"object"}},{"name":"list","inputSchema":{}}]}}' ;;
+  esac
+done"#;
+        let cfg = fake_server_cfg(script, 200);
+        let session = Arc::new(McpStdioSession::spawn("wlt".into(), &cfg).expect("spawn"));
+        let client = McpJsonRpcClient::wrap_shared(session);
+        client
+            .initialize(&sample_params(), Duration::from_secs(2))
+            .expect("init");
+        let tools = client.list_tools(Duration::from_secs(2)).expect("list");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "read");
+        assert_eq!(tools[1].name, "list");
+        let _ = client.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapped_call_tool_returns_canned_response() {
+        let script = r#"while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"v","serverInfo":{"name":"f","version":"0"},"capabilities":{}}}' ;;
+    *'"tools/call"'*) echo '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}' ;;
+  esac
+done"#;
+        let cfg = fake_server_cfg(script, 200);
+        let session = Arc::new(McpStdioSession::spawn("wct".into(), &cfg).expect("spawn"));
+        let client = McpJsonRpcClient::wrap_shared(session);
+        client
+            .initialize(&sample_params(), Duration::from_secs(2))
+            .expect("init");
+        let result = client
+            .call_tool(
+                "read",
+                &serde_json::json!({"path": "/tmp/x"}),
+                Duration::from_secs(2),
+            )
+            .expect("call");
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 1);
+        assert_eq!(result.content[0].kind, "text");
+        assert_eq!(result.content[0].text.as_deref(), Some("ok"));
+        let _ = client.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapped_and_spawn_produce_equivalent_results() {
+        // Same fake server contract for both carriers; the parsed
+        // initialize results must match.
+        let respond = r#"echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"twin","version":"9"},"capabilities":{}}}'"#;
+        let script = format!("while IFS= read -r line; do {respond}; done");
+        let cfg = fake_server_cfg(&script, 200);
+
+        // spawn-built client.
+        let owned = McpJsonRpcClient::spawn("owned".into(), &cfg).expect("spawn");
+        let owned_result = owned
+            .initialize(&sample_params(), Duration::from_secs(2))
+            .expect("init owned");
+        let _ = owned.shutdown();
+
+        // wrap-built client over an independently spawned session.
+        let session = Arc::new(McpStdioSession::spawn("wrap".into(), &cfg).expect("spawn"));
+        let wrapped = McpJsonRpcClient::wrap_shared(session);
+        let wrapped_result = wrapped
+            .initialize(&sample_params(), Duration::from_secs(2))
+            .expect("init wrap");
+        let _ = wrapped.shutdown();
+
+        assert_eq!(owned_result, wrapped_result);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapped_rpc_after_session_shutdown_surfaces_session_error() {
+        let cfg = McpStdioConfig {
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "sleep 1".into()],
+            env: Btm::new(),
+            workdir: None,
+            init_timeout: Duration::from_millis(100),
+        };
+        let session = Arc::new(McpStdioSession::spawn("shut".into(), &cfg).expect("session spawn"));
+        // Tear the session down before the client tries to use it.
+        let _ = session.shutdown();
+        let client = McpJsonRpcClient::wrap_shared(session);
+        let err = client
+            .list_tools(Duration::from_millis(50))
+            .expect_err("post-shutdown RPC must fail");
+        assert!(
+            matches!(err, McpRpcError::Session(_) | McpRpcError::Io(_)),
+            "expected session/io error, got {err:?}"
+        );
+        let _ = client.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapped_notifications_are_buffered() {
+        // Server emits a notification frame ahead of the response, just
+        // like the owned-path equivalent. The wrap carrier must buffer
+        // it identically.
+        let script = r#"while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*)
+      echo '{"jsonrpc":"2.0","method":"log","params":{"msg":"hi"}}'
+      echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"v","serverInfo":{"name":"f","version":"0"},"capabilities":{}}}'
+      ;;
+  esac
+done"#;
+        let cfg = fake_server_cfg(script, 200);
+        let session =
+            Arc::new(McpStdioSession::spawn("wnotify".into(), &cfg).expect("session spawn"));
+        let client = McpJsonRpcClient::wrap_shared(session);
+        client
+            .initialize(&sample_params(), Duration::from_secs(2))
+            .expect("init");
+        let buffered = client.buffered_notifications();
+        assert!(
+            buffered
+                .iter()
+                .any(|v| v.get("method").and_then(|m| m.as_str()) == Some("log")),
+            "expected log notification buffered, got {buffered:?}"
         );
         let _ = client.shutdown();
     }
