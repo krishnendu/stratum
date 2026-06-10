@@ -11,14 +11,15 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use stratum_runtime::{
     build_payload as build_telemetry_payload, evaluate as evaluate_update,
-    payload_is_allowlisted as telemetry_payload_is_allowlisted, AgentFactory, AnonInstallId,
-    ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CpuArchTag, EchoProvider,
-    EvalReport, EvalRunner, EvalSuite, Event, EventRecord, GenerateRequest, GpuBackend,
-    HardwareProbe, InstalledToml, LoadedModel, ManifestError, MemoryGate, ModelCatalog, ModelEntry,
-    ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag, Paths, PlatformTag, Provider,
-    ReleaseChannel, ReleaseVersion, SandboxReport, SessionId, TelemetryConfig, TelemetryEventKind,
-    TelemetryPayload, Tier, Transcript, TranscriptBlock, TranscriptStore, TranscriptTurn,
-    UpdateChannel, UpdateDecision, UpdateManifest, DEFAULT_MARGIN_MIB,
+    payload_is_allowlisted as telemetry_payload_is_allowlisted, AgentFactory, AgentServeHandler,
+    AnonInstallId, ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CpuArchTag,
+    EchoProvider, EvalReport, EvalRunner, EvalSuite, Event, EventEmitter, EventRecord,
+    GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadedModel, ManifestError,
+    MemoryEventSink, MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug, ModelTask,
+    ModelTier, OsTag, Paths, PlatformTag, Provider, ReleaseChannel, ReleaseVersion, SandboxReport,
+    ServeBind, ServeConfig, ServeHandler, ServeServer, SessionId, TelemetryConfig,
+    TelemetryEventKind, TelemetryPayload, Tier, Transcript, TranscriptBlock, TranscriptStore,
+    TranscriptTurn, UpdateChannel, UpdateDecision, UpdateManifest, DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::format_description::well_known::Rfc3339;
@@ -76,6 +77,52 @@ enum Command {
     /// Run prompt-based eval suites against an [`AgentLoop`].
     #[command(subcommand)]
     Eval(EvalCommand),
+    /// Start the JSON-RPC daemon (`stratum serve`) on a Unix socket or
+    /// loopback TCP port.
+    Serve(ServeArgs),
+}
+
+/// Arguments for `stratum serve`.
+///
+/// The daemon binds either a Unix-domain socket (`--unix-socket <PATH>`) or
+/// a loopback TCP port (`--tcp-port <N>`, defaulting to `0` for a
+/// kernel-assigned ephemeral port when neither flag is set). The two
+/// transports are mutually exclusive — passing both is rejected by clap
+/// with exit 64.
+///
+/// `--stop-after-ms` is primarily a test affordance: when set, a watchdog
+/// thread stops the server after the specified wall-clock window. When
+/// unset, the daemon polls an `AtomicBool` shutdown flag on a 100 ms
+/// cadence and exits cleanly on the next tick after the flag flips
+/// (currently only via internal handler-driven shutdown; signal-driven
+/// `Ctrl+C` plumbing lands once the broader runtime signal-policy story
+/// is settled — pinned to avoid pulling in the `ctrlc` crate).
+#[derive(Debug, Args)]
+struct ServeArgs {
+    /// Filesystem path of a Unix-domain socket to bind. Mutually
+    /// exclusive with `--tcp-port`.
+    #[arg(long, value_name = "PATH", conflicts_with = "tcp_port")]
+    unix_socket: Option<PathBuf>,
+    /// Loopback TCP port to bind. Mutually exclusive with
+    /// `--unix-socket`. When neither flag is passed the daemon defaults
+    /// to TCP loopback with port `0` (kernel-assigned ephemeral).
+    #[arg(long, value_name = "N", conflicts_with = "unix_socket")]
+    tcp_port: Option<u16>,
+    /// Maximum concurrent connections accepted by the server.
+    #[arg(long, value_name = "N", default_value_t = 16)]
+    max_connections: usize,
+    /// Per-request socket read/write timeout, in milliseconds.
+    #[arg(long, value_name = "N", default_value_t = 30_000)]
+    request_timeout_ms: u64,
+    /// Stop the daemon after the specified wall-clock window. Useful
+    /// for integration tests that exercise the bind/accept loop and
+    /// then need a deterministic shutdown.
+    #[arg(long, value_name = "N")]
+    stop_after_ms: Option<u64>,
+    /// Emit a single JSON object on startup describing the bound
+    /// address. Without this flag, a prose line is printed instead.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Subcommands under `stratum eval`.
@@ -786,6 +833,7 @@ where
             sessions_delete(&paths, &del_args, out, err)
         }
         Some(Command::Eval(EvalCommand::Run(eval_args))) => eval_run(&eval_args, &paths, out, err),
+        Some(Command::Serve(serve_args)) => serve(&serve_args, &paths, out, err),
     }
 }
 
@@ -1816,6 +1864,131 @@ where
         || fallback().map_err(|e| format!("{e}")),
         |root| Ok(Paths::under(root)),
     )
+}
+
+/// Implements `stratum serve`. Build the `AgentServeHandler` against an
+/// `EchoProvider`-backed [`AgentFactory`] plus a [`TranscriptStore`] rooted
+/// at `<state>/transcripts`, wrap it in a [`ServeServer`], start the
+/// acceptor, and block until either `--stop-after-ms` elapses or the
+/// handler's internal shutdown flag flips (via a `stop` JSON-RPC method).
+///
+/// The function intentionally avoids the `ctrlc` crate — graceful
+/// signal-driven shutdown is deferred to a follow-up that settles the
+/// broader runtime signal policy. The current shutdown surface is the
+/// `--stop-after-ms` watchdog plus the in-protocol `stop` method, which is
+/// enough to exercise the wiring in tests.
+fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    if let Err(code) = ensure_state_dir(paths, err) {
+        return code;
+    }
+
+    // Resolve transport. Clap's `conflicts_with` already rejects "both",
+    // but we still need to materialise the chosen `ServeBind`.
+    let bind = args.unix_socket.as_ref().map_or_else(
+        || ServeBind::TcpLoopback {
+            port: args.tcp_port.unwrap_or(0),
+        },
+        |path| ServeBind::UnixSocket { path: path.clone() },
+    );
+
+    let transcripts_dir = paths.state.join("transcripts");
+    if let Err(e) = std::fs::create_dir_all(&transcripts_dir) {
+        let _ = writeln!(
+            err,
+            "STRAT-E1001 cannot create {}: {e}",
+            transcripts_dir.display()
+        );
+        return ExitCode::from(1);
+    }
+    let store = match TranscriptStore::open(transcripts_dir.clone()) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "STRAT-E1001 cannot open transcript store at {}: {e}",
+                transcripts_dir.display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    let factory = Arc::new(AgentFactory::new().with_provider(Arc::new(EchoProvider::new(""))));
+    let events = Arc::new(EventEmitter::new(Arc::new(MemoryEventSink::new())));
+
+    let handler = Arc::new(AgentServeHandler::new(
+        factory,
+        store,
+        events,
+        env!("CARGO_PKG_VERSION").to_string(),
+    ));
+    handler.mark_ready();
+
+    let cfg = ServeConfig {
+        bind,
+        max_connections: args.max_connections,
+        request_timeout: Duration::from_millis(args.request_timeout_ms),
+    };
+    let handler_for_server: Arc<dyn ServeHandler> = handler.clone();
+    let server = Arc::new(ServeServer::new(cfg, handler_for_server));
+    let handle = match server.start() {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 serve start failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let bound = handle.bound_address().to_string();
+    if args.json {
+        #[allow(
+            clippy::expect_used,
+            reason = "ServeStartupReport serialization is infallible (primitive fields)"
+        )]
+        let rendered = serde_json::to_string(&ServeStartupReport { bound: &bound })
+            .expect("ServeStartupReport serialization is infallible");
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+    } else if writeln!(out, "stratum serve: listening on {bound}").is_err() {
+        return ExitCode::from(74);
+    }
+    // Flush so callers blocking on stdout (e.g. integration tests parsing
+    // the bound address) see the startup line before we start polling.
+    let _ = out.flush();
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    if let Some(ms) = args.stop_after_ms {
+        let flag = shutdown_flag.clone();
+        let _ = thread::Builder::new()
+            .name("stratum-serve-stopwatch".to_string())
+            .spawn(move || {
+                thread::sleep(Duration::from_millis(ms));
+                flag.store(true, Ordering::Relaxed);
+            });
+    }
+
+    // Poll for either the stopwatch fire or the handler's own
+    // shutdown_requested flag (set by the in-protocol `stop` method). Tick
+    // at 100ms to keep test latency low without burning CPU.
+    while !shutdown_flag.load(Ordering::Relaxed) && !handler.is_shutdown_requested() {
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    if let Err(_panic) = handle.stop() {
+        let _ = writeln!(err, "STRAT-E1001 serve acceptor thread panicked");
+        return ExitCode::from(70);
+    }
+    ExitCode::SUCCESS
+}
+
+/// JSON payload emitted by `stratum serve --json` at startup.
+#[derive(Debug, Serialize)]
+struct ServeStartupReport<'a> {
+    bound: &'a str,
 }
 
 fn print_greeting(paths: &Paths, out: &mut dyn Write) -> ExitCode {
