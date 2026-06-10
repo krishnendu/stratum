@@ -10,7 +10,7 @@ Stratum tags `v<major>.<minor>.<patch>` produce a GitHub Release with prebuilt b
 4. Tag: `git tag v0.1.0`.
 5. Push: `git push origin main v0.1.0`.
 6. The `release` workflow fires automatically:
-   - Builds `stratum` for `x86_64-unknown-linux-gnu` + `aarch64-apple-darwin`.
+   - Builds `stratum` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, and `x86_64-apple-darwin`.
    - Computes per-binary sha256.
    - Generates `stable.json` matching `stratum_runtime::UpdateManifest` shape.
    - Uploads everything to the `v0.1.0` GitHub Release.
@@ -21,14 +21,20 @@ Stratum tags `v<major>.<minor>.<patch>` produce a GitHub Release with prebuilt b
 
 ## Architecture matrix
 
-| Target                      | OS            | Notes                                |
-|---|---|---|
-| `x86_64-unknown-linux-gnu`   | ubuntu-latest | CPU-only; sandbox via `bwrap`        |
-| `aarch64-apple-darwin`       | macos-latest  | Metal supported via on-demand build  |
+| Target                        | OS            | Builder        | Notes                                              |
+|---|---|---|---|
+| `x86_64-unknown-linux-gnu`     | ubuntu-latest | `cargo`        | CPU-only; sandbox via `bwrap`                      |
+| `aarch64-unknown-linux-gnu`    | ubuntu-latest | `cargo-zigbuild` | Cross-compiled via zig; CPU-only                 |
+| `aarch64-apple-darwin`         | macos-latest  | `cargo`        | Apple Silicon; Metal supported via on-demand build |
+| `x86_64-apple-darwin`          | macos-13      | `cargo`        | Intel Mac (macos-13 free tier runner)              |
 
-## Windows + Linux ARM64
+## Windows
 
-Windows + `aarch64-unknown-linux-gnu` are deferred to a follow-up release. macOS x86_64 is also deferred (Apple Silicon runners are free; Intel macs are EOL).
+Windows is deferred to a follow-up release (no MSVC toolchain wiring yet, no signing pipeline). Tracking issue to be filed alongside the first `aarch64-pc-windows-msvc` request.
+
+## Linux packaging (deb / rpm)
+
+Native `.deb` and `.rpm` packages are not yet produced by CI. The `dist/deb/` and `dist/rpm/` directories scaffold the configuration (READMEs + `Cargo.toml` snippets) so a maintainer can run `cargo deb` or `cargo generate-rpm` manually against the published `x86_64-unknown-linux-gnu` build. Wiring these into the matrix is tracked as a follow-up.
 
 ## Update manifest
 
