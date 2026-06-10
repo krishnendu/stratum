@@ -1,57 +1,70 @@
 # Contributing to Stratum
 
-> Status: pre-alpha. Public contribution flow is being shaken down. PRs welcome; expect strict gates.
+## Workflow
 
-## Quick start
+1. Branch off `main`: `git checkout -B feat/<slug> origin/main`.
+2. Open a PR.
+3. Wait for 5 CI checks: `fmt`, `clippy` (macOS + Linux), `test` (macOS + Linux).
+4. Local review by a maintainer.
+5. Squash merge via `gh pr merge <N> --squash --auto --delete-branch`.
 
-```bash
-git clone https://github.com/krishnendu/stratum
-cd stratum
-cargo build --workspace
-cargo test --workspace
-```
+## Branch protection
 
-The toolchain is pinned via `rust-toolchain.toml` (currently 1.90.0). `rustup` picks it up automatically.
+`main` is protected: no force push, linear history, PR required, 5 status checks required. **Never use `gh pr merge --admin`** — every merge is gated by local review. Auto-merge via `--auto --squash --delete-branch` is fine and preferred.
 
-## Verification gates
+## Commits
 
-Every PR must pass the 12 gates from `docs/verification-gates.md` (mirrored from the private design corpus). CI runs them; locally you can pre-flight with:
+- [Conventional Commits](https://www.conventionalcommits.org/) subject line, e.g. `feat(runtime): add http install resume`.
+- DCO sign-off required: `git commit --signoff`.
+- **No AI co-author trailers.** Human authors only.
+
+## Pre-flight checks
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo llvm-cov --workspace --all-features --fail-under-lines 98
-cargo deny check
+cargo llvm-cov --workspace --exclude xtask --fail-under-lines 95
+cargo run -p xtask -- check-error-codes
 ```
 
-Coverage exclusions are listed in `docs/coverage-exclusions.md` and must be appended in the same PR that introduces them.
+## Lints
 
-## Branch & PR flow
+Workspace-wide: `clippy::pedantic`, `clippy::nursery`, `clippy::cargo`. `unwrap_used`, `expect_used`, and `panic` are denied outside `#[cfg(test)]`. Lint config lives in `clippy.toml` and `Cargo.toml` `[workspace.lints]`.
 
-- `main` is protected. Direct pushes are rejected.
-- Branch naming: `feat/<short-slug>`, `fix/<short-slug>`, `docs/<short-slug>`, `chore/<short-slug>`.
-- Conventional Commits subject line, e.g. `feat(runtime): add HTTP install resume`.
-- Squash-merge is the default. Linear history on `main`.
-- Every commit signed off (DCO): `git commit --signoff`.
-- **No AI co-author trailers.** Stratum commits show the human author only.
+## Coverage
 
-## PR description template
+Gate: `cargo llvm-cov --workspace --exclude xtask --fail-under-lines 95`. Exclusions tracked in `docs/coverage-exclusions.md` — append in the same PR that adds them.
 
-The repo ships a PR template under `.github/PULL_REQUEST_TEMPLATE.md` with the verification checklist. Fill it in.
+## xtask error-code validator
 
-## Issues
+`cargo run -p xtask -- check-error-codes` enforces that every `StratumError` variant has a stable error code and a row in the error-code registry. Must pass on every PR.
 
-Use the structured templates at `.github/ISSUE_TEMPLATE/`. Bug reports require a reproducer; feature requests must motivate the change against the project goals (8-16 GB laptop class, local agentic outcomes).
+## Test conventions
 
-## Security disclosure
+- Unit tests live in-module under `#[cfg(test)] mod tests { … }`.
+- Integration tests live in `crates/<name>/tests/`.
+- Prefer `stratum-testkit` for shared fixtures (fake providers, fake clocks, temp dirs).
 
-Vulnerabilities go private. See `SECURITY.md`.
+## Authoring tools
 
-## Code of Conduct
+- Local tools: implement the dispatch path in [`crates/stratum-runtime/src/tool_invocation.rs`](crates/stratum-runtime/src/tool_invocation.rs) and register a dispatcher in [`crates/stratum-runtime/src/tool_dispatchers.rs`](crates/stratum-runtime/src/tool_dispatchers.rs).
+- MCP-backed tools: see [`crates/stratum-runtime/src/mcp_jsonrpc.rs`](crates/stratum-runtime/src/mcp_jsonrpc.rs) (stdio JSON-RPC client) and [`crates/stratum-runtime/src/tool_dispatcher_mcp.rs`](crates/stratum-runtime/src/tool_dispatcher_mcp.rs) (bridge to the dispatcher trait).
 
-This project follows the Contributor Covenant v2.1. See `CODE_OF_CONDUCT.md`. Reports to `conduct@stratum.dev` (alias pending domain registration; until then, email the maintainer privately via GitHub).
+## Codebase tour
+
+Major modules under `crates/stratum-runtime/src/`:
+
+- Agent runtime: `agent_loop`, `agent_factory`, `agent_session`, `agent_handoff`, `agents`, `agent_registry_loader`, `conversation`, `intent_router`, `plan_mode`.
+- Providers + inference: `provider`, `llama_provider`, `provider_cache`, `prompt_template`, `prompt_cache`, `embedder`.
+- Tools + sandbox: `tool_invocation`, `tool_dispatchers`, `tool_dispatcher_mcp`, `mcp`, `mcp_jsonrpc`, `sandbox`, `sandbox_profile`, `sandbox_resolve`, `permission_prompt`.
+- Models + install: `model_catalog`, `model_resolver`, `catalog_sync`, `install`, `download`, `registry`, `probe`, `tier`, `gate`.
+- Resilience: `retry`, `rate_limit`, `budget`, `budget_meter`, `cancel`, `cancel_cascade`.
+- Observability: `observability`, `event_log`, `logging`, `telemetry`, `crash_report`, `panic`.
+- RAG + eval: `rag`, `rag_index_builder`, `rag_query`, `eval_runner`, `claude_cli_judge`.
+- Daemon: `serve_protocol`, `serve_server`, `serve_handler_agent`, `serve_middleware`.
+- Misc: `secrets`, `i18n`, `paths`, `prompts`, `injection`.
 
 ## License
 
-By contributing you agree your work is dual-licensed under Apache-2.0 OR MIT (the project license).
+By contributing you agree your work is dual-licensed under Apache-2.0 OR MIT.
