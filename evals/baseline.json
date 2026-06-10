@@ -71,6 +71,76 @@
       "expected_substrings": ["pass", "without"],
       "forbidden_substrings": ["fail", "error", "panic"],
       "max_blocks": 1
+    },
+    {
+      "id": "echo-unicode-tail",
+      "prompt": "ready to ship ✨",
+      "expected_substrings": ["ready", "ship", "✨"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-long-single-line",
+      "prompt": "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango",
+      "expected_substrings": ["alpha", "kilo", "tango"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-empty-list-style",
+      "prompt": "[]",
+      "expected_substrings": ["[]"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-numbers-mixed",
+      "prompt": "0 1 2 3 5 8 13 21 34",
+      "expected_substrings": ["0", "13", "34"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-mixed-case",
+      "prompt": "HELLO hello HeLLo",
+      "expected_substrings": ["HELLO", "hello", "HeLLo"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-leading-trailing-space",
+      "prompt": "   trimmed   ",
+      "expected_substrings": ["trimmed"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-rfc3339-stamp",
+      "prompt": "2026-06-11T00:00:00Z",
+      "expected_substrings": ["2026-06-11T00:00:00Z"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-tabs-and-newlines",
+      "prompt": "left\tright\ntop\tbottom",
+      "expected_substrings": ["left", "right", "top", "bottom"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-punctuation-cluster",
+      "prompt": "yes!!! no??? maybe...",
+      "expected_substrings": ["yes!!!", "no???", "maybe..."],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-mixed-script",
+      "prompt": "english 日本語 русский",
+      "expected_substrings": ["english", "日本語", "русский"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
     }
   ]
 }

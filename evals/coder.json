@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "name": "coder",
+  "cases": [
+    {
+      "id": "coder-fn-keyword",
+      "prompt": "fn add(a: i32, b: i32) -> i32 { a + b }",
+      "expected_substrings": ["fn", "->", "i32", "{", "}"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "coder-struct-keyword",
+      "prompt": "struct Point { x: f32, y: f32 }",
+      "expected_substrings": ["struct", "Point", "x:", "f32,", "}"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "coder-impl-block",
+      "prompt": "impl Display for Point { fn fmt(&self, f: &mut Formatter) -> Result {} }",
+      "expected_substrings": ["impl", "Display", "for", "fn", "->"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "coder-return-stmt",
+      "prompt": "if cond { return Ok(()); } else { return Err(e); }",
+      "expected_substrings": ["return", "Ok(());", "Err(e);"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "coder-closure-arrow",
+      "prompt": "let f = |x| => x + 1;",
+      "expected_substrings": ["let", "=>", "|x|"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "coder-fat-arrow-match",
+      "prompt": "match v { Some(x) => x , None => 0 }",
+      "expected_substrings": ["match", "Some(x)", "=>", "None"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "coder-thin-arrow-fn",
+      "prompt": "fn make() -> Box<dyn Trait> { todo!() }",
+      "expected_substrings": ["fn", "->", "Box<dyn", "Trait>", "todo!()"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "coder-semicolons",
+      "prompt": "let x = 1; let y = 2; let z = x + y;",
+      "expected_substrings": ["let", "1;", "2;", "y;"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "coder-braces-nested",
+      "prompt": "{ { { } } }",
+      "expected_substrings": ["{", "}"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "coder-use-import",
+      "prompt": "use std::collections::HashMap;",
+      "expected_substrings": ["use", "std::collections::HashMap;"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    }
+  ]
+}

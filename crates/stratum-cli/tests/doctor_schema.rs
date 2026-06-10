@@ -270,6 +270,54 @@ fn strat_error_code_matcher_rejects_garbage() {
 }
 
 #[test]
+fn doctor_strict_json_exits_zero_on_real_report() {
+    // The runtime `DoctorReport` is always shape-valid; `--strict --json`
+    // must therefore exit 0 against a freshly-rolled storage root.
+    let tmp = TempDir::new().expect("tempdir");
+    let output = bin()
+        .args([
+            "--storage-root",
+            tmp.path().to_str().expect("temp path utf-8"),
+            "--json",
+            "doctor",
+            "--strict",
+        ])
+        .output()
+        .expect("spawn stratum");
+    assert!(
+        output.status.success(),
+        "expected exit 0, got: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json");
+    assert_eq!(v["schema_version"], 1);
+}
+
+#[test]
+fn doctor_strict_without_json_is_silent_noop() {
+    // `--strict` only activates under `--json`. Without `--json` the flag
+    // is accepted but does not affect output or exit code.
+    let tmp = TempDir::new().expect("tempdir");
+    let output = bin()
+        .args([
+            "--storage-root",
+            tmp.path().to_str().expect("temp path utf-8"),
+            "doctor",
+            "--strict",
+        ])
+        .output()
+        .expect("spawn stratum");
+    assert!(
+        output.status.success(),
+        "expected exit 0, got: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    assert!(stdout.contains("stratum "), "got: {stdout}");
+}
+
+#[test]
 fn doctor_json_after_init_drops_install_issue() {
     // After `stratum init` writes `installed.toml`, the
     // "no installed.toml" info-level issue disappears. Confirms the

@@ -545,6 +545,13 @@ struct DoctorArgs {
     /// the once-per-UTC-day liveness beacon.
     #[arg(long, value_enum, default_value_t = TelemetryEventArg::DailyActive)]
     telemetry_event: TelemetryEventArg,
+    /// Validate the JSON report against the embedded
+    /// `docs/schemas/doctor.v1.json` shape before emitting. Only effective
+    /// when combined with the global `--json` flag; ignored otherwise. On
+    /// validation failure the command exits 1 with STRAT-E1001 naming the
+    /// failing field path.
+    #[arg(long)]
+    strict: bool,
 }
 
 /// Clap-friendly mirror of [`TelemetryEventKind`].
@@ -3424,8 +3431,20 @@ fn doctor(
             clippy::expect_used,
             reason = "DoctorReport serialization is infallible (primitives only)"
         )]
-        let rendered = serde_json::to_string_pretty(&report)
-            .expect("DoctorReport serialization is infallible");
+        let value =
+            serde_json::to_value(&report).expect("DoctorReport serialization is infallible");
+        if args.strict {
+            if let Err(failure) = validate_doctor_report_strict(&value) {
+                let _ = writeln!(err, "STRAT-E1001 doctor --strict: {failure}");
+                return ExitCode::from(1);
+            }
+        }
+        #[allow(
+            clippy::expect_used,
+            reason = "DoctorReport serialization is infallible (primitives only)"
+        )]
+        let rendered =
+            serde_json::to_string_pretty(&value).expect("DoctorReport serialization is infallible");
         if writeln!(out, "{rendered}").is_err() {
             return ExitCode::from(74);
         }
@@ -3464,6 +3483,115 @@ fn doctor(
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Embedded copy of `docs/schemas/doctor.v1.json`. Used by the
+/// `doctor --strict --json` validator below so the binary is self-contained:
+/// no schema file lookup at runtime, no extra dep on a full JSON-schema
+/// validator. The validator only walks `required` + enum constraints — that
+/// matches the integration test in `tests/doctor_schema.rs` and the contract
+/// in `plan/29-error-taxonomy-and-logging.md` §7-8.
+const DOCTOR_V1_SCHEMA: &str = include_str!("../../../docs/schemas/doctor.v1.json");
+
+/// Validate a `DoctorReport`-shaped JSON value against the embedded v1
+/// schema. Returns `Ok(())` when every top-level `required` key is present
+/// and every documented enum field carries an in-set value. On failure,
+/// returns the dotted path of the offending field plus a short reason. The
+/// caller wraps the message with the STRAT-E1001 sentinel.
+///
+/// Scope (mirrors the doc'd schema contract):
+///
+/// * Top-level `required`: `schema_version`, `stratum_version`, `tier`,
+///   `probe`, `gpu_accel`, `sandbox`, `installed`, `issues`.
+/// * Enum fields: `tier`, `gpu_accel`, `sandbox.available[]`,
+///   `issues[].level`.
+///
+/// We intentionally do **not** validate the `probe` subschema or pattern
+/// fields (`code: ^STRAT-E\d{4}$`) here — the integration test
+/// `tests/doctor_schema.rs` covers them on the real wire output, and a
+/// runtime regex would pull in a dep that the workspace does not yet need.
+fn validate_doctor_report_strict(value: &serde_json::Value) -> Result<(), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "<root>: expected JSON object".to_string())?;
+
+    // Walk the embedded schema's `required` array. Parsing the schema once
+    // per invocation is cheap (sub-millisecond, 134-line static string) and
+    // keeps the validator honest: if the schema's required-list grows, this
+    // check picks it up without code changes.
+    let schema: serde_json::Value = serde_json::from_str(DOCTOR_V1_SCHEMA)
+        .map_err(|e| format!("<embedded schema>: parse failed: {e}"))?;
+    let required = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "<embedded schema>.required: missing or wrong type".to_string())?;
+    for field in required {
+        let name = field
+            .as_str()
+            .ok_or_else(|| "<embedded schema>.required[]: non-string entry".to_string())?;
+        if !obj.contains_key(name) {
+            return Err(format!("{name}: missing required field"));
+        }
+    }
+
+    // Top-level enum: tier ∈ {low, medium, high}.
+    let tier = obj
+        .get("tier")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "tier: expected string".to_string())?;
+    if !matches!(tier, "low" | "medium" | "high") {
+        return Err(format!("tier: value `{tier}` not in {{low, medium, high}}"));
+    }
+
+    // Top-level enum: gpu_accel ∈ {metal, cuda, vulkan, cpu}.
+    let gpu_accel = obj
+        .get("gpu_accel")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "gpu_accel: expected string".to_string())?;
+    if !matches!(gpu_accel, "metal" | "cuda" | "vulkan" | "cpu") {
+        return Err(format!(
+            "gpu_accel: value `{gpu_accel}` not in {{metal, cuda, vulkan, cpu}}"
+        ));
+    }
+
+    // sandbox.available[] ∈ {bwrap, sandbox_exec, windows_job, passthrough}.
+    let sandbox = obj
+        .get("sandbox")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| "sandbox: expected object".to_string())?;
+    let available = sandbox
+        .get("available")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "sandbox.available: expected array".to_string())?;
+    for (idx, entry) in available.iter().enumerate() {
+        let s = entry
+            .as_str()
+            .ok_or_else(|| format!("sandbox.available[{idx}]: expected string"))?;
+        if !matches!(s, "bwrap" | "sandbox_exec" | "windows_job" | "passthrough") {
+            return Err(format!(
+                "sandbox.available[{idx}]: value `{s}` not in {{bwrap, sandbox_exec, windows_job, passthrough}}"
+            ));
+        }
+    }
+
+    // issues[].level ∈ {info, warn, error}.
+    let issues = obj
+        .get("issues")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "issues: expected array".to_string())?;
+    for (idx, issue) in issues.iter().enumerate() {
+        let level = issue
+            .get("level")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("issues[{idx}].level: expected string"))?;
+        if !matches!(level, "info" | "warn" | "error") {
+            return Err(format!(
+                "issues[{idx}].level: value `{level}` not in {{info, warn, error}}"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Minimal on-disk shape of `<state>/telemetry.json` — the brief documents
@@ -5343,6 +5471,127 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["installed"], true);
         assert!(v["probe"]["ram_total_mib"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn doctor_json_strict_passes_on_real_report() {
+        // No injected fault → strict mode must accept the real report and
+        // exit 0 (success). Echoes the integration test in
+        // `tests/doctor_schema.rs` but as a unit test on the in-process path.
+        let tmp = TempDir::new().unwrap();
+        let (code, out, _err) = drive_under(&["--json", "doctor", "--strict"], tmp.path());
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    }
+
+    #[test]
+    fn doctor_json_without_strict_skips_validation() {
+        // Without --strict the validator is bypassed entirely. We don't
+        // have an easy way to inject a bad report through the CLI surface
+        // (the real probe is always valid), so this test pins behaviour by
+        // confirming a normal non-strict run still succeeds — the bad-value
+        // path is covered by the unit tests below.
+        let tmp = TempDir::new().unwrap();
+        let (code, _out, _err) = drive_under(&["--json", "doctor"], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    }
+
+    #[test]
+    fn doctor_strict_accepts_well_formed_report() {
+        let v = serde_json::json!({
+            "schema_version": 1,
+            "stratum_version": "0.1.0",
+            "tier": "high",
+            "probe": {},
+            "gpu_accel": "metal",
+            "sandbox": { "available": ["passthrough"] },
+            "installed": false,
+            "issues": [],
+        });
+        assert!(validate_doctor_report_strict(&v).is_ok());
+    }
+
+    #[test]
+    fn doctor_strict_rejects_unknown_tier_value() {
+        // Hand-crafted bad Value: tier="ultra" is not in {low, medium, high}.
+        let v = serde_json::json!({
+            "schema_version": 1,
+            "stratum_version": "0.1.0",
+            "tier": "ultra",
+            "probe": {},
+            "gpu_accel": "cpu",
+            "sandbox": { "available": ["passthrough"] },
+            "installed": false,
+            "issues": [],
+        });
+        let err = validate_doctor_report_strict(&v).expect_err("ultra is not a valid tier");
+        assert!(err.starts_with("tier:"), "got: {err}");
+        assert!(err.contains("ultra"), "got: {err}");
+    }
+
+    #[test]
+    fn doctor_strict_rejects_missing_required_field() {
+        // Drop the `issues` key.
+        let v = serde_json::json!({
+            "schema_version": 1,
+            "stratum_version": "0.1.0",
+            "tier": "high",
+            "probe": {},
+            "gpu_accel": "cpu",
+            "sandbox": { "available": ["passthrough"] },
+            "installed": false,
+        });
+        let err = validate_doctor_report_strict(&v).expect_err("missing issues must fail");
+        assert!(err.starts_with("issues:"), "got: {err}");
+    }
+
+    #[test]
+    fn doctor_strict_rejects_unknown_gpu_accel() {
+        let v = serde_json::json!({
+            "schema_version": 1,
+            "stratum_version": "0.1.0",
+            "tier": "high",
+            "probe": {},
+            "gpu_accel": "rocm",
+            "sandbox": { "available": ["passthrough"] },
+            "installed": false,
+            "issues": [],
+        });
+        let err = validate_doctor_report_strict(&v).expect_err("rocm is not a valid backend");
+        assert!(err.starts_with("gpu_accel:"), "got: {err}");
+    }
+
+    #[test]
+    fn doctor_strict_rejects_unknown_sandbox_backend() {
+        let v = serde_json::json!({
+            "schema_version": 1,
+            "stratum_version": "0.1.0",
+            "tier": "high",
+            "probe": {},
+            "gpu_accel": "cpu",
+            "sandbox": { "available": ["docker"] },
+            "installed": false,
+            "issues": [],
+        });
+        let err = validate_doctor_report_strict(&v).expect_err("docker is not in the enum");
+        assert!(err.starts_with("sandbox.available[0]:"), "got: {err}");
+    }
+
+    #[test]
+    fn doctor_strict_rejects_unknown_issue_level() {
+        let v = serde_json::json!({
+            "schema_version": 1,
+            "stratum_version": "0.1.0",
+            "tier": "high",
+            "probe": {},
+            "gpu_accel": "cpu",
+            "sandbox": { "available": ["passthrough"] },
+            "installed": false,
+            "issues": [{ "code": "STRAT-E1001", "level": "fatal", "message": "x" }],
+        });
+        let err = validate_doctor_report_strict(&v).expect_err("fatal is not in {info,warn,error}");
+        assert!(err.starts_with("issues[0].level:"), "got: {err}");
     }
 
     #[test]

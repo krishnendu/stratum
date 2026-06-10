@@ -278,6 +278,68 @@ fn malformed_suite_json_exits_one_with_strat_e1001() {
     assert!(stderr.contains("STRAT-E1001"), "stderr: {stderr}");
 }
 
+/// Resolve a path relative to the workspace root (`CARGO_MANIFEST_DIR`
+/// points at `crates/stratum-cli`; the workspace is two levels up).
+fn workspace_path(rel: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates dir parent")
+        .parent()
+        .expect("workspace dir parent")
+        .join(rel)
+}
+
+#[test]
+fn shipped_baseline_suite_passes_against_echo() {
+    let tmp = TempDir::new().expect("tempdir");
+    let suite = workspace_path("evals/baseline.json");
+    let out = run_eval(
+        tmp.path(),
+        &["--suite", suite.to_str().expect("utf-8 suite")],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    assert!(stdout.contains("passed: 20/20"), "got: {stdout}");
+}
+
+#[test]
+fn shipped_coder_suite_passes_against_echo() {
+    let tmp = TempDir::new().expect("tempdir");
+    let suite = workspace_path("evals/coder.json");
+    let out = run_eval(
+        tmp.path(),
+        &["--suite", suite.to_str().expect("utf-8 suite")],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    assert!(stdout.contains("passed: 10/10"), "got: {stdout}");
+}
+
+#[test]
+fn shipped_polisher_suite_passes_against_echo() {
+    let tmp = TempDir::new().expect("tempdir");
+    let suite = workspace_path("evals/polisher.json");
+    let out = run_eval(
+        tmp.path(),
+        &["--suite", suite.to_str().expect("utf-8 suite")],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    assert!(stdout.contains("passed: 10/10"), "got: {stdout}");
+}
+
 #[test]
 fn model_flag_is_accepted_and_ignored() {
     // The flag is parsed for forward compatibility but ignored — the Echo
