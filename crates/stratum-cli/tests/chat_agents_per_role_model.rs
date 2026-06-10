@@ -79,10 +79,7 @@ fn write_agent(dir: &Path, name: &str, role: &str, model: &str) {
 /// short-circuits before touching `ModelInstaller`.
 #[cfg_attr(
     feature = "provider-llama-cpp",
-    allow(
-        dead_code,
-        reason = "helper is only consumed by no-feature tests"
-    )
+    allow(dead_code, reason = "helper is only consumed by no-feature tests")
 )]
 fn write_catalog_with_qwen(state: &Path) {
     let catalog = r#"{
