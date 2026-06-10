@@ -181,6 +181,17 @@ struct ServeArgs {
     /// then need a deterministic shutdown.
     #[arg(long, value_name = "N")]
     stop_after_ms: Option<u64>,
+    /// Catalog slug for the model the daemon's `AgentLoop` should use.
+    /// When omitted, the default [`EchoProvider`] is wired in (the
+    /// Phase 1 behavior). Requires the `provider-llama-cpp` feature at
+    /// build time; passing the flag without the feature exits with
+    /// STRAT-E1001.
+    #[arg(long, value_name = "SLUG")]
+    model: Option<String>,
+    /// Logical context window passed to the llama.cpp provider, in
+    /// tokens. Only used together with `--model`.
+    #[arg(long, default_value_t = 4096)]
+    ctx: u32,
     /// Emit a single JSON object on startup describing the bound
     /// address. Without this flag, a prose line is printed instead.
     #[arg(long)]
@@ -2190,11 +2201,64 @@ where
     )
 }
 
+/// Build the [`AgentFactory`] the daemon will hand to every
+/// [`AgentServeHandler`] dispatch, plus a short label naming the wired
+/// provider (`"echo"` or `"llama-cpp:<slug>"`) for the startup line.
+///
+/// Resolution rules:
+///
+/// * No `--model`: returns an `EchoProvider`-backed factory + `"echo"`.
+/// * `--model <slug>` without the `provider-llama-cpp` feature: exits with
+///   STRAT-E1001 (the feature has to be compiled in).
+/// * `--model <slug>` with the feature: routes through the same
+///   [`ModelCatalog`] + [`ModelInstaller`] + [`stratum_runtime::LlamaCppProvider`]
+///   flow as `stratum chat --model`, then wraps the result in the factory.
+#[cfg(not(feature = "provider-llama-cpp"))]
+fn resolve_serve_provider(
+    args: &ServeArgs,
+    _paths: &Paths,
+    err: &mut dyn Write,
+) -> Result<(AgentFactory, String), ExitCode> {
+    use std::sync::Arc;
+
+    if args.model.is_some() {
+        let _ = writeln!(
+            err,
+            "STRAT-E1001 the `provider-llama-cpp` feature is not enabled; rebuild with `--features provider-llama-cpp`"
+        );
+        return Err(ExitCode::from(1));
+    }
+    let factory = AgentFactory::new().with_provider(Arc::new(EchoProvider::new("")));
+    Ok((factory, "echo".to_string()))
+}
+
+#[cfg(feature = "provider-llama-cpp")]
+fn resolve_serve_provider(
+    args: &ServeArgs,
+    paths: &Paths,
+    err: &mut dyn Write,
+) -> Result<(AgentFactory, String), ExitCode> {
+    use std::sync::Arc;
+
+    use stratum_runtime::Provider as ProviderTrait;
+
+    let Some(slug) = args.model.as_deref() else {
+        let factory = AgentFactory::new().with_provider(Arc::new(EchoProvider::new("")));
+        return Ok((factory, "echo".to_string()));
+    };
+    let provider = resolve_llama_provider(slug, args.ctx, paths, err)?;
+    let provider_arc: Arc<dyn ProviderTrait> = Arc::new(provider);
+    let factory = AgentFactory::new().with_provider(provider_arc);
+    Ok((factory, format!("llama-cpp:{slug}")))
+}
+
 /// Implements `stratum serve`. Build the `AgentServeHandler` against an
-/// `EchoProvider`-backed [`AgentFactory`] plus a [`TranscriptStore`] rooted
-/// at `<state>/transcripts`, wrap it in a [`ServeServer`], start the
-/// acceptor, and block until either `--stop-after-ms` elapses or the
-/// handler's internal shutdown flag flips (via a `stop` JSON-RPC method).
+/// `EchoProvider`-backed [`AgentFactory`] (or, with `--model <slug>` and the
+/// `provider-llama-cpp` feature, a real `LlamaCppProvider`-backed factory)
+/// plus a [`TranscriptStore`] rooted at `<state>/transcripts`, wrap it in a
+/// [`ServeServer`], start the acceptor, and block until either
+/// `--stop-after-ms` elapses or the handler's internal shutdown flag flips
+/// (via a `stop` JSON-RPC method).
 ///
 /// The function intentionally avoids the `ctrlc` crate — graceful
 /// signal-driven shutdown is deferred to a follow-up that settles the
@@ -2240,7 +2304,16 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
         }
     };
 
-    let factory = Arc::new(AgentFactory::new().with_provider(Arc::new(EchoProvider::new(""))));
+    // Resolve the provider. Without `--model`, the daemon keeps the
+    // Phase-1 EchoProvider default. With `--model`, we route through
+    // the same ModelCatalog + ModelInstaller + LlamaCppProvider flow
+    // that `stratum chat --model` uses (feature-gated by
+    // `provider-llama-cpp`).
+    let (factory, provider_label) = match resolve_serve_provider(args, paths, err) {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
+    let factory = Arc::new(factory);
     let events = Arc::new(EventEmitter::new(Arc::new(MemoryEventSink::new())));
 
     let handler = Arc::new(AgentServeHandler::new(
@@ -2272,12 +2345,20 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
             clippy::expect_used,
             reason = "ServeStartupReport serialization is infallible (primitive fields)"
         )]
-        let rendered = serde_json::to_string(&ServeStartupReport { bound: &bound })
-            .expect("ServeStartupReport serialization is infallible");
+        let rendered = serde_json::to_string(&ServeStartupReport {
+            bound: &bound,
+            provider: &provider_label,
+        })
+        .expect("ServeStartupReport serialization is infallible");
         if writeln!(out, "{rendered}").is_err() {
             return ExitCode::from(74);
         }
-    } else if writeln!(out, "stratum serve: listening on {bound}").is_err() {
+    } else if writeln!(
+        out,
+        "stratum serve: provider={provider_label}, listening on {bound}"
+    )
+    .is_err()
+    {
         return ExitCode::from(74);
     }
     // Flush so callers blocking on stdout (e.g. integration tests parsing
@@ -2313,6 +2394,7 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
 #[derive(Debug, Serialize)]
 struct ServeStartupReport<'a> {
     bound: &'a str,
+    provider: &'a str,
 }
 
 /// Serialize a JSON-RPC 2.0 request envelope into a single line of JSON

@@ -1,15 +1,16 @@
-//! Integration tests for `stratum serve`.
+//! Integration tests for `stratum serve --model <slug>`.
 //!
-//! These spawn the real CLI binary via `CARGO_BIN_EXE_stratum` and drive
-//! the daemon over a real loopback socket (or, on Unix, a real Unix
-//! socket). They cover:
+//! These spawn the real CLI binary via `CARGO_BIN_EXE_stratum` and cover:
 //!
-//! * default TCP loopback with a stopwatch-driven shutdown,
-//! * explicit `--tcp-port 0` plus `--json` startup payload shape,
-//! * Unix-socket binding (gated `cfg(unix)`),
-//! * mutually-exclusive `--unix-socket` / `--tcp-port` rejection,
-//! * a real JSON-RPC `ping` round-trip through the wire — the integration
-//!   test that proves the runtime wiring is hooked up correctly.
+//! * Default (no `--model`): provider line names `echo`, exit 0.
+//! * `--model X` without the `provider-llama-cpp` feature: exit 1 +
+//!   STRAT-E1001 pointing at the missing feature.
+//! * `--model unknown-slug` with the feature on: exit 1 + STRAT-E1001
+//!   "unknown slug" (only compiled when the feature is enabled).
+//! * End-to-end TCP `ping` round-trip with `--model X --json` only in the
+//!   feature-off configuration so default CI stays fast; the feature-on
+//!   path needs a real on-disk GGUF and is exercised by the on-demand
+//!   llama workflow instead.
 
 // Integration test binary: every fn here exists only for `cargo test`.
 // Test helpers panic on setup failures by design; clippy's
@@ -21,11 +22,7 @@
     reason = "integration test helpers may panic on setup failures"
 )]
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
 
 use tempfile::TempDir;
 
@@ -33,19 +30,8 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_stratum"))
 }
 
-/// Parse the bound address from a `--json` startup line. Returns the
-/// `"bound"` field as a `String`.
-fn bound_from_json(line: &str) -> String {
-    let v: serde_json::Value =
-        serde_json::from_str(line.trim()).expect("startup line is valid JSON");
-    v.get("bound")
-        .and_then(|b| b.as_str())
-        .map(str::to_string)
-        .expect("`bound` field present")
-}
-
 #[test]
-fn serve_tcp_zero_json_prints_bound_address_and_exits_zero() {
+fn serve_without_model_reports_echo_provider() {
     let tmp = TempDir::new().unwrap();
     let output = bin()
         .args([
@@ -54,33 +40,6 @@ fn serve_tcp_zero_json_prints_bound_address_and_exits_zero() {
             "serve",
             "--tcp-port",
             "0",
-            "--stop-after-ms",
-            "200",
-            "--json",
-        ])
-        .output()
-        .expect("spawn stratum");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("utf8");
-    let bound = bound_from_json(&stdout);
-    assert!(
-        bound.starts_with("127.0.0.1:"),
-        "expected loopback addr, got {bound}"
-    );
-}
-
-#[test]
-fn serve_no_flags_defaults_to_tcp_loopback() {
-    let tmp = TempDir::new().unwrap();
-    let output = bin()
-        .args([
-            "--storage-root",
-            tmp.path().to_str().unwrap(),
-            "serve",
             "--stop-after-ms",
             "200",
         ])
@@ -94,74 +53,101 @@ fn serve_no_flags_defaults_to_tcp_loopback() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("provider=echo"),
-        "expected provider=echo, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("listening on 127.0.0.1:"),
-        "expected loopback addr, got: {stdout}"
+        "expected provider=echo in startup line, got: {stdout}"
     );
 }
 
-#[cfg(unix)]
+#[cfg(not(feature = "provider-llama-cpp"))]
 #[test]
-fn serve_unix_socket_json_reports_socket_path() {
+fn serve_with_model_without_feature_errors() {
     let tmp = TempDir::new().unwrap();
-    // Place the socket inside the temp dir so the test is hermetic and
-    // never fights with a stale `/tmp` entry left by a prior run.
-    let sock = tmp.path().join("stratum-test.sock");
     let output = bin()
         .args([
             "--storage-root",
             tmp.path().to_str().unwrap(),
             "serve",
-            "--unix-socket",
-            sock.to_str().unwrap(),
+            "--tcp-port",
+            "0",
             "--stop-after-ms",
             "200",
-            "--json",
+            "--model",
+            "X",
         ])
         .output()
         .expect("spawn stratum");
-    assert!(
-        output.status.success(),
-        "stderr: {}",
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit 1, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8(output.stdout).expect("utf8");
-    let bound = bound_from_json(&stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        bound.contains("stratum-test.sock"),
-        "expected socket path in bound, got {bound}"
+        stderr.contains("STRAT-E1001"),
+        "expected STRAT-E1001 in stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("provider-llama-cpp"),
+        "expected provider-llama-cpp hint in stderr, got: {stderr}"
     );
 }
 
+#[cfg(feature = "provider-llama-cpp")]
 #[test]
-fn serve_unix_socket_and_tcp_port_are_mutually_exclusive() {
+fn serve_with_unknown_model_slug_errors() {
     let tmp = TempDir::new().unwrap();
     let output = bin()
         .args([
             "--storage-root",
             tmp.path().to_str().unwrap(),
             "serve",
-            "--unix-socket",
-            "/tmp/x.sock",
             "--tcp-port",
-            "5000",
+            "0",
+            "--stop-after-ms",
+            "200",
+            "--model",
+            "unknown-slug",
         ])
         .output()
         .expect("spawn stratum");
-    assert_eq!(output.status.code(), Some(64));
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit 1, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("STRAT-E1001"),
+        "expected STRAT-E1001 in stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("unknown slug"),
+        "expected 'unknown slug' in stderr, got: {stderr}"
+    );
 }
 
-/// End-to-end wiring proof: spawn the daemon, parse the bound TCP port
-/// from its `--json` startup payload, open a TCP connection, send a
-/// JSON-RPC `ping`, and assert the response contains `"id":1`.
+/// End-to-end wiring proof for the feature-off configuration: spawn
+/// the daemon WITHOUT `--model` (so the `EchoProvider` path is exercised),
+/// parse the bound TCP port from the `--json` startup payload, open a
+/// real TCP connection, send a JSON-RPC `ping`, and assert the response
+/// contains `"id":1` with a `result` field — i.e. the daemon's
+/// `AgentLoop` wiring still works under the new `resolve_serve_provider`
+/// indirection.
 ///
-/// This is the only test that exercises the live socket — every other
-/// case relies on the stopwatch shutdown happening before the test
-/// finishes.
+/// The feature-on equivalent (a real `ping` round-trip with a working
+/// `LlamaCppProvider`) is owned by the on-demand llama workflow because
+/// it requires a real GGUF on disk and would otherwise blow the default
+/// CI budget.
+#[cfg(not(feature = "provider-llama-cpp"))]
 #[test]
-fn serve_accepts_jsonrpc_ping_over_tcp() {
+fn serve_default_provider_accepts_jsonrpc_ping_over_tcp() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     let tmp = TempDir::new().unwrap();
     let mut child = bin()
         .args([
@@ -179,26 +165,33 @@ fn serve_accepts_jsonrpc_ping_over_tcp() {
         .spawn()
         .expect("spawn stratum");
 
-    // The CLI flushes stdout after writing the startup JSON, so a single
-    // `read_line` on the child's stdout is enough to grab the address.
     let stdout = child.stdout.take().expect("child stdout");
     let stderr = child.stderr.take().expect("child stderr");
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     reader.read_line(&mut line).expect("read startup line");
-    let bound = bound_from_json(&line);
 
-    // Drain stderr in the background so the child doesn't block on a
-    // full pipe.
+    let parsed: serde_json::Value =
+        serde_json::from_str(line.trim()).expect("startup line is valid JSON");
+    let bound = parsed
+        .get("bound")
+        .and_then(|b| b.as_str())
+        .map(str::to_string)
+        .expect("`bound` field present");
+    assert_eq!(
+        parsed
+            .get("provider")
+            .and_then(|p| p.as_str())
+            .expect("`provider` field present"),
+        "echo"
+    );
+
     let stderr_join = thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = BufReader::new(stderr).read_to_end(&mut buf);
         buf
     });
 
-    // Connect and round-trip a ping. Retry briefly because the bound
-    // address may be reported a hair before the acceptor's first poll
-    // cycle on slow CI.
     let response = {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut last_err: Option<std::io::Error> = None;
@@ -235,9 +228,6 @@ fn serve_accepts_jsonrpc_ping_over_tcp() {
         "expected `result`, got {response}"
     );
 
-    // Wait for the stopwatch (5s) to bring the daemon down. To keep the
-    // test fast we don't wait the full 5s — we just confirm the child
-    // exits cleanly when it does.
     let status = child.wait().expect("wait on child");
     assert!(
         status.success(),
