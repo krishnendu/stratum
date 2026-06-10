@@ -171,6 +171,8 @@ pub mod tool_dispatcher_mcp;
 pub mod tool_dispatchers;
 /// Tool invocation data shape + dispatcher trait (Phase 3 scaffold).
 pub mod tool_invocation;
+/// Third-party tool plugin SDK — manifest + filesystem registry + subprocess dispatcher.
+pub mod tool_plugin;
 /// Per-tool-call timeout policy + RAII timer guard.
 pub mod tool_timeout;
 /// Tool registry and capability matrix.
@@ -344,6 +346,10 @@ pub use tool_dispatchers::{
 pub use tool_invocation::{
     quick_dispatch, DenyDispatcher, DispatchError, EchoDispatcher, RegistryDispatcher,
     ToolDispatcher, ToolInvocation, ToolResult,
+};
+pub use tool_plugin::{
+    FileSystemPluginRegistry, ToolPlugin, ToolPluginDispatcher, ToolPluginLoadError,
+    ToolPluginManifest, ToolPluginRegistry, DEFAULT_PLUGIN_TIMEOUT_MS,
 };
 pub use tool_timeout::{
     record_outcome, run_with_timeout, ToolTimeoutError, ToolTimeoutGuard, ToolTimeoutPolicy,

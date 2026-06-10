@@ -75,6 +75,11 @@ pub const ALLOWLIST: &[&str] = &[
     "E_DISPATCH_MCP_TOOL_DENIED",
     "E_DISPATCH_MCP_TOOL_ERROR",
     "E_DISPATCH_MCP_TRANSPORT",
+    "E_PLUGIN_BAD_OUTPUT",
+    "E_PLUGIN_TIMEOUT",
+    "E_PLUGIN_SPAWN_FAILED",
+    "E_PLUGIN_NO_MATCH",
+    "E_PLUGIN_INVOCATION_ENCODING",
 ];
 
 /// Outcome of a single `run()` invocation.
