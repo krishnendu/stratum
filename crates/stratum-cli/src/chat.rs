@@ -39,11 +39,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as TuiBlock, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 use stratum_runtime::{
-    format_tokens_per_second, AgentLoop, AgentLoopConfig, CancelToken, CapabilityMatrix,
-    EchoProvider, Event as RtEvent, EventEmitter, EventRecord, IntentRouter, MemoryEventSink,
-    Paths, PendingPrompt, PermissionDecision, PermissionRequest, PermissionStore, PlanMode,
-    PromptId, PromptIdGen, Provider, RoleTimer, Tier, Transcript, TranscriptTurn, TurnContext,
-    TurnId, TurnMetrics, TurnRecorder, TurnResult,
+    format_tokens_per_second, AgentHandoff, AgentLoop, AgentLoopConfig, CancelToken,
+    CapabilityMatrix, EchoProvider, Event as RtEvent, EventEmitter, EventRecord, IntentRouter,
+    MemoryEventSink, Paths, PendingPrompt, PermissionDecision, PermissionRequest, PermissionStore,
+    PlanMode, PromptId, PromptIdGen, Provider, RoleTimer, SuggestedRole, Tier, Transcript,
+    TranscriptTurn, TurnContext, TurnId, TurnMetrics, TurnRecorder, TurnResult,
 };
 use stratum_types::{Block, ModelId, StratumResult};
 
@@ -148,6 +148,19 @@ pub struct ChatState {
     /// Shared TUI permission prompter. Cloned into the [`AgentLoop`] as the
     /// responder and read by the event loop to surface pending requests.
     permission_prompter: Arc<TuiPromptResponder>,
+    /// Optional multi-role coordinator. When `Some`, [`Self::submit`] runs
+    /// the turn through [`AgentHandoff::run_turn_with_handoff`] and tracks
+    /// the resulting role in [`Self::current_role`]. When `None`, the TUI
+    /// is in single-loop mode and the status bar shows no role label.
+    handoff: Option<Arc<AgentHandoff>>,
+    /// Classifier used to build a [`stratum_runtime::RoutedIntent`] for the
+    /// handoff path. Only consulted when [`Self::handoff`] is `Some`; the
+    /// single-loop [`AgentLoop::run_turn`] uses its own internal router.
+    handoff_router: IntentRouter,
+    /// Currently-active role in multi-agent mode. `None` when no handoff is
+    /// wired; `Some(role)` once [`Self::with_handoff`] runs and is updated
+    /// after each [`AgentHandoff::run_turn_with_handoff`] step.
+    current_role: Option<SuggestedRole>,
 }
 
 impl Default for ChatState {
@@ -195,7 +208,44 @@ impl ChatState {
             plan_mode,
             resumed_count: 0,
             permission_prompter,
+            handoff: None,
+            handoff_router: IntentRouter::default(),
+            current_role: None,
         }
+    }
+
+    /// Attach a multi-role [`AgentHandoff`] coordinator. Switches
+    /// [`Self::submit`] onto the handoff path and primes
+    /// [`Self::current_role`] with the coordinator's default role so the
+    /// status bar shows an `"agent: <role>"` label immediately.
+    #[must_use]
+    pub fn with_handoff(mut self, handoff: Arc<AgentHandoff>) -> Self {
+        self.current_role = Some(handoff.default_role());
+        self.handoff = Some(handoff);
+        self
+    }
+
+    /// Borrow the attached [`AgentHandoff`], if any.
+    #[must_use]
+    pub const fn handoff(&self) -> Option<&Arc<AgentHandoff>> {
+        self.handoff.as_ref()
+    }
+
+    /// Borrow the currently-active role, if any.
+    #[must_use]
+    pub const fn current_role(&self) -> Option<SuggestedRole> {
+        self.current_role
+    }
+
+    /// Render the current role as a short label for the status bar.
+    ///
+    /// Empty string when no [`AgentHandoff`] is wired (single-loop mode).
+    /// Otherwise `"agent: <snake_case role>"` — e.g. `"agent: default"`,
+    /// `"agent: polisher"`, `"agent: coder"`.
+    #[must_use]
+    pub fn current_role_label(&self) -> String {
+        self.current_role
+            .map_or_else(String::new, |role| format!("agent: {}", role_label(role)))
     }
 
     /// Build a state wrapping the supplied [`AgentLoop`]. Test-friendly
@@ -525,6 +575,21 @@ impl ChatState {
             "help" => PaletteOutcome::Acknowledged {
                 message: HELP_TEXT.to_string(),
             },
+            "agents" => match self.handoff.as_ref() {
+                None => PaletteOutcome::Rejected {
+                    message: "no multi-agent mode; pass --agents-dir to enable".to_string(),
+                },
+                Some(handoff) => {
+                    let mut roles: Vec<&'static str> =
+                        handoff.roles().into_iter().map(role_label).collect();
+                    roles.sort_unstable();
+                    let list = roles.join(", ");
+                    let current = self.current_role.map_or("(none)", role_label);
+                    PaletteOutcome::Acknowledged {
+                        message: format!("roles: {list} (current: {current})"),
+                    }
+                }
+            },
             "quit" | "exit" => {
                 self.quit = true;
                 PaletteOutcome::Acknowledged {
@@ -592,7 +657,39 @@ impl ChatState {
             started_at: std::time::SystemTime::now(),
         };
         let role_timer = RoleTimer::start();
-        let turn_result = self.agent_loop.run_turn(ctx, &self.cancel);
+        let turn_result = if let Some(handoff) = self.handoff.clone() {
+            let intent = self.handoff_router.classify(&prompt);
+            match handoff.run_turn_with_handoff(ctx, intent, &self.cancel) {
+                Ok(result) => {
+                    self.current_role = Some(result.final_role);
+                    // Synthesize a TurnResult-equivalent for the existing
+                    // single-turn bookkeeping below: take the final step's
+                    // outcome and the coordinator's accumulated final blocks.
+                    let final_outcome = result
+                        .steps
+                        .last()
+                        .map_or(stratum_runtime::TurnOutcome::Success, |s| {
+                            s.turn_result.outcome.clone()
+                        });
+                    TurnResult {
+                        turn_id,
+                        outcome: final_outcome,
+                        blocks: result.final_blocks,
+                        transitions: Vec::new(),
+                        events_emitted: Vec::new(),
+                    }
+                }
+                Err(_err) => TurnResult {
+                    turn_id,
+                    outcome: stratum_runtime::TurnOutcome::Success,
+                    blocks: Vec::new(),
+                    transitions: Vec::new(),
+                    events_emitted: Vec::new(),
+                },
+            }
+        } else {
+            self.agent_loop.run_turn(ctx, &self.cancel)
+        };
         let step_ms = role_timer.stop_ms();
 
         let blocks = turn_result.blocks.clone();
@@ -690,6 +787,14 @@ impl ChatState {
                     metrics.turn_id.0, metrics.prompt_tokens, metrics.completion_tokens,
                 ),
                 Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        let role_label_str = self.current_role_label();
+        if !role_label_str.is_empty() {
+            status_spans.push(Span::raw(" · "));
+            status_spans.push(Span::styled(
+                role_label_str,
+                Style::default().add_modifier(Modifier::BOLD),
             ));
         }
         status_spans.push(Span::raw(" · "));
@@ -810,6 +915,19 @@ fn default_agent_loop(
         .with_plan_mode(plan_mode)
         .with_config(AgentLoopConfig::default())
         .build()
+}
+
+/// Snake-case label for a [`SuggestedRole`]. Mirrors the `serde` rename
+/// rule on the enum so the status bar and `/agents` listing show the same
+/// string a user would write in `agents.toml`.
+const fn role_label(role: SuggestedRole) -> &'static str {
+    match role {
+        SuggestedRole::Default => "default",
+        SuggestedRole::Cavemanish => "cavemanish",
+        SuggestedRole::Polisher => "polisher",
+        SuggestedRole::Coder => "coder",
+        SuggestedRole::Researcher => "researcher",
+    }
 }
 
 /// Map a single keystroke to a [`PermissionDecision`] for the modal.
@@ -2375,6 +2493,219 @@ mod tests {
         assert!(text.contains("permission"));
         assert!(text.contains("fs.write"));
         assert!(text.contains("[a]"));
+    }
+
+    // ---------- multi-agent / handoff status + /agents ----------
+
+    fn handoff_with_default_and_coder() -> Arc<AgentHandoff> {
+        let mut reg = stratum_runtime::AgentRegistry::new();
+        let echo = Arc::new(stratum_runtime::AgentFactory::echo().expect("echo factory builds"));
+        reg.register(SuggestedRole::Default, Arc::clone(&echo));
+        reg.register(SuggestedRole::Coder, echo);
+        Arc::new(AgentHandoff::new(
+            reg,
+            SuggestedRole::Default,
+            stratum_runtime::HandoffPolicy::default(),
+        ))
+    }
+
+    #[test]
+    fn current_role_label_empty_without_handoff() {
+        let s = state();
+        assert!(s.current_role().is_none());
+        assert_eq!(s.current_role_label(), "");
+    }
+
+    #[test]
+    fn with_handoff_primes_current_role_to_default() {
+        let s = state().with_handoff(handoff_with_default_and_coder());
+        assert_eq!(s.current_role(), Some(SuggestedRole::Default));
+        assert_eq!(s.current_role_label(), "agent: default");
+    }
+
+    /// Provider that emits a `<handoff:coder>` marker followed by a payload
+    /// — drives the chain to land on `SuggestedRole::Coder`.
+    #[derive(Debug)]
+    struct CoderHandoffProvider;
+
+    impl Provider for CoderHandoffProvider {
+        fn id(&self) -> &'static str {
+            "coder_handoff"
+        }
+        fn capabilities(&self) -> &'static [stratum_types::Capability] {
+            const CAPS: &[stratum_types::Capability] = &[stratum_types::Capability::Generate];
+            CAPS
+        }
+        fn generate(
+            &self,
+            req: &stratum_runtime::GenerateRequest,
+            _cancel: &CancelToken,
+        ) -> Vec<Block> {
+            // First hop: prompt is user-supplied — emit a marker pointing
+            // at `coder`. Second hop: the coordinator strips the marker
+            // so the prompt begins with the leftover "\nover to you" —
+            // emit plain text to end the chain.
+            if req.prompt.starts_with("\nover to you") {
+                vec![Block::Text {
+                    text: "done".into(),
+                }]
+            } else {
+                vec![Block::Text {
+                    text: "<handoff:coder>\nover to you".into(),
+                }]
+            }
+        }
+    }
+
+    fn handoff_routing_to_coder() -> Arc<AgentHandoff> {
+        // Both roles share a loop wired with the CoderHandoffProvider so the
+        // first hop emits the sentinel and the second hop ends the chain.
+        let provider: Arc<dyn Provider> = Arc::new(CoderHandoffProvider);
+        let sink: Arc<dyn stratum_runtime::EventSink> = Arc::new(MemoryEventSink::new());
+        let events = Arc::new(EventEmitter::new(sink));
+        let loop_ = build_loop(provider, events);
+        let mut reg = stratum_runtime::AgentRegistry::new();
+        reg.register(SuggestedRole::Default, Arc::clone(&loop_));
+        reg.register(SuggestedRole::Coder, loop_);
+        Arc::new(AgentHandoff::new(
+            reg,
+            SuggestedRole::Default,
+            stratum_runtime::HandoffPolicy::default(),
+        ))
+    }
+
+    #[test]
+    fn submit_with_handoff_updates_current_role_to_final() {
+        let mut s = state().with_handoff(handoff_routing_to_coder());
+        assert_eq!(s.current_role(), Some(SuggestedRole::Default));
+        s.submit_with_prompt("please refactor");
+        assert_eq!(s.current_role(), Some(SuggestedRole::Coder));
+        assert_eq!(s.current_role_label(), "agent: coder");
+    }
+
+    #[test]
+    fn agents_command_without_handoff_is_rejected() {
+        let mut s = state();
+        let outcome = s.execute_palette_command("/agents");
+        let PaletteOutcome::Rejected { message } = outcome else {
+            panic!("expected rejected");
+        };
+        assert!(
+            message.contains("no multi-agent"),
+            "unexpected message: {message}"
+        );
+        // Transcript records the rejection but does not panic.
+        let Turn::Command { text, ok, .. } = s.transcript().last().expect("turn") else {
+            panic!("expected command turn")
+        };
+        assert_eq!(text, "/agents");
+        assert!(!*ok);
+    }
+
+    #[test]
+    fn agents_command_with_handoff_lists_roles_and_current() {
+        let mut s = state().with_handoff(handoff_with_default_and_coder());
+        let outcome = s.execute_palette_command("/agents");
+        let PaletteOutcome::Acknowledged { message } = outcome else {
+            panic!("expected acknowledged");
+        };
+        assert!(message.starts_with("roles:"), "got: {message}");
+        assert!(message.contains("default"));
+        assert!(message.contains("coder"));
+        assert!(
+            message.contains("current: default"),
+            "missing current marker: {message}"
+        );
+        let Turn::Command { text, ok, .. } = s.transcript().last().expect("turn") else {
+            panic!("expected command turn")
+        };
+        assert_eq!(text, "/agents");
+        assert!(*ok);
+    }
+
+    #[test]
+    fn status_bar_renders_agent_label_when_handoff_set() {
+        let s = state().with_handoff(handoff_with_default_and_coder());
+        let text = rendered_text(&s, 100, 6);
+        assert!(text.contains("agent: default"), "render: {text}");
+    }
+
+    #[test]
+    fn status_bar_omits_agent_label_in_single_loop_mode() {
+        let s = state();
+        let text = rendered_text(&s, 100, 6);
+        assert!(!text.contains("agent:"), "render: {text}");
+    }
+
+    #[test]
+    fn handoff_getter_returns_attached_coordinator() {
+        let s = state();
+        assert!(s.handoff().is_none());
+        let s = s.with_handoff(handoff_with_default_and_coder());
+        assert!(s.handoff().is_some());
+    }
+
+    /// Provider that emits a marker pointing at an unregistered role —
+    /// drives the [`HandoffError::NoSuchRole`] fall-through in
+    /// [`ChatState::submit`].
+    #[derive(Debug)]
+    struct BadMarkerProvider;
+    impl Provider for BadMarkerProvider {
+        fn id(&self) -> &'static str {
+            "bad_marker"
+        }
+        fn capabilities(&self) -> &'static [stratum_types::Capability] {
+            const CAPS: &[stratum_types::Capability] = &[stratum_types::Capability::Generate];
+            CAPS
+        }
+        fn generate(
+            &self,
+            _req: &stratum_runtime::GenerateRequest,
+            _cancel: &CancelToken,
+        ) -> Vec<Block> {
+            // Sentinel points at `polisher`, which is not in the registry —
+            // and the fallback default role is also absent.
+            vec![Block::Text {
+                text: "<handoff:polisher>\nrest".into(),
+            }]
+        }
+    }
+
+    #[test]
+    fn submit_with_handoff_error_falls_through_to_empty_assistant() {
+        // Registry only has `Coder` and the coordinator's default role
+        // `Polisher` is unregistered — resolve_role fails when the marker
+        // requests an unknown role and there is no default fallback. The
+        // submit path must record an empty assistant turn and not panic.
+        let provider: Arc<dyn Provider> = Arc::new(BadMarkerProvider);
+        let sink: Arc<dyn stratum_runtime::EventSink> = Arc::new(MemoryEventSink::new());
+        let events = Arc::new(EventEmitter::new(sink));
+        let loop_ = build_loop(provider, events);
+        let mut reg = stratum_runtime::AgentRegistry::new();
+        reg.register(SuggestedRole::Coder, loop_);
+        let handoff = Arc::new(AgentHandoff::new(
+            reg,
+            SuggestedRole::Polisher, // default not in registry
+            stratum_runtime::HandoffPolicy::default(),
+        ));
+        let mut s = state().with_handoff(handoff);
+        s.submit_with_prompt("anything");
+        // Assistant turn present; blocks empty under the error fallback.
+        let Some(Turn::Assistant(blocks)) = s.transcript().last() else {
+            panic!("expected assistant turn")
+        };
+        assert!(blocks.is_empty(), "expected empty blocks on error path");
+    }
+
+    #[test]
+    fn role_label_covers_every_suggested_role_variant() {
+        // Pin the snake-case mapping for every variant so a new role added
+        // to the enum forces an update here.
+        assert_eq!(role_label(SuggestedRole::Default), "default");
+        assert_eq!(role_label(SuggestedRole::Cavemanish), "cavemanish");
+        assert_eq!(role_label(SuggestedRole::Polisher), "polisher");
+        assert_eq!(role_label(SuggestedRole::Coder), "coder");
+        assert_eq!(role_label(SuggestedRole::Researcher), "researcher");
     }
 
     #[test]
