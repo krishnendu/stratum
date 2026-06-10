@@ -18,14 +18,14 @@ use stratum_runtime::{
     AnonInstallId, ArtifactRef as ModelArtifactRef, CancelToken, CatalogError, CatalogSync,
     CatalogSyncConfig, CpuArchTag, EchoProvider, EvalReport, EvalRunner, EvalSuite, Event,
     EventEmitter, EventRecord, GenerateRequest, GpuBackend, HandoffPolicy, HardwareProbe,
-    InstalledToml, LoadFailure, LoadedModel, ManifestError, McpServerConfig, McpServerSet,
-    McpTransport, MemoryEventSink, MemoryGate, ModelCatalog, ModelEntry, ModelInstaller, ModelSlug,
-    ModelTask, ModelTier, OsTag, Paths, PlatformTag, Provider, ProviderResolveError,
-    ProviderResolver, ReleaseChannel, ReleaseVersion, RequestId, SandboxReport, ServeBind,
-    ServeConfig, ServeHandler, ServeServer, SessionId, SkipReason, SuggestedRole, TelemetryConfig,
-    TelemetryEventKind, TelemetryPayload, Tier, Transcript, TranscriptBlock, TranscriptStore,
-    TranscriptTurn, UpdateChannel, UpdateDecision, UpdateManifest, DEFAULT_CATALOG_MAX_BYTES,
-    DEFAULT_MARGIN_MIB,
+    InstalledToml, IntentRouter, LoadFailure, LoadedModel, ManifestError, McpServerConfig,
+    McpServerSet, McpTransport, MemoryEventSink, MemoryGate, ModelCatalog, ModelEntry,
+    ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag, ParallelResult, Paths, PlatformTag,
+    Provider, ProviderResolveError, ProviderResolver, ReleaseChannel, ReleaseVersion, RequestId,
+    RoleResult, SandboxReport, ServeBind, ServeConfig, ServeHandler, ServeServer, SessionId,
+    SkipReason, SuggestedRole, TelemetryConfig, TelemetryEventKind, TelemetryPayload, Tier,
+    Transcript, TranscriptBlock, TranscriptStore, TranscriptTurn, TurnContext, TurnId, TurnOutcome,
+    UpdateChannel, UpdateDecision, UpdateManifest, DEFAULT_CATALOG_MAX_BYTES, DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::format_description::well_known::Rfc3339;
@@ -498,6 +498,18 @@ struct ChatArgs {
     /// hear about immediately.
     #[arg(long = "agents-dir", value_name = "PATH")]
     agents_dir: Option<PathBuf>,
+    /// Broadcast the same prompt to multiple agent roles concurrently via
+    /// [`stratum_runtime::AgentHandoff::run_turn_parallel`] and render one
+    /// section per role.
+    ///
+    /// Value is a comma-separated list of role names (`snake_case` to match
+    /// the `SuggestedRole` serde projection), e.g. `cavemanish,coder,polisher`.
+    /// Each role must resolve to a registered agent in `--agents-dir`;
+    /// unknown role names exit 1 with `STRAT-E1001`. Requires `--agents-dir`
+    /// — without a populated agents directory the runtime has no registry
+    /// to dispatch against.
+    #[arg(long = "parallel", value_name = "ROLES", requires = "agents_dir")]
+    parallel: Option<String>,
 }
 
 /// Clap-friendly mirror of the `kind` tag of [`Event`].
@@ -1113,7 +1125,7 @@ where
         Some(Command::Doctor(doc_args)) => doctor(cli.json, &doc_args, &paths, out, err),
         Some(Command::Init) => init(cli.json, &paths, out, err),
         Some(Command::Echo { prompt, max_blocks }) => echo(cli.json, &prompt, max_blocks, out),
-        Some(Command::Chat(chat_args)) => chat_command(&chat_args, &paths, out, err),
+        Some(Command::Chat(chat_args)) => chat_command(cli.json, &chat_args, &paths, out, err),
         Some(Command::Models(ModelsCommand::List(list_args))) => {
             models_list(cli.json, &paths, &list_args, out, err)
         }
@@ -2401,6 +2413,7 @@ fn format_gb_one_decimal(mib: u32) -> String {
 }
 
 fn chat_command(
+    json: bool,
     args: &ChatArgs,
     paths: &Paths,
     out: &mut dyn Write,
@@ -2423,7 +2436,7 @@ fn chat_command(
     // `AgentRegistryLoader` + `AgentHandoff`. Takes priority over `--model`
     // so the documented "load my agents and route" path is unambiguous.
     if let Some(dir) = args.agents_dir.clone() {
-        return chat_with_agents_dir(&dir, args, paths, tier, resumed, out, err);
+        return chat_with_agents_dir(&dir, args, paths, tier, resumed, json, out, err);
     }
 
     // Model-resolution flow only runs when --model is set. Without the
@@ -2620,12 +2633,17 @@ impl CliProviderResolver {
 /// * Success → builds a `ChatState` against the handoff and either runs one
 ///   `--prompt` turn or drops into the interactive TUI, mirroring the
 ///   default `chat_command` shape.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every argument is a distinct CLI concern (dir, args, paths, tier, resumed, json, out, err); collapsing them into a struct adds plumbing without reducing complexity"
+)]
 fn chat_with_agents_dir(
     dir: &Path,
     args: &ChatArgs,
     paths: &Paths,
     tier: Tier,
     resumed: Option<Transcript>,
+    json: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
@@ -2682,6 +2700,14 @@ fn chat_with_agents_dir(
         HandoffPolicy::default(),
     ));
 
+    // `--parallel <roles>` + `--prompt <STR>` opts the chat into the
+    // multi-role broadcast dispatcher. The interactive TUI path is
+    // intentionally not wired here — a fanned-out turn does not have a
+    // single "current role" to drive the status bar.
+    if let (Some(roles_csv), Some(prompt)) = (args.parallel.as_deref(), args.prompt.as_deref()) {
+        return chat_parallel_prompt(&handoff, roles_csv, prompt, json, out, err);
+    }
+
     let provider = EchoProvider::new("");
     let mut state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths))
         .with_handoff(handoff);
@@ -2708,6 +2734,206 @@ fn chat_with_agents_dir(
             ExitCode::from(70)
         }
     }
+}
+
+/// Parse a comma-separated role list into [`SuggestedRole`] values.
+///
+/// Empty values (e.g. `"a,,b"`), an empty list (`""`), and unknown role
+/// names all surface as a `STRAT-E1001 unknown role: <name>` diagnostic
+/// on `err` and an exit-1 [`ExitCode`].
+fn parse_parallel_roles(csv: &str, err: &mut dyn Write) -> Result<Vec<SuggestedRole>, ExitCode> {
+    let mut roles = Vec::new();
+    for raw in csv.split(',') {
+        let trimmed = raw.trim();
+        let Some(role) = parse_role_snake_case(trimmed) else {
+            let _ = writeln!(err, "STRAT-E1001 unknown role: {trimmed}");
+            return Err(ExitCode::from(1));
+        };
+        roles.push(role);
+    }
+    if roles.is_empty() {
+        let _ = writeln!(err, "STRAT-E1001 unknown role: ");
+        return Err(ExitCode::from(1));
+    }
+    Ok(roles)
+}
+
+/// Resolve a `snake_case` role label to its [`SuggestedRole`] variant.
+///
+/// Mirrors the `serde(rename_all = "snake_case")` projection on
+/// [`SuggestedRole`] so the wire spelling stays in sync. `None` for any
+/// label outside the closed set of variants.
+fn parse_role_snake_case(s: &str) -> Option<SuggestedRole> {
+    match s {
+        "default" => Some(SuggestedRole::Default),
+        "cavemanish" => Some(SuggestedRole::Cavemanish),
+        "polisher" => Some(SuggestedRole::Polisher),
+        "coder" => Some(SuggestedRole::Coder),
+        "researcher" => Some(SuggestedRole::Researcher),
+        _ => None,
+    }
+}
+
+/// Run one `--prompt` turn fanned out across `roles_csv` via
+/// [`AgentHandoff::run_turn_parallel`] and render the result.
+///
+/// * Bad role name → exit 1 with `STRAT-E1001 unknown role: <name>`.
+/// * `NoSuchRole` from the dispatcher (role parsed but not registered) →
+///   exit 1 with `STRAT-E1001 unknown role: <name>`.
+/// * Any other dispatcher error → exit 1 with the error display.
+/// * Exit 0 only when every per-role outcome is [`TurnOutcome::Success`].
+fn chat_parallel_prompt(
+    handoff: &AgentHandoff,
+    roles_csv: &str,
+    prompt: &str,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let roles = match parse_parallel_roles(roles_csv, err) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+
+    let ctx = TurnContext {
+        user_prompt: prompt.to_string(),
+        model: ModelId::from("echo"),
+        turn_id: TurnId(0),
+        started_at: SystemTime::now(),
+    };
+    let intent = IntentRouter::default().classify(prompt);
+    let cancel = CancelToken::new();
+
+    let result = match handoff.run_turn_parallel(ctx, intent, &cancel, &roles) {
+        Ok(r) => r,
+        Err(stratum_runtime::HandoffError::NoSuchRole(role)) => {
+            let _ = writeln!(
+                err,
+                "STRAT-E1001 unknown role: {}",
+                suggested_role_wire(role)
+            );
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 parallel dispatch failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if json {
+        if let Err(code) = render_parallel_json(&result, out, err) {
+            return code;
+        }
+    } else {
+        render_parallel_prose(&result, out);
+    }
+
+    let all_ok = result
+        .per_role
+        .values()
+        .all(|r| matches!(r.outcome, TurnOutcome::Success));
+    if all_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// Render the `ParallelResult` as prose to `out`:
+///
+/// ```text
+/// === <role> (<duration_ms>ms) ===
+/// <concatenated text blocks>
+///
+/// ```
+fn render_parallel_prose(result: &ParallelResult, out: &mut dyn Write) {
+    for (key, role_result) in &result.per_role {
+        let role = suggested_role_wire(key.role());
+        let _ = writeln!(out, "=== {role} ({}ms) ===", role_result.duration_ms);
+        let text = concat_text_blocks(&role_result.blocks);
+        let _ = writeln!(out, "{text}");
+        let _ = writeln!(out);
+    }
+}
+
+/// Render the `ParallelResult` as pretty JSON to `out`.
+///
+/// `ParallelResult` / `RoleResult` do not derive `Serialize`, so we build
+/// an equivalent `serde_json::Value` by hand. Schema:
+///
+/// ```json
+/// {
+///   "elapsed_ms": u64,
+///   "per_role": {
+///     "<role>": {
+///       "role": "<role>",
+///       "outcome": <TurnOutcome JSON>,
+///       "blocks": [<Block JSON>, …],
+///       "duration_ms": u64,
+///       "error": <string | null>
+///     },
+///     …
+///   }
+/// }
+/// ```
+fn render_parallel_json(
+    result: &ParallelResult,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<(), ExitCode> {
+    let mut per_role_obj = serde_json::Map::new();
+    for (key, role_result) in &result.per_role {
+        let role = suggested_role_wire(key.role());
+        per_role_obj.insert(role.to_string(), role_result_to_json(role_result));
+    }
+    let payload = serde_json::json!({
+        "elapsed_ms": result.elapsed_ms,
+        "per_role": per_role_obj,
+    });
+    let rendered = match serde_json::to_string_pretty(&payload) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 cannot render parallel JSON: {e}");
+            return Err(ExitCode::from(1));
+        }
+    };
+    if writeln!(out, "{rendered}").is_err() {
+        return Err(ExitCode::from(74));
+    }
+    Ok(())
+}
+
+/// Project a [`RoleResult`] into a `serde_json::Value`. See
+/// [`render_parallel_json`] for the schema.
+fn role_result_to_json(role_result: &RoleResult) -> serde_json::Value {
+    let outcome = serde_json::to_value(&role_result.outcome)
+        .unwrap_or_else(|_| serde_json::Value::String("model_error".to_string()));
+    let blocks = serde_json::to_value(&role_result.blocks).unwrap_or(serde_json::Value::Null);
+    let error = role_result
+        .error
+        .as_ref()
+        .map_or(serde_json::Value::Null, |s| {
+            serde_json::Value::String(s.clone())
+        });
+    serde_json::json!({
+        "role": suggested_role_wire(role_result.role),
+        "outcome": outcome,
+        "blocks": blocks,
+        "duration_ms": role_result.duration_ms,
+        "error": error,
+    })
+}
+
+/// Concatenate every [`Block::Text`] payload in `blocks` in order.
+/// Non-text blocks (usage, tool calls, etc.) are skipped.
+fn concat_text_blocks(blocks: &[Block]) -> String {
+    let mut out = String::new();
+    for block in blocks {
+        if let Block::Text { text } = block {
+            out.push_str(text);
+        }
+    }
+    out
 }
 
 /// Resolve `raw` as a 16-hex session id, open the on-disk transcript store,

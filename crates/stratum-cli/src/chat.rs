@@ -43,7 +43,7 @@ use stratum_runtime::{
     CapabilityMatrix, EchoProvider, Event as RtEvent, EventEmitter, EventRecord, IntentRouter,
     MemoryEventSink, Paths, PendingPrompt, PermissionDecision, PermissionRequest, PermissionStore,
     PlanMode, PromptId, PromptIdGen, Provider, RoleTimer, SuggestedRole, Tier, Transcript,
-    TranscriptTurn, TurnContext, TurnId, TurnMetrics, TurnRecorder, TurnResult,
+    TranscriptTurn, TurnContext, TurnId, TurnMetrics, TurnOutcome, TurnRecorder, TurnResult,
 };
 use stratum_types::{Block, ModelId, StratumResult};
 
@@ -62,6 +62,8 @@ const HELP_TEXT: &str = "available commands:\n\
     /cancel — cancel the in-flight turn\n\
     /clear — clear the transcript\n\
     /agents — list registered roles (multi-agent mode only)\n\
+    /parallel <role1,role2,…> — fan the next turn out across the listed roles \
+(multi-agent mode only)\n\
     /budget — show the latest turn metrics (tokens · ms · tok/s · turn id)\n\
     /help — show this message\n\
     /quit, /exit — exit the TUI";
@@ -600,6 +602,10 @@ impl ChatState {
                 message: HELP_TEXT.to_string(),
             },
             "agents" => self.dispatch_agents(),
+            "parallel" => {
+                let tail = trimmed.strip_prefix("parallel").unwrap_or("").trim();
+                self.dispatch_parallel(tail)
+            }
             "budget" => self.dispatch_budget(),
             "quit" | "exit" => {
                 self.quit = true;
@@ -634,6 +640,118 @@ impl ChatState {
         let current = self.current_role.map_or("default", |role| role_name(role));
         PaletteOutcome::Acknowledged {
             message: format!("roles: {joined} (current: {current})"),
+        }
+    }
+
+    /// Render the `/parallel <role1,role2,…>` palette command output.
+    ///
+    /// Without an installed [`AgentHandoff`] (single-loop mode), reject with
+    /// a pointer to `--agents-dir`. With a handoff: parse the role list
+    /// (`snake_case` to match `SuggestedRole`'s serde projection), drive one
+    /// turn through [`AgentHandoff::run_turn_parallel`], and append the
+    /// per-role results to the transcript as a series of [`Turn::Command`]
+    /// summaries plus a [`Turn::Assistant`] block carrying the concatenated
+    /// text of every role's output.
+    ///
+    /// Unknown roles, an empty list, or `NoSuchRole` from the dispatcher
+    /// all surface as `PaletteOutcome::Rejected`. Any other dispatcher
+    /// error also rejects — the transcript receives no assistant turn.
+    fn dispatch_parallel(&mut self, args: &str) -> PaletteOutcome {
+        let Some(handoff) = self.handoff.clone() else {
+            return PaletteOutcome::Rejected {
+                message: "no multi-agent mode; pass --agents-dir to enable".to_string(),
+            };
+        };
+        if args.is_empty() {
+            return PaletteOutcome::Rejected {
+                message: "unknown role: ".to_string(),
+            };
+        }
+        let mut roles = Vec::new();
+        for raw in args.split(',') {
+            let label = raw.trim();
+            let Some(role) = parse_role_label(label) else {
+                return PaletteOutcome::Rejected {
+                    message: format!("unknown role: {label}"),
+                };
+            };
+            roles.push(role);
+        }
+
+        let turn_id = TurnId(self.next_turn_id);
+        self.next_turn_id = self.next_turn_id.saturating_add(1);
+        let prompt = self
+            .transcript
+            .iter()
+            .rev()
+            .find_map(|t| match t {
+                Turn::User(text) => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let ctx = TurnContext {
+            user_prompt: prompt.clone(),
+            model: ModelId::from("echo"),
+            turn_id,
+            started_at: SystemTime::now(),
+        };
+        let intent = IntentRouter::default().classify(&prompt);
+        let result = match handoff.run_turn_parallel(ctx, intent, &self.cancel, &roles) {
+            Ok(r) => r,
+            Err(stratum_runtime::HandoffError::NoSuchRole(role)) => {
+                return PaletteOutcome::Rejected {
+                    message: format!("unknown role: {}", role_name(role)),
+                };
+            }
+            Err(e) => {
+                return PaletteOutcome::Rejected {
+                    message: format!("parallel dispatch failed: {e}"),
+                };
+            }
+        };
+
+        let mut combined: Vec<Block> = Vec::new();
+        let mut summaries: Vec<(String, bool, String)> = Vec::new();
+        for (key, role_result) in &result.per_role {
+            let role = role_name(key.role());
+            let ok = matches!(role_result.outcome, TurnOutcome::Success);
+            let text = concat_text_blocks(&role_result.blocks);
+            combined.push(Block::Text {
+                text: format!("=== {role} ({}ms) ===\n{text}\n", role_result.duration_ms),
+            });
+            let summary = if ok {
+                format!(
+                    "[{role}] {}ms ({} chars)",
+                    role_result.duration_ms,
+                    text.len()
+                )
+            } else {
+                let err = role_result
+                    .error
+                    .as_deref()
+                    .unwrap_or("non-success outcome");
+                format!("[{role}] error: {err}")
+            };
+            summaries.push((format!("/parallel {role}"), ok, summary));
+        }
+
+        if !combined.is_empty() {
+            self.transcript.push(Turn::Assistant(combined));
+        }
+        for (text, ok, message) in summaries {
+            self.transcript.push(Turn::Command { text, ok, message });
+        }
+
+        let all_ok = result
+            .per_role
+            .values()
+            .all(|r| matches!(r.outcome, TurnOutcome::Success));
+        PaletteOutcome::Acknowledged {
+            message: format!(
+                "parallel: {} role(s) in {}ms (all_ok={all_ok})",
+                result.per_role.len(),
+                result.elapsed_ms,
+            ),
         }
     }
 
@@ -1142,6 +1260,36 @@ const fn role_name(role: SuggestedRole) -> &'static str {
         SuggestedRole::Coder => "coder",
         SuggestedRole::Researcher => "researcher",
     }
+}
+
+/// Resolve a `snake_case` role label to its [`SuggestedRole`] variant.
+///
+/// Mirrors the `serde(rename_all = "snake_case")` projection on
+/// [`SuggestedRole`] so the `/parallel` palette command accepts the same
+/// spelling as the on-disk agent TOML's `roles = […]` field.
+fn parse_role_label(s: &str) -> Option<SuggestedRole> {
+    match s {
+        "default" => Some(SuggestedRole::Default),
+        "cavemanish" => Some(SuggestedRole::Cavemanish),
+        "polisher" => Some(SuggestedRole::Polisher),
+        "coder" => Some(SuggestedRole::Coder),
+        "researcher" => Some(SuggestedRole::Researcher),
+        _ => None,
+    }
+}
+
+/// Concatenate every [`Block::Text`] payload in `blocks` in order. Used by
+/// the `/parallel` palette dispatcher to render each role's output as a
+/// single transcript line. Non-text blocks (usage, tool calls, etc.) are
+/// skipped.
+fn concat_text_blocks(blocks: &[Block]) -> String {
+    let mut out = String::new();
+    for block in blocks {
+        if let Block::Text { text } = block {
+            out.push_str(text);
+        }
+    }
+    out
 }
 
 fn approximate_token_count(blocks: &[Block]) -> u64 {
@@ -3028,5 +3176,103 @@ mod tests {
         assert_eq!(role_name(SuggestedRole::Polisher), "polisher");
         assert_eq!(role_name(SuggestedRole::Coder), "coder");
         assert_eq!(role_name(SuggestedRole::Researcher), "researcher");
+    }
+
+    // -- /parallel palette --------------------------------------------------
+
+    /// Registry with Cavemanish + Coder, both backed by the echo factory.
+    /// Used by the `/parallel` palette tests so the dispatcher has at
+    /// least two distinct roles to fan a turn out to.
+    fn handoff_cavemanish_and_coder() -> Arc<AgentHandoff> {
+        use stratum_runtime::{AgentFactory, AgentRegistry, HandoffPolicy, SuggestedRole};
+        let l1 = Arc::new(AgentFactory::echo().expect("echo factory builds"));
+        let l2 = Arc::new(AgentFactory::echo().expect("echo factory builds"));
+        let mut reg = AgentRegistry::new();
+        reg.register(SuggestedRole::Cavemanish, l1);
+        reg.register(SuggestedRole::Coder, l2);
+        Arc::new(AgentHandoff::new(
+            reg,
+            SuggestedRole::Default,
+            HandoffPolicy::default(),
+        ))
+    }
+
+    #[test]
+    fn parallel_command_without_handoff_is_rejected_with_hint() {
+        let mut s = state();
+        let outcome = s.execute_palette_command("/parallel cavemanish,coder");
+        let PaletteOutcome::Rejected { message } = outcome else {
+            panic!("expected rejected, got: {outcome:?}");
+        };
+        assert!(message.contains("no multi-agent"), "got: {message}");
+        assert!(message.contains("--agents-dir"), "got: {message}");
+    }
+
+    #[test]
+    fn parallel_command_with_handoff_appends_assistant_turn() {
+        let mut s = state().with_handoff(handoff_cavemanish_and_coder());
+        let outcome = s.execute_palette_command("/parallel cavemanish,coder");
+        let PaletteOutcome::Acknowledged { message } = outcome else {
+            panic!("expected acknowledged, got: {outcome:?}");
+        };
+        assert!(message.starts_with("parallel:"), "got: {message}");
+        // Transcript should now contain an Assistant turn whose concatenated
+        // text mentions both role names (each role gets its own section
+        // header).
+        let combined = s
+            .transcript()
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Assistant(blocks) => Some(concat_text_blocks(blocks)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("cavemanish") && combined.contains("coder"),
+            "expected both role headers in assistant turn; got: {combined:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_command_unknown_role_is_rejected() {
+        let mut s = state().with_handoff(handoff_cavemanish_and_coder());
+        let outcome = s.execute_palette_command("/parallel unknown-role");
+        let PaletteOutcome::Rejected { message } = outcome else {
+            panic!("expected rejected, got: {outcome:?}");
+        };
+        assert!(message.contains("unknown role"), "got: {message}");
+    }
+
+    #[test]
+    fn parallel_command_empty_args_is_rejected() {
+        let mut s = state().with_handoff(handoff_cavemanish_and_coder());
+        let outcome = s.execute_palette_command("/parallel");
+        let PaletteOutcome::Rejected { message } = outcome else {
+            panic!("expected rejected, got: {outcome:?}");
+        };
+        assert!(message.contains("unknown role"), "got: {message}");
+    }
+
+    #[test]
+    fn help_text_lists_parallel_command() {
+        assert!(HELP_TEXT.contains("/parallel"), "got: {HELP_TEXT}");
+    }
+
+    #[test]
+    fn parse_role_label_covers_every_suggested_role() {
+        assert_eq!(parse_role_label("default"), Some(SuggestedRole::Default));
+        assert_eq!(
+            parse_role_label("cavemanish"),
+            Some(SuggestedRole::Cavemanish)
+        );
+        assert_eq!(parse_role_label("polisher"), Some(SuggestedRole::Polisher));
+        assert_eq!(parse_role_label("coder"), Some(SuggestedRole::Coder));
+        assert_eq!(
+            parse_role_label("researcher"),
+            Some(SuggestedRole::Researcher)
+        );
+        assert_eq!(parse_role_label("unknown"), None);
+        assert_eq!(parse_role_label(""), None);
     }
 }
