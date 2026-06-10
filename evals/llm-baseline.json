@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "name": "llm-baseline",
+  "cases": [
+    { "id": "greet", "prompt": "say hi", "expected_substrings": ["hi"], "forbidden_substrings": [], "max_blocks": 8 },
+    { "id": "math-easy", "prompt": "What is 2+2?", "expected_substrings": ["4"], "forbidden_substrings": [], "max_blocks": 8 },
+    { "id": "explain-short", "prompt": "In one sentence, what is a CPU?", "expected_substrings": ["processor"], "forbidden_substrings": [], "max_blocks": 8 },
+    { "id": "yes-no", "prompt": "Is water wet? Answer yes or no.", "expected_substrings": [], "forbidden_substrings": [], "max_blocks": 8 },
+    { "id": "list-three", "prompt": "List three colors.", "expected_substrings": [], "forbidden_substrings": [], "max_blocks": 8 },
+    { "id": "translate-fr", "prompt": "Translate 'hello' to French.", "expected_substrings": ["bonjour"], "forbidden_substrings": [], "max_blocks": 8 },
+    { "id": "name-river", "prompt": "Name one famous river.", "expected_substrings": [], "forbidden_substrings": [], "max_blocks": 8 },
+    { "id": "letter-count", "prompt": "How many letters in 'apple'?", "expected_substrings": ["5"], "forbidden_substrings": [], "max_blocks": 8 }
+  ]
+}
