@@ -42,7 +42,7 @@ use stratum_runtime::{
     format_tokens_per_second, AgentLoop, AgentLoopConfig, AllowAllResponder, CancelToken,
     CapabilityMatrix, EchoProvider, Event as RtEvent, EventEmitter, EventRecord, IntentRouter,
     MemoryEventSink, Paths, PermissionStore, PlanMode, PromptIdGen, Provider, RoleTimer, Tier,
-    TurnContext, TurnId, TurnMetrics, TurnRecorder, TurnResult,
+    Transcript, TranscriptTurn, TurnContext, TurnId, TurnMetrics, TurnRecorder, TurnResult,
 };
 use stratum_types::{Block, ModelId, StratumResult};
 
@@ -131,6 +131,12 @@ pub struct ChatState {
     /// the same `Arc` is what makes `/plan` semantically meaningful: a
     /// toggle here immediately reflects in the loop's fence.
     plan_mode: Arc<PlanMode>,
+    /// Number of [`Turn`]s prepended from a resumed [`Transcript`].
+    ///
+    /// Set by [`Self::with_resumed_transcript`]; defaults to zero. Lets
+    /// callers render a "Resumed N turns" banner without re-walking the
+    /// transcript to count.
+    resumed_count: usize,
 }
 
 impl Default for ChatState {
@@ -170,6 +176,7 @@ impl ChatState {
             agent_loop,
             last_turn_result: None,
             plan_mode,
+            resumed_count: 0,
         }
     }
 
@@ -211,6 +218,64 @@ impl ChatState {
         self.events = events;
         self.memory_sink = None;
         self
+    }
+
+    /// Pre-populate the scrollback with the turns from a previously persisted
+    /// [`Transcript`] so a resumed session shows its prior context.
+    ///
+    /// Each [`TranscriptTurn`] is mapped to its in-memory [`Turn`] counterpart:
+    ///
+    /// * [`TranscriptTurn::User`] → [`Turn::User`].
+    /// * [`TranscriptTurn::Assistant`] → [`Turn::Assistant`] with each
+    ///   [`stratum_runtime::TranscriptBlock`] folded into a [`Block::Text`]
+    ///   carrying its rendered text. This keeps the user-visible content while
+    ///   sidestepping the impedance mismatch between the persisted block taxonomy
+    ///   and the streaming-provider [`Block`] enum.
+    /// * [`TranscriptTurn::System`] → [`Turn::Command`] with `text` prefixed by
+    ///   `"(system) "`, mirroring how the palette renders informational lines.
+    /// * [`TranscriptTurn::Command`] → [`Turn::Command`] preserving `ok`.
+    ///
+    /// Call this once, before [`Self::submit`] / [`Self::submit_with_prompt`];
+    /// existing transcript entries are preserved and the resumed turns are
+    /// appended at the current end. [`Self::resumed_count`] is updated by the
+    /// number of turns folded in.
+    #[must_use]
+    pub fn with_resumed_transcript(mut self, t: Transcript) -> Self {
+        let mut added = 0_usize;
+        for turn in t.turns {
+            let mapped = match turn {
+                TranscriptTurn::User { text, .. } => Turn::User(text),
+                TranscriptTurn::Assistant { blocks, .. } => {
+                    let mapped_blocks: Vec<Block> = blocks
+                        .into_iter()
+                        .map(|b| Block::Text { text: b.text })
+                        .collect();
+                    Turn::Assistant(mapped_blocks)
+                }
+                TranscriptTurn::System { text, .. } => Turn::Command {
+                    text: format!("(system) {text}"),
+                    ok: true,
+                    message: String::new(),
+                },
+                TranscriptTurn::Command { text, ok, .. } => Turn::Command {
+                    text,
+                    ok,
+                    message: String::new(),
+                },
+            };
+            self.transcript.push(mapped);
+            added = added.saturating_add(1);
+        }
+        self.resumed_count = self.resumed_count.saturating_add(added);
+        self
+    }
+
+    /// Number of turns prepended by [`Self::with_resumed_transcript`].
+    ///
+    /// Returns zero when no transcript was resumed.
+    #[must_use]
+    pub const fn resumed_count(&self) -> usize {
+        self.resumed_count
     }
 
     /// Borrow the most recent [`TurnResult`], if any.
@@ -1764,5 +1829,109 @@ mod tests {
         let mut s = state();
         s.submit_with_prompt("");
         assert!(s.transcript().is_empty());
+    }
+
+    // ---------- --resume / with_resumed_transcript ----------
+
+    fn fixed_at() -> std::time::SystemTime {
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)
+    }
+
+    fn resume_fixture() -> stratum_runtime::Transcript {
+        use stratum_runtime::{
+            SessionId, TranscriptBlock, TranscriptBlockKind, TRANSCRIPT_SCHEMA_VERSION,
+        };
+        stratum_runtime::Transcript {
+            schema_version: TRANSCRIPT_SCHEMA_VERSION,
+            session_id: SessionId::from_str("deadbeefcafef00d").expect("valid id"),
+            created_at: fixed_at(),
+            turns: vec![
+                stratum_runtime::TranscriptTurn::User {
+                    at: fixed_at(),
+                    text: "earlier-q".to_owned(),
+                },
+                stratum_runtime::TranscriptTurn::Assistant {
+                    at: fixed_at(),
+                    blocks: vec![TranscriptBlock {
+                        kind: TranscriptBlockKind::Text,
+                        text: "earlier-a".to_owned(),
+                    }],
+                },
+                stratum_runtime::TranscriptTurn::System {
+                    at: fixed_at(),
+                    text: "sysline".to_owned(),
+                },
+                stratum_runtime::TranscriptTurn::Command {
+                    at: fixed_at(),
+                    text: "/help".to_owned(),
+                    ok: true,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn with_resumed_transcript_counts_turns_and_populates_scrollback() {
+        let t = resume_fixture();
+        let expected = t.turns.len();
+        let s = ChatState::default().with_resumed_transcript(t);
+        assert_eq!(s.resumed_count(), expected);
+        assert_eq!(s.transcript().len(), expected);
+        // User and Assistant turns must round-trip through the in-memory
+        // shapes — System and Command both fold to Turn::Command.
+        assert!(matches!(&s.transcript()[0], Turn::User(text) if text == "earlier-q"));
+        match &s.transcript()[1] {
+            Turn::Assistant(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(&blocks[0], Block::Text { text } if text == "earlier-a"));
+            }
+            other => panic!("expected Turn::Assistant, got {other:?}"),
+        }
+        match &s.transcript()[2] {
+            Turn::Command { text, ok, .. } => {
+                assert!(text.starts_with("(system)"), "got: {text}");
+                assert!(ok);
+            }
+            other => panic!("expected Turn::Command for system, got {other:?}"),
+        }
+        match &s.transcript()[3] {
+            Turn::Command { text, ok, .. } => {
+                assert_eq!(text, "/help");
+                assert!(ok);
+            }
+            other => panic!("expected Turn::Command for command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_resumed_transcript_default_count_is_zero() {
+        let s = ChatState::default();
+        assert_eq!(s.resumed_count(), 0);
+    }
+
+    #[test]
+    fn with_resumed_transcript_empty_turns_yields_zero_count() {
+        use stratum_runtime::{SessionId, TRANSCRIPT_SCHEMA_VERSION};
+        let t = stratum_runtime::Transcript {
+            schema_version: TRANSCRIPT_SCHEMA_VERSION,
+            session_id: SessionId::from_str("0123456789abcdef").expect("valid id"),
+            created_at: fixed_at(),
+            turns: vec![],
+        };
+        let s = ChatState::default().with_resumed_transcript(t);
+        assert_eq!(s.resumed_count(), 0);
+        assert!(s.transcript().is_empty());
+    }
+
+    #[test]
+    fn resumed_count_independent_of_submit() {
+        // Submit a new turn after resume; resumed_count must NOT increase.
+        let t = resume_fixture();
+        let mut s = ChatState::default().with_resumed_transcript(t);
+        let baseline = s.resumed_count();
+        let pre_len = s.transcript().len();
+        s.submit_with_prompt("hi");
+        assert_eq!(s.resumed_count(), baseline);
+        assert!(s.transcript().len() > pre_len);
     }
 }
