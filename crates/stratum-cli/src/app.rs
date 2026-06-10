@@ -3200,13 +3200,16 @@ fn client_unix_roundtrip(_path: &Path, _line: &str, _timeout: Duration) -> Resul
 }
 
 fn print_greeting(paths: &Paths, out: &mut dyn Write) -> ExitCode {
-    let installed = paths.installed_toml();
-    let status = if installed.exists() {
-        "installed"
+    let installed_path = paths.installed_toml();
+    let (tier, status) = if installed_path.exists() {
+        match InstalledToml::load(&installed_path) {
+            Ok(rec) => (rec.tier.to_string(), "installed"),
+            Err(_) => ("unknown".to_string(), "installed (config unreadable)"),
+        }
     } else {
-        "not installed; run `stratum init`"
+        ("unknown".to_string(), "not installed; run `stratum init`")
     };
-    if writeln!(out, "hello, tier=unknown — {status}").is_err() {
+    if writeln!(out, "hello, tier={tier} — {status}").is_err() {
         return ExitCode::from(74);
     }
     ExitCode::SUCCESS
@@ -4791,6 +4794,20 @@ mod tests {
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert!(out.contains("hello, tier=unknown"));
         assert!(out.contains("not installed"));
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn default_prints_real_tier_when_installed() {
+        let tmp = TempDir::new().unwrap();
+        // Materialize installed.toml via `stratum init`.
+        let (_init_code, _init_out, _init_err) = drive_under(&["init"], tmp.path());
+        let (code, out, err) = drive_under(&[], tmp.path());
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(out.starts_with("hello, tier="));
+        assert!(!out.contains("tier=unknown"));
+        assert!(out.contains("— installed"));
+        assert!(!out.contains("not installed"));
         assert!(err.is_empty());
     }
 
