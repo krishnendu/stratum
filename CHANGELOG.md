@@ -4,6 +4,19 @@ All notable changes to Stratum. Format: [Keep a Changelog](https://keepachangelo
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-11
+
+User-visible plumbing for the v0.2.0 runtime capabilities.
+
+### Fixed
+- Brew install conflict: `stratum` and `stratum-llama-cpp` formulas now declare `conflicts_with` each other (both ship a `stratum` binary). Users must `brew uninstall` one before installing the other (#146).
+- `stratum models sync` no longer 404s — release workflow now publishes `catalog-stable.json` with an opinionated seed entry (Qwen2.5 0.5B Q4_K_M pointed at HuggingFace) (#146).
+
+### Added
+- `stratum chat --agents-dir <dir>` now resolves each agent's `model = "<slug>"` TOML field through `<state>/models.json` + `ModelInstaller`. Without `--features provider-llama-cpp` the resolver errors clearly per role; with the feature each role loads its own GGUF (#147).
+- `stratum chat --parallel <role1,role2,...> --prompt "..."` fans the prompt out to N agents concurrently via `AgentHandoff::run_turn_parallel` and renders per-role results. JSON form available via `--json` (#148).
+- `/parallel <roles>` palette command in the chat TUI dispatches the same flow live (#148).
+
 ## [0.2.0] - 2026-06-11
 
 First minor bump. Bundles UX polish + secondary brew formula for real-LLM build.

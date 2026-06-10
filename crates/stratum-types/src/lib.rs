@@ -15,7 +15,7 @@ pub mod error;
 mod ids;
 mod mem;
 
-pub use block::Block;
+pub use block::{AudioData, Block, ImageData};
 pub use capability::{Capability, ConcurrencyModel, Family};
 pub use error::{ErrorCode, StratumError, StratumResult};
 pub use ids::{ModelId, RoleId};
