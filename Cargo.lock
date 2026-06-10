@@ -1502,6 +1502,7 @@ dependencies = [
  "stratum-types",
  "tempfile",
  "time",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "ureq",
