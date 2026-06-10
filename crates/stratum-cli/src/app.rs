@@ -17,10 +17,10 @@ use stratum_runtime::{
     GenerateRequest, GpuBackend, HardwareProbe, InstalledToml, LoadedModel, ManifestError,
     McpServerConfig, McpServerSet, McpTransport, MemoryEventSink, MemoryGate, ModelCatalog,
     ModelEntry, ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag, Paths, PlatformTag,
-    Provider, ReleaseChannel, ReleaseVersion, SandboxReport, ServeBind, ServeConfig, ServeHandler,
-    ServeServer, SessionId, TelemetryConfig, TelemetryEventKind, TelemetryPayload, Tier,
-    Transcript, TranscriptBlock, TranscriptStore, TranscriptTurn, UpdateChannel, UpdateDecision,
-    UpdateManifest, DEFAULT_MARGIN_MIB,
+    Provider, ReleaseChannel, ReleaseVersion, RequestId, SandboxReport, ServeBind, ServeConfig,
+    ServeHandler, ServeServer, SessionId, TelemetryConfig, TelemetryEventKind, TelemetryPayload,
+    Tier, Transcript, TranscriptBlock, TranscriptStore, TranscriptTurn, UpdateChannel,
+    UpdateDecision, UpdateManifest, DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::format_description::well_known::Rfc3339;
@@ -81,9 +81,51 @@ enum Command {
     /// Start the JSON-RPC daemon (`stratum serve`) on a Unix socket or
     /// loopback TCP port.
     Serve(ServeArgs),
+    /// JSON-RPC client: invoke a single method against a running
+    /// `stratum serve` daemon and print the response.
+    Client(ClientArgs),
     /// Inspect configured MCP (Model Context Protocol) upstream servers.
     #[command(subcommand)]
     Mcp(McpCommand),
+}
+
+/// Default loopback TCP address used by `stratum client` when neither
+/// `--tcp` nor `--unix-socket` is passed. Documented in the `--tcp`
+/// help text and exercised by the integration tests.
+const DEFAULT_CLIENT_TCP: &str = "127.0.0.1:54321";
+
+/// Arguments for `stratum client`.
+///
+/// Drives a single JSON-RPC 2.0 round-trip against a running
+/// `stratum serve` daemon. Exactly one of `--tcp <HOST:PORT>` or
+/// `--unix-socket <PATH>` selects the transport; passing both is
+/// rejected by clap with exit 64. When neither flag is passed the
+/// client defaults to `--tcp 127.0.0.1:54321` so simple local runs
+/// work without ceremony.
+#[derive(Debug, Args)]
+struct ClientArgs {
+    /// JSON-RPC method name (e.g. `ping`, `health`, `run_turn`).
+    #[arg(long, value_name = "NAME")]
+    method: String,
+    /// JSON-encoded `params` value. Defaults to `{}`.
+    #[arg(long, value_name = "JSON")]
+    params: Option<String>,
+    /// Connect over loopback TCP at `HOST:PORT`. Mutually exclusive
+    /// with `--unix-socket`. Defaults to `127.0.0.1:54321` when
+    /// neither transport flag is set.
+    #[arg(long, value_name = "HOST:PORT", conflicts_with = "unix_socket")]
+    tcp: Option<String>,
+    /// Connect over a Unix-domain socket. Mutually exclusive with
+    /// `--tcp`.
+    #[arg(long, value_name = "PATH", conflicts_with = "tcp")]
+    unix_socket: Option<PathBuf>,
+    /// Per-request connect + read deadline, in milliseconds.
+    #[arg(long, value_name = "N", default_value_t = 10_000)]
+    timeout_ms: u64,
+    /// Emit the raw JSON-RPC `result`/`error` payload instead of the
+    /// default prose summary.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Subcommands under `stratum mcp`.
@@ -864,6 +906,7 @@ where
         }
         Some(Command::Eval(EvalCommand::Run(eval_args))) => eval_run(&eval_args, &paths, out, err),
         Some(Command::Serve(serve_args)) => serve(&serve_args, &paths, out, err),
+        Some(Command::Client(client_args)) => client(&client_args, out, err),
         Some(Command::Mcp(McpCommand::List(mcp_args))) => mcp_list(&paths, &mcp_args, out, err),
     }
 }
@@ -2270,6 +2313,232 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
 #[derive(Debug, Serialize)]
 struct ServeStartupReport<'a> {
     bound: &'a str,
+}
+
+/// Serialize a JSON-RPC 2.0 request envelope into a single line of JSON
+/// (no trailing newline; the caller adds `'\n'` for line framing).
+///
+/// Mirrors the shape of `stratum_runtime::render_serve_response` so the
+/// client and server agree on framing without us needing to re-implement
+/// `serde_json` plumbing on either side.
+fn render_client_request(method: &str, id: &RequestId, params: &serde_json::Value) -> String {
+    let id_value = match id {
+        RequestId::Num(n) => serde_json::Value::from(*n),
+        RequestId::Str(s) => serde_json::Value::from(s.clone()),
+        RequestId::Null => serde_json::Value::Null,
+    };
+    let mut obj = serde_json::Map::new();
+    obj.insert("jsonrpc".to_string(), serde_json::Value::from("2.0"));
+    obj.insert("id".to_string(), id_value);
+    obj.insert("method".to_string(), serde_json::Value::from(method));
+    obj.insert("params".to_string(), params.clone());
+    serde_json::Value::Object(obj).to_string()
+}
+
+/// `stratum client` entry point.
+///
+/// Connects to a running `stratum serve` daemon over either TCP loopback
+/// or a Unix-domain socket, sends a single JSON-RPC 2.0 request, reads
+/// one newline-delimited response line, and prints either a prose summary
+/// or the raw `result`/`error` JSON (`--json`).
+///
+/// Exit codes:
+/// * `0` — server returned `result`.
+/// * `1` — server returned `error`, connect failed, IO failed, parse
+///   failed, or the read deadline elapsed.
+/// * `64` — clap rejected the invocation (mutually-exclusive transport
+///   flags). Handled upstream by `Cli::try_parse_from`.
+fn client(args: &ClientArgs, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    // Parse --params; default to {}.
+    let params: serde_json::Value = match args.params.as_deref() {
+        None => serde_json::json!({}),
+        Some(raw) => match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 invalid --params: {e}");
+                return ExitCode::from(1);
+            }
+        },
+    };
+
+    let line = render_client_request(&args.method, &RequestId::Num(1), &params);
+    let timeout = Duration::from_millis(args.timeout_ms);
+
+    // Dispatch over the chosen transport. Unix takes priority over TCP
+    // when both are set — but clap's `conflicts_with` rules out that
+    // combination upstream.
+    let response_line = if let Some(sock_path) = args.unix_socket.as_deref() {
+        match client_unix_roundtrip(sock_path, &line, timeout) {
+            Ok(resp) => resp,
+            Err(diag) => {
+                let _ = writeln!(err, "{diag}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        let addr = args.tcp.as_deref().unwrap_or(DEFAULT_CLIENT_TCP);
+        match client_tcp_roundtrip(addr, &line, timeout) {
+            Ok(resp) => resp,
+            Err(diag) => {
+                let _ = writeln!(err, "{diag}");
+                return ExitCode::from(1);
+            }
+        }
+    };
+
+    print_client_response(&response_line, args.json, out, err)
+}
+
+/// Parse the server's response line and emit either the prose summary
+/// (default) or the raw `result`/`error` JSON (`--json`). Exit 0 on
+/// `result`, exit 1 on `error` (or on a malformed envelope).
+fn print_client_response(
+    response: &str,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let parsed: serde_json::Value = match serde_json::from_str(response.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 invalid response from server: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(result) = parsed.get("result") {
+        if json {
+            let rendered =
+                serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string());
+            if writeln!(out, "{rendered}").is_err() {
+                return ExitCode::from(74);
+            }
+        } else {
+            let rendered =
+                serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string());
+            if writeln!(out, "ok: {rendered}").is_err() {
+                return ExitCode::from(74);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    if let Some(error) = parsed.get("error") {
+        if json {
+            let rendered =
+                serde_json::to_string_pretty(error).unwrap_or_else(|_| error.to_string());
+            let _ = writeln!(err, "{rendered}");
+        } else {
+            let code = error
+                .get("code")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let message = error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let _ = writeln!(err, "error {code}: {message}");
+        }
+        return ExitCode::from(1);
+    }
+    let _ = writeln!(
+        err,
+        "STRAT-E1001 response envelope had neither result nor error"
+    );
+    ExitCode::from(1)
+}
+
+/// Connect to `addr`, send `line + '\n'`, and read one newline-delimited
+/// response line back. The deadline applies to connect, write, and read
+/// independently — a single round-trip should never exceed `timeout`
+/// total in the common case.
+///
+/// # Errors
+///
+/// Returns a human-readable diagnostic string (prefixed `STRAT-E1001`)
+/// on any failure: address parse, connect, write, deadline expiry, or
+/// peer EOF before a full line.
+fn client_tcp_roundtrip(addr: &str, line: &str, timeout: Duration) -> Result<String, String> {
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+
+    let resolved: Vec<SocketAddr> = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("STRAT-E1001 invalid --tcp address {addr}: {e}"))?
+        .collect();
+    let first = resolved
+        .first()
+        .ok_or_else(|| format!("STRAT-E1001 --tcp {addr} resolved to no addresses"))?;
+    let mut stream = TcpStream::connect_timeout(first, timeout)
+        .map_err(|e| format!("STRAT-E1001 cannot connect to {addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("STRAT-E1001 set_read_timeout failed: {e}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| format!("STRAT-E1001 set_write_timeout failed: {e}"))?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| diagnose_io_err("write", &e, timeout))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|e| diagnose_io_err("write", &e, timeout))?;
+    let mut reader = BufReader::new(stream);
+    let mut resp = String::new();
+    let n = reader
+        .read_line(&mut resp)
+        .map_err(|e| diagnose_io_err("read", &e, timeout))?;
+    if n == 0 {
+        return Err("STRAT-E1001 server closed connection before sending a response".to_string());
+    }
+    Ok(resp)
+}
+
+/// Map an `io::Error` from a deadline-bounded socket op into a
+/// diagnostic. Read/write timeouts surface as `WouldBlock` or `TimedOut`
+/// on the various platforms; both map to `STRAT-E1001 ... timeout`.
+fn diagnose_io_err(op: &str, e: &std::io::Error, timeout: Duration) -> String {
+    match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            format!("STRAT-E1001 {op} timeout after {} ms", timeout.as_millis())
+        }
+        _ => format!("STRAT-E1001 {op} failed: {e}"),
+    }
+}
+
+/// Unix-socket twin of [`client_tcp_roundtrip`]. Compiled only on `unix`;
+/// the [`client`] dispatcher gates the call site so non-Unix builds
+/// silently drop the variant via clap's existing parsing.
+#[cfg(unix)]
+fn client_unix_roundtrip(path: &Path, line: &str, timeout: Duration) -> Result<String, String> {
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(path)
+        .map_err(|e| format!("STRAT-E1001 cannot connect to {}: {e}", path.display()))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("STRAT-E1001 set_read_timeout failed: {e}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| format!("STRAT-E1001 set_write_timeout failed: {e}"))?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| diagnose_io_err("write", &e, timeout))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|e| diagnose_io_err("write", &e, timeout))?;
+    let mut reader = BufReader::new(stream);
+    let mut resp = String::new();
+    let n = reader
+        .read_line(&mut resp)
+        .map_err(|e| diagnose_io_err("read", &e, timeout))?;
+    if n == 0 {
+        return Err("STRAT-E1001 server closed connection before sending a response".to_string());
+    }
+    Ok(resp)
+}
+
+/// Stub for non-Unix targets so the call site in [`client`] type-checks.
+#[cfg(not(unix))]
+fn client_unix_roundtrip(_path: &Path, _line: &str, _timeout: Duration) -> Result<String, String> {
+    Err("STRAT-E1001 --unix-socket is not supported on this platform".to_string())
 }
 
 fn print_greeting(paths: &Paths, out: &mut dyn Write) -> ExitCode {
