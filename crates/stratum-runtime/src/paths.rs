@@ -66,7 +66,7 @@ impl Paths {
                 StratumError::new(E1001_INSTALLED_SCHEMA_UNREADABLE, "OS exposes no data dir")
             })?
             .join("stratum");
-        let state = state.unwrap_or_else(|| data.clone()).join("stratum");
+        let state = state.map_or_else(|| data.clone(), |p| p.join("stratum"));
         let cache = cache
             .ok_or_else(|| {
                 StratumError::new(E1001_INSTALLED_SCHEMA_UNREADABLE, "OS exposes no cache dir")
