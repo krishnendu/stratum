@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "name": "baseline",
+  "cases": [
+    {
+      "id": "echo-hello",
+      "prompt": "hello",
+      "expected_substrings": ["hello"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-multiline",
+      "prompt": "line1\nline2",
+      "expected_substrings": ["line1", "line2"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-unicode",
+      "prompt": "café 🚀",
+      "expected_substrings": ["café", "🚀"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-empty-rejected",
+      "prompt": "",
+      "expected_substrings": [],
+      "forbidden_substrings": ["error"],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-long",
+      "prompt": "the quick brown fox jumps over the lazy dog",
+      "expected_substrings": ["quick", "brown", "fox", "lazy", "dog"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-quotes",
+      "prompt": "she said \"hello\"",
+      "expected_substrings": ["she", "said", "hello"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-json-like",
+      "prompt": "{\"k\": 1}",
+      "expected_substrings": ["{", "}", "k", "1"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-code-snippet",
+      "prompt": "fn main() { println!(\"hi\"); }",
+      "expected_substrings": ["fn", "main()", "println!", "hi"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-question",
+      "prompt": "what is 2+2?",
+      "expected_substrings": ["2+2", "?"],
+      "forbidden_substrings": [],
+      "max_blocks": 1
+    },
+    {
+      "id": "echo-no-forbidden",
+      "prompt": "this should pass without issue",
+      "expected_substrings": ["pass", "without"],
+      "forbidden_substrings": ["fail", "error", "panic"],
+      "max_blocks": 1
+    }
+  ]
+}
