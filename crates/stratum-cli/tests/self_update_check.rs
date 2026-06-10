@@ -476,10 +476,11 @@ fn check_rejects_mutually_exclusive_manifest_sources() {
 
 #[test]
 fn check_default_current_falls_back_to_cargo_pkg_version() {
-    // CARGO_PKG_VERSION is `0.0.0` in this workspace; a manifest whose latest
-    // is `0.0.0` therefore yields UpToDate without `--current`.
+    // A manifest whose latest matches the workspace's `CARGO_PKG_VERSION`
+    // yields UpToDate without `--current`.
+    let pkg_version = env!("CARGO_PKG_VERSION");
     let tmp = TempDir::new().unwrap();
-    let manifest = build_manifest_json(&["0.0.0"], wire_platform_for("linux_x86_64"), None);
+    let manifest = build_manifest_json(&[pkg_version], wire_platform_for("linux_x86_64"), None);
     let fixture = write_fixture(tmp.path(), "manifest.json", &manifest);
     let output = run(
         &[
@@ -499,5 +500,5 @@ fn check_default_current_falls_back_to_cargo_pkg_version() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("up to date"), "stdout: {stdout}");
-    assert!(stdout.contains("0.0.0"));
+    assert!(stdout.contains(pkg_version));
 }
