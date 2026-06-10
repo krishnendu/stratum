@@ -19,6 +19,9 @@ class Stratum < Formula
   license any_of: ["Apache-2.0", "MIT"]
   version "0.2.0"
 
+  conflicts_with "stratum-llama-cpp",
+    because: "both install a `stratum` binary; pick the prebuilt or the LLM-enabled build"
+
   on_macos do
     on_arm do
       url "https://github.com/krishnendu/stratum/releases/download/v0.2.0/stratum-v0.2.0-aarch64-apple-darwin.tar.gz"
