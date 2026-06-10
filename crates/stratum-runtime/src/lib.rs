@@ -118,6 +118,8 @@ pub mod provider;
 pub mod provider_cache;
 /// RAG index data shape and in-memory index (Phase 1 scaffold for Phase 4+).
 pub mod rag;
+/// `RagIndexBuilder` — workspace tree → `RagIndex` + `InMemoryVectorStore` pipeline.
+pub mod rag_index_builder;
 /// Token-bucket rate limiter primitives (scaffold for `stratum serve`).
 pub mod rate_limit;
 /// Provider registry + role-to-provider routing table.
@@ -260,6 +262,9 @@ pub use prompts::{system_prompt, PromptRole};
 pub use provider::{EchoProvider, GenerateRequest, Provider};
 pub use provider_cache::{CacheError, CacheSlot, ProviderCache, ProviderKey};
 pub use rag::{chunk_document, Chunk, ChunkPlan, ChunkSpan, DocumentId, RagDocument, RagIndex};
+pub use rag_index_builder::{
+    BuildStats, BuiltIndex, RagBuildError, RagIndexBuilder, DEFAULT_MAX_FILE_BYTES,
+};
 pub use rate_limit::{
     Clock, KeyedRateLimiter, ManualClock, RateLimitError, SystemClock, TokenBucket,
     TokenBucketConfig,
