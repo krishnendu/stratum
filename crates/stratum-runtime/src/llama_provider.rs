@@ -19,7 +19,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use stratum_types::{Block, Capability};
@@ -49,7 +49,12 @@ fn shared_backend() -> Result<Arc<LlamaBackend>, LlamaProviderError> {
     static BACKEND: OnceLock<Result<Arc<LlamaBackend>, String>> = OnceLock::new();
     let cached = BACKEND.get_or_init(|| {
         LlamaBackend::init()
-            .map(Arc::new)
+            .map(|mut b| {
+                if std::env::var_os("STRATUM_LLAMA_VERBOSE").is_none() {
+                    b.void_logs();
+                }
+                Arc::new(b)
+            })
             .map_err(|e| e.to_string())
     });
     match cached {
@@ -122,6 +127,10 @@ pub struct LlamaCppProvider {
     n_threads: i32,
     /// Sampling seed copied from the config.
     seed: u64,
+    /// Tool names + one-line descriptions surfaced to the model in the
+    /// system prompt so it knows what verbs to emit. `(id, description)`.
+    /// Empty list = no tool guidance injected.
+    tools: Vec<(String, String)>,
 }
 
 impl LlamaCppProvider {
@@ -150,7 +159,16 @@ impl LlamaCppProvider {
             n_ctx: cfg.n_ctx,
             n_threads: cfg.n_threads.unwrap_or(0),
             seed: cfg.seed,
+            tools: Vec::new(),
         })
+    }
+
+    /// Install the tool catalog the model is told about in its system
+    /// prompt. Empty list disables tool guidance.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<(String, String)>) -> Self {
+        self.tools = tools;
+        self
     }
 
     /// Sampling temperature actually used for a request.
@@ -180,15 +198,155 @@ impl LlamaCppProvider {
         ])
     }
 
+    /// Build the system message that tells the model which tools are
+    /// available and how to call them. Empty `tools` list returns the
+    /// generic helpful-assistant prompt.
+    fn system_prompt(&self) -> String {
+        if self.tools.is_empty() {
+            return "You are Stratum, a friendly local coding assistant.".to_string();
+        }
+        use std::fmt::Write;
+        let mut out = String::with_capacity(1024);
+
+        // -- 1. IDENTITY (one sentence, top of prompt). --
+        out.push_str(
+            "You are Stratum, a friendly local coding assistant running on the user's \
+             machine.\n\n",
+        );
+
+        // -- 2. MODES. Strict default = chat; tool use is the exception. --
+        out.push_str(
+            "## MODES\n\
+             You have two modes. By default you are in CHAT mode and you reply in plain \
+             English. You only switch to TOOL mode when the user explicitly asks for a \
+             workspace action.\n\n\
+             CHAT mode applies to: greetings, questions about your capabilities, opinions, \
+             explanations, summaries of prior tool output, code discussion, debugging \
+             advice, planning, anything conversational.\n\n\
+             TOOL mode applies to: \"list files\", \"open <file>\", \"read <file>\", \
+             \"search for <pattern>\", \"find <regex>\", \"edit <file>\", \"write <file>\", \
+             \"run <allowlisted command>\". The user names a concrete workspace operation.\n\n",
+        );
+
+        // -- 3. RULES — named bans (Cline-style). --
+        out.push_str(
+            "## RULES\n\
+             1. You are STRICTLY FORBIDDEN from emitting JSON, code fences containing JSON, \
+                or any tool-call payload in CHAT mode. A user typing \"hi\", \"hello\", \
+                \"what can you do\", or any greeting/question/discussion gets a plain \
+                English reply only.\n\
+             2. You are STRICTLY FORBIDDEN from inventing filenames or paths. Use only \
+                paths the user typed in this conversation or paths returned by a prior \
+                `glob` / `grep` call.\n\
+             3. You are STRICTLY FORBIDDEN from using absolute paths (`/`, `/tmp`, \
+                `/workspace`, `/etc`, `~`, `~/.ssh`) or parent-dir escapes (`..`). \
+                Paths are always workspace-relative.\n\
+             4. You are STRICTLY FORBIDDEN from chaining tool calls in one reply. Emit \
+                exactly one JSON object per turn, then wait for the result.\n\
+             5. You are STRICTLY FORBIDDEN from wrapping JSON in markdown code fences \
+                (` ```json `, ` ``` `). The JSON stands alone on one line.\n\n",
+        );
+
+        // -- 4. TOOL FORMAT (over-specified, one shape only). --
+        out.push_str(
+            "## TOOL FORMAT\n\
+             When (and only when) you are in TOOL mode, your entire reply is exactly one \
+             line of JSON, this shape:\n\
+             {\"tool\":\"<tool_id>\",\"args\":{...}}\n\n",
+        );
+
+        // -- 5. AVAILABLE TOOLS (compact name list; details in examples). --
+        out.push_str("## AVAILABLE TOOLS\n");
+        for (id, desc) in &self.tools {
+            let _ = writeln!(out, "- `{id}` — {desc}");
+        }
+        out.push('\n');
+
+        // -- 6. FEW-SHOT (form-teaching, not content-teaching). --
+        out.push_str(
+            "## EXAMPLES\n\
+             user: hi\n\
+             assistant: Hello! What can I help with today?\n\n\
+             user: what tools do you have\n\
+             assistant: I can list files (glob), search code (grep), read/edit/write files, \
+             and run a few shell commands. Tell me what you'd like and I'll do it.\n\n\
+             user: what can you do\n\
+             assistant: I'm a local coding assistant. I can chat, plan, explain code, and \
+             when you point me at the workspace I can list files, search, read, edit, write, \
+             and run a few small shell commands. What are you working on?\n\n\
+             user: list rust files\n\
+             assistant: {\"tool\":\"glob\",\"args\":{\"pattern\":\"**/*.rs\"}}\n\n\
+             user: show me Cargo.toml\n\
+             assistant: {\"tool\":\"fs.read\",\"args\":{\"path\":\"Cargo.toml\"}}\n\n\
+             user: find usages of `foo`\n\
+             assistant: {\"tool\":\"grep\",\"args\":{\"pattern\":\"foo\"}}\n\n",
+        );
+
+        // -- 7. REMINDER. --
+        out.push_str(
+            "When in doubt: CHAT mode. Plain English. No JSON.\n",
+        );
+        out
+    }
+
+    fn format_chat_prompt(&self, prompt: &str) -> String {
+        let system = self.system_prompt();
+        let chatml_fallback = || {
+            format!(
+                "<|im_start|>system\n{system}<|im_end|>\n\
+                 <|im_start|>user\n{prompt}<|im_end|>\n\
+                 <|im_start|>assistant\n"
+            )
+        };
+        let tmpl = match self.model.chat_template(None) {
+            Ok(t) => t,
+            Err(_) => match LlamaChatTemplate::new("chatml") {
+                Ok(t) => t,
+                Err(_) => return chatml_fallback(),
+            },
+        };
+        let system_msg = LlamaChatMessage::new("system".to_string(), system.clone()).ok();
+        let user_msg = match LlamaChatMessage::new("user".to_string(), prompt.to_string()) {
+            Ok(m) => m,
+            Err(_) => return chatml_fallback(),
+        };
+        let msgs: Vec<LlamaChatMessage> = match system_msg {
+            Some(s) => vec![s, user_msg],
+            None => vec![user_msg],
+        };
+        self.model
+            .apply_chat_template(&tmpl, &msgs, true)
+            .unwrap_or_else(|_| chatml_fallback())
+    }
+
     /// Run the core generate loop, returning aggregated text.
     fn generate_text(
         &self,
         req: &GenerateRequest,
         cancel: &CancelToken,
     ) -> Result<Option<String>, LlamaProviderError> {
+        self.generate_text_streaming(req, cancel, &|_| {})
+    }
+
+    fn generate_text_streaming(
+        &self,
+        req: &GenerateRequest,
+        cancel: &CancelToken,
+        on_piece: &dyn Fn(&str),
+    ) -> Result<Option<String>, LlamaProviderError> {
         let n_ctx_nz = NonZeroU32::new(self.n_ctx)
             .ok_or_else(|| LlamaProviderError::Backend("n_ctx must be non-zero".to_string()))?;
-        let mut ctx_params = LlamaContextParams::default().with_n_ctx(Some(n_ctx_nz));
+        // `n_batch` must be >= prompt token count or llama.cpp asserts
+        // `GGML_ASSERT(n_tokens_all <= cparams.n_batch)`. Set it equal
+        // to `n_ctx` so the largest single decode fits. The KV slot
+        // allocator concern that motivated the old 512 cap is addressed
+        // by `with_kv_unified` + the `next_pos < n_ctx` guard in the
+        // generation loop below.
+        let mut ctx_params = LlamaContextParams::default()
+            .with_n_ctx(Some(n_ctx_nz))
+            .with_n_batch(self.n_ctx)
+            .with_n_seq_max(1)
+            .with_kv_unified(true);
         if self.n_threads > 0 {
             ctx_params = ctx_params
                 .with_n_threads(self.n_threads)
@@ -200,9 +358,10 @@ impl LlamaCppProvider {
             .new_context(&self.backend, ctx_params)
             .map_err(|e| LlamaProviderError::Backend(e.to_string()))?;
 
+        let formatted_prompt = self.format_chat_prompt(&req.prompt);
         let prompt_tokens = self
             .model
-            .str_to_token(&req.prompt, AddBos::Always)
+            .str_to_token(&formatted_prompt, AddBos::Never)
             .map_err(|e| LlamaProviderError::Tokenize(e.to_string()))?;
         if prompt_tokens.is_empty() {
             return Ok(None);
@@ -234,9 +393,13 @@ impl LlamaCppProvider {
         let mut next_pos = i32::try_from(prompt_tokens.len())
             .map_err(|e| LlamaProviderError::Tokenize(e.to_string()))?;
 
+        let n_ctx_i32 = i32::try_from(self.n_ctx).unwrap_or(i32::MAX);
         while produced < max_new_tokens {
             if cancel.is_cancelled() {
                 return Ok(None);
+            }
+            if next_pos >= n_ctx_i32 {
+                break;
             }
             let token: LlamaToken = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(token);
@@ -248,6 +411,7 @@ impl LlamaCppProvider {
                 .token_to_piece(token, &mut decoder, false, None)
                 .map_err(|e| LlamaProviderError::DecodeUtf8(e.to_string()))?;
             output.push_str(&piece);
+            on_piece(&piece);
 
             batch.clear();
             batch
@@ -279,7 +443,7 @@ impl Provider for LlamaCppProvider {
 
     fn generate(&self, req: &GenerateRequest, cancel: &CancelToken) -> Vec<Block> {
         match self.generate_text(req, cancel) {
-            Ok(Some(text)) => vec![Block::Text { text }],
+            Ok(Some(text)) => text_to_blocks(text),
             Ok(None) => Vec::new(),
             Err(e) => vec![Block::Cancelled {
                 // No dedicated `STRAT-E####` is assigned yet — the CLI
@@ -290,6 +454,123 @@ impl Provider for LlamaCppProvider {
             }],
         }
     }
+
+    fn generate_streaming(
+        &self,
+        req: &GenerateRequest,
+        cancel: &CancelToken,
+        on_chunk: &dyn Fn(&Block),
+    ) -> Vec<Block> {
+        // Emit a `Block::Text` per llama.cpp piece as the model decodes.
+        // The final returned `Vec<Block>` still holds the consolidated
+        // text — possibly converted into a `Block::ToolCall` if the
+        // model emitted a JSON tool call — so existing callers see
+        // the same shape.
+        let result = self.generate_text_streaming(req, cancel, &|piece| {
+            on_chunk(&Block::Text {
+                text: piece.to_string(),
+            });
+        });
+        match result {
+            Ok(Some(text)) => text_to_blocks(text),
+            Ok(None) => Vec::new(),
+            Err(e) => vec![Block::Cancelled {
+                reason: format!("llama-cpp provider failure: {e}"),
+            }],
+        }
+    }
+}
+
+/// Convert a raw model output string into one or more `Block`s.
+///
+/// If the output is a JSON object of shape `{"tool":"...","args":{...}}`
+/// (optionally wrapped in surrounding whitespace), emit a
+/// `Block::ToolCall` the dispatcher loop can consume. Otherwise emit a
+/// plain `Block::Text`. The detection is lenient — we accept whitespace
+/// before the opening brace and ignore trailing text after the
+/// matching close — so partial-stream artifacts and trailing newlines
+/// don't break detection.
+fn text_to_blocks(text: String) -> Vec<Block> {
+    let trimmed = strip_code_fence(text.trim());
+    // Did the model attempt a tool call (starts with `{` and mentions
+    // a "tool" key)? We track this so a malformed attempt doesn't fall
+    // back to rendering the raw JSON as user-visible text.
+    let looks_like_tool_attempt = trimmed.starts_with('{') && trimmed.contains("\"tool\"");
+    if let Some(stripped) = trimmed.strip_prefix('{') {
+        if let Some(end_idx) = find_balanced_close(stripped) {
+            let candidate = &trimmed[..=end_idx + 1];
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(candidate) {
+                if let (Some(serde_json::Value::String(tool)), Some(args_val)) =
+                    (map.get("tool"), map.get("args"))
+                {
+                    let args_str = serde_json::to_string(args_val).unwrap_or_else(|_| "{}".to_string());
+                    return vec![Block::ToolCall {
+                        id: format!("call-{tool}"),
+                        tool: tool.clone(),
+                        args: args_str,
+                    }];
+                }
+            }
+        }
+    }
+    if looks_like_tool_attempt {
+        // Malformed / unparseable tool call attempt. Replace with a
+        // human-readable marker instead of leaking the JSON.
+        return vec![Block::Text {
+            text: "(model tried to call a tool but emitted a malformed payload; ignoring)"
+                .to_string(),
+        }];
+    }
+    vec![Block::Text { text }]
+}
+
+/// Strip a leading / trailing markdown code fence (```json, ```text,
+/// ```, etc.) so the JSON-tool-call detector sees the raw object even
+/// when the model wraps it for "presentation". Idempotent: if no fence
+/// is present, returns the input unchanged.
+fn strip_code_fence(s: &str) -> &str {
+    let mut out = s;
+    if let Some(rest) = out.strip_prefix("```") {
+        // Skip the optional language tag up to the first newline.
+        if let Some(nl) = rest.find('\n') {
+            out = &rest[nl + 1..];
+        } else {
+            out = rest;
+        }
+    }
+    if let Some(rest) = out.strip_suffix("```") {
+        out = rest.trim_end();
+    }
+    out.trim()
+}
+
+/// Find the index (relative to `s`) of the `}` that closes the
+/// opening `{` immediately before `s`. Assumes `s` starts inside
+/// the object body. Returns `None` if no balanced close is found.
+fn find_balanced_close(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 1i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match b {
+            b'\\' if in_string => escape = true,
+            b'"' => in_string = !in_string,
+            b'{' if !in_string => depth += 1,
+            b'}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Five-token deterministic smoke check used by the on-demand workflow.

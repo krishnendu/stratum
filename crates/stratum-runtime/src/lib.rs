@@ -135,6 +135,8 @@ pub mod registry;
 pub mod retry;
 /// Sandbox backend detection.
 pub mod sandbox;
+/// Subagent primitive: TOML schema + loader + builtin seed.
+pub mod subagent;
 /// Sandbox profile bodies (bwrap-*, macos-*, passthrough).
 pub mod sandbox_profile;
 /// Sandbox-profile resolver — combine profile + caps + workspace → launch spec.

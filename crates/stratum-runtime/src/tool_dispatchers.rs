@@ -63,6 +63,14 @@ const E_DISPATCH_SIZE_CAP: &str = "E_DISPATCH_SIZE_CAP";
 const E_DISPATCH_READ_FAILED: &str = "E_DISPATCH_READ_FAILED";
 /// Local sentinel: shell.exec failed to spawn under the chosen backend.
 const E_DISPATCH_SPAWN_FAILED: &str = "E_DISPATCH_SPAWN_FAILED";
+/// Local sentinel: fs.write failed at the filesystem layer.
+const E_DISPATCH_WRITE_FAILED: &str = "E_DISPATCH_WRITE_FAILED";
+/// Local sentinel: fs.edit could not find the `old_string` to replace.
+const E_DISPATCH_EDIT_NOT_FOUND: &str = "E_DISPATCH_EDIT_NOT_FOUND";
+/// Local sentinel: fs.edit `old_string` appeared more than once.
+const E_DISPATCH_EDIT_AMBIGUOUS: &str = "E_DISPATCH_EDIT_AMBIGUOUS";
+/// Local sentinel: grep / glob pattern was invalid.
+const E_DISPATCH_BAD_PATTERN: &str = "E_DISPATCH_BAD_PATTERN";
 
 /// Default allowlist of read-only binaries that `ShellToolDispatcher` will exec.
 ///
@@ -399,9 +407,472 @@ impl ToolDispatcher for FsReadToolDispatcher {
     }
 }
 
-/// Build the default dispatcher registry used by the agent loop:
-/// `FsReadToolDispatcher` anchored at `workspace_root`, plus a
-/// `ShellToolDispatcher` driving `sandbox` against `base_spec`.
+/// Write a file inside the workspace root.
+#[derive(Debug, Clone)]
+pub struct FsWriteToolDispatcher {
+    id: String,
+    root: PathBuf,
+    max_bytes: u64,
+}
+
+impl FsWriteToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "fs.write";
+    /// Default cap on a single write payload: 4 MiB.
+    pub const DEFAULT_MAX_BYTES: u64 = 4 << 20;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for FsWriteToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let requested = match inv.args.get("path") {
+            Some(Value::String(s)) if !s.is_empty() => PathBuf::from(s),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "fs.write requires `path`"),
+        };
+        let content = match inv.args.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "fs.write requires `content`"),
+        };
+        if requested.is_absolute()
+            || requested
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+        let bytes_len = content.len() as u64;
+        if bytes_len > self.max_bytes {
+            return self.err(
+                E_DISPATCH_SIZE_CAP,
+                format!("content exceeds {} byte cap", self.max_bytes),
+            );
+        }
+        let canonical_root = match self.root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return self.err(
+                    E_DISPATCH_WRITE_FAILED,
+                    format!("workspace root unreadable: {e}"),
+                )
+            }
+        };
+        let target = canonical_root.join(&requested);
+        if !target.starts_with(&canonical_root) {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+        if let Some(parent) = target.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return self.err(E_DISPATCH_WRITE_FAILED, format!("mkdir failed: {e}"));
+            }
+        }
+        if let Err(e) = std::fs::write(&target, content.as_bytes()) {
+            return self.err(E_DISPATCH_WRITE_FAILED, format!("write failed: {e}"));
+        }
+        let body = serde_json::json!({
+            "path": target.display().to_string(),
+            "bytes": bytes_len,
+        });
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes: bytes_len,
+        }
+    }
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Single-occurrence string replace inside a workspace file.
+#[derive(Debug, Clone)]
+pub struct FsEditToolDispatcher {
+    id: String,
+    root: PathBuf,
+    max_bytes: u64,
+}
+
+impl FsEditToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "fs.edit";
+    /// Default cap on the post-edit file size: 4 MiB.
+    pub const DEFAULT_MAX_BYTES: u64 = 4 << 20;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for FsEditToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let requested = match inv.args.get("path") {
+            Some(Value::String(s)) if !s.is_empty() => PathBuf::from(s),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "fs.edit requires `path`"),
+        };
+        let old_s = match inv.args.get("old_string") {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "fs.edit requires `old_string`"),
+        };
+        let new_s = match inv.args.get("new_string") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "fs.edit requires `new_string`"),
+        };
+        if requested.is_absolute()
+            || requested
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+        let canonical_root = match self.root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return self.err(
+                    E_DISPATCH_READ_FAILED,
+                    format!("workspace root unreadable: {e}"),
+                )
+            }
+        };
+        let target = match canonical_root.join(&requested).canonicalize() {
+            Ok(p) => p,
+            Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("path unreadable: {e}")),
+        };
+        if !target.starts_with(&canonical_root) {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+        let original = match std::fs::read_to_string(&target) {
+            Ok(s) => s,
+            Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("read failed: {e}")),
+        };
+        let count = original.matches(&old_s).count();
+        if count == 0 {
+            return self.err(E_DISPATCH_EDIT_NOT_FOUND, "old_string not found in file");
+        }
+        if count > 1 {
+            return self.err(
+                E_DISPATCH_EDIT_AMBIGUOUS,
+                format!("old_string appears {count} times; widen the snippet"),
+            );
+        }
+        let updated = original.replacen(&old_s, &new_s, 1);
+        let bytes_len = updated.len() as u64;
+        if bytes_len > self.max_bytes {
+            return self.err(
+                E_DISPATCH_SIZE_CAP,
+                format!("result exceeds {} byte cap", self.max_bytes),
+            );
+        }
+        if let Err(e) = std::fs::write(&target, updated.as_bytes()) {
+            return self.err(E_DISPATCH_WRITE_FAILED, format!("write failed: {e}"));
+        }
+        let body = serde_json::json!({
+            "path": target.display().to_string(),
+            "bytes": bytes_len,
+        });
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes: bytes_len,
+        }
+    }
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Recursive regex search across the workspace root.
+#[derive(Debug, Clone)]
+pub struct GrepToolDispatcher {
+    id: String,
+    root: PathBuf,
+    max_matches: usize,
+}
+
+impl GrepToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "grep";
+    /// Default cap on returned matches.
+    pub const DEFAULT_MAX_MATCHES: usize = 200;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            max_matches: Self::DEFAULT_MAX_MATCHES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for GrepToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let pattern = match inv.args.get("pattern") {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "grep requires `pattern`"),
+        };
+        let re = match regex::Regex::new(&pattern) {
+            Ok(r) => r,
+            Err(e) => return self.err(E_DISPATCH_BAD_PATTERN, format!("regex: {e}")),
+        };
+        let canonical_root = match self.root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return self.err(
+                    E_DISPATCH_READ_FAILED,
+                    format!("workspace root unreadable: {e}"),
+                )
+            }
+        };
+        let mut matches: Vec<serde_json::Value> = Vec::new();
+        let mut total_bytes: u64 = 0;
+        let mut stack = vec![canonical_root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with('.') || name == "target" || name == "node_modules" {
+                        continue;
+                    }
+                }
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (i, line) in content.lines().enumerate() {
+                    if re.is_match(line) {
+                        let rel = path.strip_prefix(&canonical_root).unwrap_or(&path);
+                        let entry = serde_json::json!({
+                            "path": rel.display().to_string(),
+                            "line": i + 1,
+                            "text": line,
+                        });
+                        total_bytes += line.len() as u64;
+                        matches.push(entry);
+                        if matches.len() >= self.max_matches {
+                            break;
+                        }
+                    }
+                }
+                if matches.len() >= self.max_matches {
+                    break;
+                }
+            }
+            if matches.len() >= self.max_matches {
+                break;
+            }
+        }
+        let body = serde_json::json!({
+            "pattern": pattern,
+            "matches": matches,
+        });
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes: total_bytes,
+        }
+    }
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Filename glob matching across the workspace root.
+#[derive(Debug, Clone)]
+pub struct GlobToolDispatcher {
+    id: String,
+    root: PathBuf,
+    max_results: usize,
+}
+
+impl GlobToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "glob";
+    /// Default cap on returned paths.
+    pub const DEFAULT_MAX_RESULTS: usize = 500;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            max_results: Self::DEFAULT_MAX_RESULTS,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Translate a shell-style glob into an anchored regex.
+fn glob_to_regex(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len() + 4);
+    out.push('^');
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
+                    }
+                    out.push_str(".*");
+                } else {
+                    out.push_str("[^/]*");
+                }
+            }
+            '?' => out.push_str("[^/]"),
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('$');
+    out
+}
+
+impl ToolDispatcher for GlobToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let pattern = match inv.args.get("pattern") {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "glob requires `pattern`"),
+        };
+        let re_str = glob_to_regex(&pattern);
+        let re = match regex::Regex::new(&re_str) {
+            Ok(r) => r,
+            Err(e) => return self.err(E_DISPATCH_BAD_PATTERN, format!("regex: {e}")),
+        };
+        let canonical_root = match self.root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return self.err(
+                    E_DISPATCH_READ_FAILED,
+                    format!("workspace root unreadable: {e}"),
+                )
+            }
+        };
+        let mut results: Vec<String> = Vec::new();
+        let mut stack = vec![canonical_root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with('.') || name == "target" || name == "node_modules" {
+                        continue;
+                    }
+                }
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+                let rel = path.strip_prefix(&canonical_root).unwrap_or(&path);
+                let rel_str = rel.display().to_string();
+                if re.is_match(&rel_str) {
+                    results.push(rel_str);
+                    if results.len() >= self.max_results {
+                        break;
+                    }
+                }
+            }
+            if results.len() >= self.max_results {
+                break;
+            }
+        }
+        let total_bytes: u64 = results.iter().map(|s| s.len() as u64).sum();
+        let body = serde_json::json!({
+            "pattern": pattern,
+            "matches": results,
+        });
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes: total_bytes,
+        }
+    }
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Build the default dispatcher registry used by the agent loop.
+/// Includes: `fs.read`, `fs.write`, `fs.edit`, `grep`, `glob`,
+/// `shell.exec`.
 #[must_use]
 pub fn default_dispatchers(
     workspace_root: PathBuf,
@@ -409,19 +880,18 @@ pub fn default_dispatchers(
     base_spec: SandboxLaunchSpec,
 ) -> RegistryDispatcher {
     let mut reg = RegistryDispatcher::new();
-    // Register order is observable via `ids()`; fs.read first matches
-    // the doctor/event-log ordering used elsewhere.
-    let fs = FsReadToolDispatcher::new(workspace_root);
+    let fs_read = FsReadToolDispatcher::new(workspace_root.clone());
+    let fs_write = FsWriteToolDispatcher::new(workspace_root.clone());
+    let fs_edit = FsEditToolDispatcher::new(workspace_root.clone());
+    let grep = GrepToolDispatcher::new(workspace_root.clone());
+    let glob = GlobToolDispatcher::new(workspace_root);
     let shell = ShellToolDispatcher::new(sandbox, base_spec);
-    // Both ids are guaranteed unique; suppress the error path with a
-    // fall-through that still returns an empty registry on the
-    // exceedingly-unlikely duplicate-id failure mode.
-    if reg.register(Box::new(fs)).is_err() {
-        return reg;
-    }
-    if reg.register(Box::new(shell)).is_err() {
-        return reg;
-    }
+    let _ = reg.register(Box::new(fs_read));
+    let _ = reg.register(Box::new(fs_write));
+    let _ = reg.register(Box::new(fs_edit));
+    let _ = reg.register(Box::new(grep));
+    let _ = reg.register(Box::new(glob));
+    let _ = reg.register(Box::new(shell));
     reg
 }
 
@@ -979,7 +1449,7 @@ mod tests {
     // ---- default_dispatchers registry integration ---------------------
 
     #[test]
-    fn default_dispatchers_registers_two() {
+    fn default_dispatchers_registers_all() {
         let tmp = TempDir::new().expect("tmp");
         let reg = default_dispatchers(
             tmp.path().to_path_buf(),
@@ -987,8 +1457,12 @@ mod tests {
             passthrough_spec_in(tmp.path()),
         );
         let ids = reg.ids();
-        assert_eq!(ids.len(), 2);
+        assert_eq!(ids.len(), 6);
         assert!(ids.contains(&"fs.read"));
+        assert!(ids.contains(&"fs.write"));
+        assert!(ids.contains(&"fs.edit"));
+        assert!(ids.contains(&"grep"));
+        assert!(ids.contains(&"glob"));
         assert!(ids.contains(&"shell.exec"));
     }
 

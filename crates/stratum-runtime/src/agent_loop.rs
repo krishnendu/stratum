@@ -115,6 +115,13 @@ pub struct AgentLoopConfig {
     /// performed within a single turn. Pinned by docs even though the
     /// scaffold's permission loop is single-pass.
     pub max_tool_calls_per_turn: u8,
+    /// Maximum number of provider-generate iterations in a single
+    /// `run_turn`. Each iteration may emit one or more `Block::ToolCall`
+    /// entries; once dispatched, the agent loop builds a continuation
+    /// prompt that includes the tool results and re-calls the provider.
+    /// Hard upper bound on the agentic recursion depth — guards against
+    /// loops that never emit a non-tool-call block.
+    pub max_agentic_steps: u8,
 }
 
 impl Default for AgentLoopConfig {
@@ -123,6 +130,11 @@ impl Default for AgentLoopConfig {
             plan_mode: false,
             max_turn_duration: Duration::from_secs(300),
             max_tool_calls_per_turn: 8,
+            // Default to one-shot dispatch (no agentic continuation).
+            // Production wires this to a non-zero cap from the CLI when
+            // building the LLM-backed loop; tests and EchoProvider
+            // callers can rely on the single-iteration semantics.
+            max_agentic_steps: 0,
         }
     }
 }
@@ -437,6 +449,30 @@ impl AgentLoop {
         reason = "orchestrator straight-line composition; owning the context matches the spec'd surface"
     )]
     pub fn run_turn(&self, ctx: TurnContext, cancel: &CancelToken) -> TurnResult {
+        self.run_turn_inner(ctx, cancel, None, 0)
+    }
+
+    /// Streaming variant: forwards each incremental `Block` emitted by
+    /// the provider to `chunk_tx` as it lands, then returns the same
+    /// `TurnResult` as [`Self::run_turn`]. The receiver should drain
+    /// chunks concurrently to keep the channel small. Closing the
+    /// receiver early is safe — sends are best-effort.
+    pub fn run_turn_streaming(
+        &self,
+        ctx: TurnContext,
+        cancel: &CancelToken,
+        chunk_tx: mpsc::Sender<Block>,
+    ) -> TurnResult {
+        self.run_turn_inner(ctx, cancel, Some(chunk_tx), 0)
+    }
+
+    fn run_turn_inner(
+        &self,
+        ctx: TurnContext,
+        cancel: &CancelToken,
+        chunk_tx: Option<mpsc::Sender<Block>>,
+        step: u8,
+    ) -> TurnResult {
         self.turn_counter.fetch_add(1, Ordering::SeqCst);
 
         let turn_id_u64 = ctx.turn_id.0;
@@ -509,8 +545,17 @@ impl AgentLoop {
         let (tx, rx) = mpsc::channel::<Vec<Block>>();
         let provider = Arc::clone(&self.provider);
         let cancel_for_worker = child_cancel.clone();
+        let chunk_tx_for_worker = chunk_tx.clone();
         let worker = thread::spawn(move || {
-            let result = provider.generate(&req, &cancel_for_worker);
+            let result = match chunk_tx_for_worker {
+                Some(stream_tx) => {
+                    let cb = |b: &Block| {
+                        let _ = stream_tx.send(b.clone());
+                    };
+                    provider.generate_streaming(&req, &cancel_for_worker, &cb)
+                }
+                None => provider.generate(&req, &cancel_for_worker),
+            };
             // Best-effort send; receiver may already be gone if the
             // deadline expired.
             let _ = tx.send(result);
@@ -634,9 +679,18 @@ impl AgentLoop {
         //    and dispatch the approved calls via `RegistryDispatcher`.
         let mut tool_checks: u8 = 0;
         for block in blocks.clone() {
-            let Block::ToolCall { id, .. } = block else {
+            let Block::ToolCall {
+                id: call_id,
+                tool: tool_name,
+                args: args_json,
+            } = block
+            else {
                 continue;
             };
+            // Use `tool_name` for dispatcher lookup; `call_id` is the
+            // correlation id and gets carried into the matching
+            // `Block::ToolResult` below.
+            let id = tool_name.clone();
             if tool_checks >= self.config.max_tool_calls_per_turn {
                 // Budget exhausted before this call ran — fail fast with
                 // a structured `BudgetExceeded` outcome so the caller can
@@ -671,6 +725,7 @@ impl AgentLoop {
 
             let req = PermissionRequest::ToolUse {
                 tool_id: id.clone(),
+                args: args_json.clone(),
             };
             let decision = evaluate_permission(
                 req,
@@ -730,12 +785,25 @@ impl AgentLoop {
                         .find(|e| e.verb_matches(&id))
                         .map_or_else(|| format!("tool.{id}"), |e| e.as_str().to_string());
 
+                    // Parse the model-supplied args JSON into a map.
+                    // Empty / invalid JSON falls back to an empty map so the
+                    // dispatcher can surface its own missing-arg sentinel.
+                    let args_map: BTreeMap<String, serde_json::Value> =
+                        if args_json.trim().is_empty() {
+                            BTreeMap::new()
+                        } else {
+                            match serde_json::from_str::<serde_json::Value>(&args_json) {
+                                Ok(serde_json::Value::Object(m)) => m.into_iter().collect(),
+                                _ => BTreeMap::new(),
+                            }
+                        };
                     let inv = ToolInvocation {
                         tool_id: id.clone(),
-                        args: BTreeMap::new(),
+                        args: args_map,
                         capability,
                         turn_id: turn_id_u64,
                     };
+                    let _ = &call_id;
 
                     // Run the dispatch under `catch_unwind` so a
                     // panicking dispatcher cannot poison the turn loop.
@@ -787,7 +855,7 @@ impl AgentLoop {
                     ));
 
                     match result {
-                        ToolResult::Ok { .. } => {
+                        ToolResult::Ok { body, .. } => {
                             let _ = driver.apply(
                                 TurnEvent::ToolCompleted {
                                     tool_id: id.clone(),
@@ -796,6 +864,16 @@ impl AgentLoop {
                                 },
                                 ctx.started_at,
                             );
+                            // Surface the tool output as a Block::ToolResult
+                            // in the returned blocks. Required for the future
+                            // agentic loop closure to feed results back into
+                            // a continuation prompt; harmless for callers that
+                            // only render Block::Text.
+                            blocks.push(Block::ToolResult {
+                                id: call_id.clone(),
+                                output: serde_json::to_string(&body)
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                            });
                         }
                         ToolResult::Err { code, .. } => {
                             // Fail-fast: the first tool error bails the
@@ -828,7 +906,39 @@ impl AgentLoop {
             }
         }
 
-        // 9. Clean finish.
+        // 9. Agentic continuation: if the provider emitted any tool
+        // calls AND we have budget left, build a continuation prompt
+        // that includes the tool results and recurse. Mirrors Claude
+        // Code's behavior of letting the model react to tool output.
+        let dispatched_count = blocks
+            .iter()
+            .filter(|b| matches!(b, Block::ToolResult { .. }))
+            .count();
+        if dispatched_count > 0 && step < self.config.max_agentic_steps {
+            let continuation_prompt = build_continuation_prompt(&ctx.user_prompt, &blocks);
+            let next_ctx = TurnContext {
+                user_prompt: continuation_prompt,
+                model: ctx.model.clone(),
+                turn_id: ctx.turn_id,
+                started_at: ctx.started_at,
+            };
+            let sub = self.run_turn_inner(next_ctx, cancel, chunk_tx, step.saturating_add(1));
+            // Merge the inner step's blocks + events into ours and adopt
+            // its outcome / transition history.
+            let mut merged_blocks = blocks;
+            merged_blocks.extend(sub.blocks);
+            let mut merged_events = events_emitted;
+            merged_events.extend(sub.events_emitted);
+            return TurnResult {
+                turn_id: ctx.turn_id,
+                outcome: sub.outcome,
+                blocks: merged_blocks,
+                transitions: sub.transitions,
+                events_emitted: merged_events,
+            };
+        }
+
+        // 10. Clean finish.
         let _ = driver.apply(
             TurnEvent::Finish {
                 outcome: TurnOutcome::Success,
@@ -843,6 +953,36 @@ impl AgentLoop {
             events_emitted,
         }
     }
+}
+
+/// Build a continuation prompt from the original user prompt plus the
+/// tool-call / tool-result pairs that were dispatched this iteration.
+/// Used by [`AgentLoop::run_turn_inner`] to feed the provider context
+/// for the next agentic step. Simple text-append format is provider-
+/// agnostic; per-model formats (Qwen `<tool_call>`, Hermes ChatML, etc.)
+/// land when GBNF grammar wiring does.
+fn build_continuation_prompt(original: &str, blocks: &[Block]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(original.len() + 256);
+    out.push_str(original);
+    out.push_str("\n\n---\n");
+    out.push_str("You issued the following tool calls and received these results:\n\n");
+    for b in blocks {
+        match b {
+            Block::ToolCall { tool, args, .. } => {
+                let _ = writeln!(out, "Tool call: {tool} args={args}");
+            }
+            Block::ToolResult { output, .. } => {
+                let _ = writeln!(out, "Result: {output}");
+            }
+            _ => {}
+        }
+    }
+    out.push_str(
+        "\nContinue. If you have enough information, give the final answer in plain text. \
+         Otherwise issue another tool call.\n",
+    );
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,7 +1537,8 @@ mod tests {
         let res = loop_.run_turn(ctx("call a tool"), &CancelToken::new());
         match res.outcome {
             TurnOutcome::ToolFailure { tool_id, code } => {
-                assert_eq!(tool_id, "fs.read#1");
+                // Reports the tool name, not the per-call correlation id.
+                assert_eq!(tool_id, "fs.read");
                 assert_eq!(code, "STRAT-E5004");
             }
             other => panic!("expected ToolFailure, got {other:?}"),
@@ -2213,9 +2354,12 @@ mod tests {
         );
         let res = loop_.run_turn(ctx("call"), &CancelToken::new());
         assert!(matches!(res.outcome, TurnOutcome::Success));
+        // Capability sentinel is derived from the tool name, not the
+        // per-call correlation id, so that the matrix lookup keys off the
+        // verb (`fs.read`) rather than an opaque request id.
         assert_eq!(
             cap.last_cap.lock().unwrap().as_deref(),
-            Some("tool.unknown_id")
+            Some("tool.fs.read")
         );
     }
 
@@ -2346,6 +2490,14 @@ mod tests {
         );
         let res = loop_.run_turn(ctx("call"), &CancelToken::new());
         assert!(matches!(res.outcome, TurnOutcome::Success));
-        assert_eq!(res.blocks, original);
+        // Provider's original ToolCall + Text blocks are preserved verbatim,
+        // followed by the synthesized `Block::ToolResult` emitted by the
+        // dispatch loop so the agentic continuation can pick it up.
+        let mut expected = original.clone();
+        expected.push(Block::ToolResult {
+            id: "echo".into(),
+            output: "{}".into(),
+        });
+        assert_eq!(res.blocks, expected);
     }
 }

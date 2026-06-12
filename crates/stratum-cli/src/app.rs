@@ -352,7 +352,7 @@ struct ServeArgs {
     model: Option<String>,
     /// Logical context window passed to the llama.cpp provider, in
     /// tokens. Only used together with `--model`.
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 2048)]
     ctx: u32,
     /// Emit a single JSON object on startup describing the bound
     /// address. Without this flag, a prose line is printed instead.
@@ -462,7 +462,7 @@ struct ChatArgs {
     #[arg(long, value_name = "SLUG")]
     model: Option<String>,
     /// Logical context window passed to the llama.cpp provider, in tokens.
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 2048)]
     ctx: u32,
     /// Maximum number of blocks the provider is allowed to emit per turn.
     #[arg(long = "max-blocks", default_value_t = 1)]
@@ -484,7 +484,13 @@ struct ChatArgs {
     /// via [`crate::chat::ChatState::with_resumed_transcript`] and (for the
     /// non-interactive `--prompt` path) echoed to stdout in order before the
     /// new turn's response is printed.
-    #[arg(long, value_name = "SESSION_ID")]
+    #[arg(
+        long,
+        value_name = "SESSION_ID",
+        num_args = 0..=1,
+        default_missing_value = "",
+        require_equals = false
+    )]
     resume: Option<String>,
     /// Load custom agent role definitions from `<PATH>/*.toml` and route the
     /// chat through an [`stratum_runtime::AgentHandoff`] keyed off the
@@ -2424,8 +2430,24 @@ fn chat_command(
 
     // Resolve `--resume` up front so a bad / missing / malformed transcript
     // fails before we spin up any provider or write to disk.
+    // `--resume` with no value short-circuits to `sessions list` so the user
+    // can pick an id without remembering it.
     let resumed = match args.resume.as_deref() {
         None => None,
+        Some("") => {
+            // `--resume` with no value: list saved sessions if any,
+            // otherwise fall through to a fresh empty chat. Matches
+            // Claude Code's UX where the user can repeat `--resume`
+            // before they have history.
+            let has_any = open_transcript_store(paths, err)
+                .ok()
+                .and_then(|s| s.list().ok())
+                .is_some_and(|ids| !ids.is_empty());
+            if has_any {
+                return sessions_list(json, paths, out, err);
+            }
+            None
+        }
         Some(raw) => match load_resumed_transcript(raw, paths, err) {
             Ok(t) => Some(t),
             Err(code) => return code,
@@ -2439,11 +2461,22 @@ fn chat_command(
         return chat_with_agents_dir(&dir, args, paths, tier, resumed, json, out, err);
     }
 
-    // Model-resolution flow only runs when --model is set. Without the
-    // `provider-llama-cpp` feature, the only legal mode is EchoProvider —
-    // surface a clear STRAT-E1001 error instead of silently downgrading.
+    // Model-resolution flow.
+    //
+    // 1. Explicit `--model X` wins.
+    // 2. Otherwise, if the `provider-llama-cpp` feature is built in AND the
+    //    catalog has any chat model for this tier, auto-select the smallest
+    //    recommended slug. This makes `stratum chat --prompt hi` use real
+    //    inference by default after `stratum models sync` runs, instead of
+    //    silently downgrading to EchoProvider.
+    // 3. Without the feature or with an empty catalog, fall through to the
+    //    EchoProvider path below.
     if let Some(slug) = args.model.as_deref() {
         return chat_with_model(slug, args, paths, tier, resumed, out, err);
+    }
+    #[cfg(feature = "provider-llama-cpp")]
+    if let Some(slug) = auto_select_model(paths, tier) {
+        return chat_with_model(&slug, args, paths, tier, resumed, out, err);
     }
 
     // No --model: keep EchoProvider behavior. `--prompt` still works for
@@ -2475,7 +2508,7 @@ fn chat_command(
         if let Some(t) = resumed {
             state = state.with_resumed_transcript(t);
         }
-        return match crate::chat::run_with_state(state) {
+        return match crate::chat::run_with_state(state, stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 let _ = writeln!(err, "{e}");
@@ -2492,7 +2525,7 @@ fn chat_command(
         let provider = EchoProvider::new("echo: ");
         let state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths))
             .with_resumed_transcript(t);
-        return match crate::chat::run_with_state(state) {
+        return match crate::chat::run_with_state(state, stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 let _ = writeln!(err, "{e}");
@@ -2727,7 +2760,7 @@ fn chat_with_agents_dir(
         state.submit_with_prompt(prompt);
         return print_assistant_text(&state, out, err);
     }
-    match crate::chat::run_with_state(state) {
+    match crate::chat::run_with_state(state, stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "{e}");
@@ -3054,6 +3087,102 @@ fn chat_with_model(
     ExitCode::from(1)
 }
 
+/// Auto-select a chat model from the catalog when `--model` is omitted.
+///
+/// Returns the recommended slug for the host's tier + chat task, or None
+/// if the catalog is empty / unreadable. Used to make `stratum chat`
+/// default to real inference once `stratum models sync` has populated
+/// the catalog, instead of silently falling back to EchoProvider.
+/// Build a shell-runner closure used by the `!cmd` TUI prefix.
+///
+/// Wraps `ShellToolDispatcher` with a passthrough sandbox + workspace-root
+/// cwd. Splits the user line on whitespace into `command` + `args`, calls
+/// the dispatcher, and renders the JSON body as plain text for the TUI.
+fn build_shell_runner() -> impl Fn(&str) -> Result<String, String> + Send + Sync + 'static {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use stratum_runtime::sandbox::{SandboxBackend, SandboxSpawn};
+    use stratum_runtime::sandbox_resolve::{BackendChoice, ResolvedNet, SandboxLaunchSpec};
+    use stratum_runtime::tool_dispatchers::ShellToolDispatcher;
+    use stratum_runtime::tool_invocation::{ToolDispatcher, ToolInvocation, ToolResult};
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let spec = SandboxLaunchSpec {
+        mounts: Vec::new(),
+        net: ResolvedNet::Loopback,
+        env: BTreeMap::new(),
+        allowed_caps: BTreeSet::new(),
+        denied_caps: BTreeSet::new(),
+        working_dir: cwd,
+        cpu_quota_pct: None,
+        memory_limit_mib: None,
+        backend: BackendChoice::Passthrough,
+    };
+    let spawn = SandboxSpawn::new(SandboxBackend::Passthrough);
+    let dispatcher = ShellToolDispatcher::new(spawn, spec);
+
+    move |line: &str| {
+        let parts: Vec<String> = line.split_whitespace().map(String::from).collect();
+        let Some(command) = parts.first().cloned() else {
+            return Err("empty command".to_string());
+        };
+        let args: Vec<serde_json::Value> = parts
+            .iter()
+            .skip(1)
+            .map(|a| serde_json::Value::String(a.clone()))
+            .collect();
+        let mut args_obj = std::collections::BTreeMap::new();
+        args_obj.insert("command".to_string(), serde_json::Value::String(command));
+        args_obj.insert("args".to_string(), serde_json::Value::Array(args));
+        let inv = ToolInvocation {
+            tool_id: "shell.exec".to_string(),
+            args: args_obj,
+            capability: "shell.exec".to_string(),
+            turn_id: 0,
+        };
+        match dispatcher.invoke(&inv) {
+            ToolResult::Ok { body, .. } => Ok(body
+                .get("stdout")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()),
+            ToolResult::Err { code, message, .. } => Err(format!("{code}: {message}")),
+        }
+    }
+}
+
+#[cfg(feature = "provider-llama-cpp")]
+fn catalog_slugs(paths: &Paths) -> Vec<String> {
+    let catalog_path = paths.state.join("models.json");
+    let Ok(catalog) = ModelCatalog::load(&catalog_path) else {
+        return Vec::new();
+    };
+    catalog
+        .filter_by_task(ModelTask::Chat)
+        .into_iter()
+        .map(|e| e.slug.as_ref().to_owned())
+        .collect()
+}
+
+#[cfg(feature = "provider-llama-cpp")]
+fn auto_select_model(paths: &Paths, host_tier: Tier) -> Option<String> {
+    let catalog_path = paths.state.join("models.json");
+    let catalog = ModelCatalog::load(&catalog_path).ok()?;
+    let cli_tier = match host_tier {
+        Tier::Low => ModelTier::Low,
+        Tier::Medium => ModelTier::Medium,
+        Tier::High => ModelTier::High,
+    };
+    // Walk tier downward so a `Low`-tagged model is acceptable on a `High`
+    // host: small first, escalate if nothing matches.
+    for tier in [ModelTier::Low, cli_tier] {
+        if let Some(entry) = catalog.recommend_for(tier, ModelTask::Chat) {
+            return Some(entry.slug.as_ref().to_owned());
+        }
+    }
+    None
+}
+
 #[cfg(feature = "provider-llama-cpp")]
 fn chat_with_model(
     slug: &str,
@@ -3074,13 +3203,57 @@ fn chat_with_model(
     };
     let provider_arc: Arc<dyn ProviderTrait> = Arc::new(provider);
 
-    let loop_ = match build_llama_agent_loop(provider_arc, err) {
+    // Non-interactive `--prompt` mode cannot render a permission modal,
+    // so use the auto-allow responder there. Interactive TUI mode uses
+    // a shared `TuiPromptResponder` so the AgentLoop's requests render
+    // through the same modal queue the event loop drains each tick.
+    let prompter = std::sync::Arc::new(crate::chat::TuiPromptResponder::default());
+    let prompter_dyn: std::sync::Arc<dyn stratum_runtime::PromptResponder> = if args.prompt.is_some()
+    {
+        std::sync::Arc::new(stratum_runtime::AllowAllResponder)
+    } else {
+        prompter.clone()
+    };
+
+    let loop_ = match build_llama_agent_loop(provider_arc, prompter_dyn.clone(), err) {
         Ok(l) => l,
         Err(code) => return code,
     };
     let _ = args.max_blocks; // honored by provider request path; reserved for Phase 3 wiring.
 
-    let mut state = crate::chat::ChatState::with_agent_loop(loop_);
+    let switcher_paths = paths.clone();
+    let switcher_ctx = args.ctx;
+    let switcher_prompter = prompter_dyn.clone();
+    let switcher = crate::chat::ModelSwitcher::new(move |new_slug: &str| {
+        let provider = {
+            let mut sink = Vec::<u8>::new();
+            resolve_llama_provider(new_slug, switcher_ctx, &switcher_paths, &mut sink).map_err(
+                |_| {
+                    String::from_utf8(sink)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string()
+                },
+            )
+        }?;
+        let provider_arc: Arc<dyn ProviderTrait> = Arc::new(provider);
+        let mut sink = Vec::<u8>::new();
+        build_llama_agent_loop(provider_arc, switcher_prompter.clone(), &mut sink).map_err(|_| {
+            String::from_utf8(sink)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
+    });
+
+    let shell_executor = crate::chat::ShellExecutor::new(build_shell_runner());
+
+    let mut state = crate::chat::ChatState::with_agent_loop(loop_)
+        .with_permission_prompter(prompter)
+        .with_active_model(slug)
+        .with_available_models(catalog_slugs(paths))
+        .with_model_switcher(switcher)
+        .with_shell_executor(shell_executor);
     if let Some(prompt) = args.prompt.as_deref() {
         if let Some(t) = resumed {
             print_resumed_transcript(&t, out);
@@ -3094,7 +3267,7 @@ fn chat_with_model(
     }
     // No --prompt: drop into the interactive TUI. The state already wraps
     // the llama-backed loop so input is routed through real inference.
-    match crate::chat::run_with_state(state) {
+    match crate::chat::run_with_state(state, stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "{e}");
@@ -3185,10 +3358,50 @@ fn resolve_llama_provider(
         n_gpu_layers: 0,
         seed: 42,
     };
-    LlamaCppProvider::open(&cfg).map_err(|e| {
-        let _ = writeln!(err, "STRAT-E1001 provider open failed: {e}");
-        ExitCode::from(1)
-    })
+    LlamaCppProvider::open(&cfg)
+        .map(|p| p.with_tools(default_tool_catalog()))
+        .map_err(|e| {
+            let _ = writeln!(err, "STRAT-E1001 provider open failed: {e}");
+            ExitCode::from(1)
+        })
+}
+
+/// Tool catalog surfaced to the LLM in its system prompt. Mirrors the
+/// ids registered by [`default_dispatchers`] so the model knows what
+/// verbs to emit when it wants to call a tool.
+#[cfg(feature = "provider-llama-cpp")]
+fn default_tool_catalog() -> Vec<(String, String)> {
+    vec![
+        (
+            "fs.read".to_string(),
+            r#"Read a file inside the workspace. Args: {"path":"<relative/path>"}."#.to_string(),
+        ),
+        (
+            "fs.write".to_string(),
+            r#"Write a file inside the workspace. Args: {"path":"<relative/path>","content":"<full file contents>"}."#
+                .to_string(),
+        ),
+        (
+            "fs.edit".to_string(),
+            r#"Replace a single occurrence of `old_string` with `new_string` in a workspace file. Args: {"path":"...","old_string":"...","new_string":"..."}."#
+                .to_string(),
+        ),
+        (
+            "grep".to_string(),
+            r#"Recursive regex search across the workspace. Args: {"pattern":"<regex>"}."#
+                .to_string(),
+        ),
+        (
+            "glob".to_string(),
+            r#"Find files matching a shell-style glob. Args: {"pattern":"**/*.rs"}."#
+                .to_string(),
+        ),
+        (
+            "shell.exec".to_string(),
+            r#"Run an allowlisted shell command. Args: {"command":"ls","args":["-la"]}. Allowed: echo, ls, cat, pwd, wc, head, tail."#
+                .to_string(),
+        ),
+    ]
 }
 
 /// Build the `AgentLoop` wrapping `provider` with the documented
@@ -3198,27 +3411,53 @@ fn resolve_llama_provider(
 #[cfg(feature = "provider-llama-cpp")]
 fn build_llama_agent_loop(
     provider: std::sync::Arc<dyn stratum_runtime::Provider>,
+    responder: std::sync::Arc<dyn stratum_runtime::PromptResponder>,
     err: &mut dyn Write,
 ) -> Result<std::sync::Arc<stratum_runtime::AgentLoop>, ExitCode> {
     use std::sync::Arc;
 
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use stratum_runtime::sandbox::{SandboxBackend, SandboxSpawn};
+    use stratum_runtime::sandbox_resolve::{BackendChoice, ResolvedNet, SandboxLaunchSpec};
+    use stratum_runtime::tool_dispatchers::default_dispatchers;
     use stratum_runtime::{
-        AgentLoop, AgentLoopConfig, AllowAllResponder, CapabilityMatrix, EventEmitter, EventSink,
+        AgentLoop, AgentLoopConfig, CapabilityMatrix, EventEmitter, EventSink,
         IntentRouter, MemoryEventSink, PermissionStore, PlanMode, PromptIdGen,
     };
 
     let sink: Arc<dyn EventSink> = Arc::new(MemoryEventSink::new());
     let events = Arc::new(EventEmitter::new(sink));
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let spec = SandboxLaunchSpec {
+        mounts: Vec::new(),
+        net: ResolvedNet::Loopback,
+        env: BTreeMap::new(),
+        allowed_caps: BTreeSet::new(),
+        denied_caps: BTreeSet::new(),
+        working_dir: cwd.clone(),
+        cpu_quota_pct: None,
+        memory_limit_mib: None,
+        backend: BackendChoice::Passthrough,
+    };
+    let spawn = SandboxSpawn::new(SandboxBackend::Passthrough);
+    let dispatcher = Arc::new(default_dispatchers(cwd, spawn, spec));
+
     AgentLoop::builder()
         .with_provider(provider)
         .with_router(IntentRouter::default())
         .with_permission_store(Arc::new(PermissionStore::new()))
         .with_prompt_gen(Arc::new(PromptIdGen::new()))
-        .with_responder(Arc::new(AllowAllResponder))
+        .with_responder(responder)
         .with_events(events)
         .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
         .with_plan_mode(Arc::new(PlanMode::new()))
-        .with_config(AgentLoopConfig::default())
+        .with_dispatcher(dispatcher)
+        .with_config(AgentLoopConfig {
+            max_agentic_steps: 5,
+            ..AgentLoopConfig::default()
+        })
         .build()
         .map(Arc::new)
         .map_err(|e| {
@@ -3249,6 +3488,14 @@ fn print_assistant_text(
             return ExitCode::from(74);
         }
         ExitCode::SUCCESS
+    } else if let Some(msg) = state.last_command_message() {
+        if writeln!(out, "{msg}").is_err() {
+            return ExitCode::from(74);
+        }
+        ExitCode::SUCCESS
+    } else if let Some(reason) = state.last_assistant_failure_reason() {
+        let _ = writeln!(err, "STRAT-E1001 provider failed: {reason}");
+        ExitCode::from(1)
     } else {
         let _ = writeln!(err, "STRAT-E1001 provider returned no text blocks");
         ExitCode::from(1)

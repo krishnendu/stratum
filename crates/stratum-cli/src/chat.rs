@@ -24,10 +24,15 @@
 )]
 
 use std::io;
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -61,7 +66,14 @@ const HELP_TEXT: &str = "available commands:\n\
     /plan [on|off] — toggle (or set) plan mode\n\
     /cancel — cancel the in-flight turn\n\
     /clear — clear the transcript\n\
+    /model, /active — show currently active model\n\
+    /models — list available models from the catalog\n\
+    /switch <slug> — swap to a different model mid-session\n\
+    !<cmd> — run shell command directly (bypass LLM, sandboxed)\n\
+    /tier — show current host tier (low/medium/high)\n\
+    /version — show stratum version\n\
     /agents — list registered roles (multi-agent mode only)\n\
+    /subagents — list available subagents (built-in + user-defined)\n\
     /parallel <role1,role2,…> — fan the next turn out across the listed roles \
 (multi-agent mode only)\n\
     /budget — show the latest turn metrics (tokens · ms · tok/s · turn id)\n\
@@ -104,6 +116,62 @@ pub enum PaletteOutcome {
         /// Human-friendly explanation.
         message: String,
     },
+}
+
+/// Payload sent from the provider worker thread back to the TUI main
+/// thread when an async turn completes.
+#[derive(Debug)]
+struct TurnAsyncResult {
+    blocks: Vec<Block>,
+    turn_result: Option<TurnResult>,
+    handoff_lines: Vec<Turn>,
+    final_role: Option<SuggestedRole>,
+    step_ms: u32,
+}
+
+/// Type-erased shell executor for `!cmd` palette prefix. Wraps a
+/// closure that runs `cmd` (interpreted as a shell command line) and
+/// returns combined stdout+stderr or an error string.
+#[derive(Clone)]
+pub struct ShellExecutor(Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>);
+
+impl std::fmt::Debug for ShellExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShellExecutor").finish_non_exhaustive()
+    }
+}
+
+impl ShellExecutor {
+    /// Wrap a shell execution closure.
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&str) -> Result<String, String> + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+}
+
+/// Type-erased model swap hook. Wraps a closure that rebuilds an
+/// [`AgentLoop`] against a new slug.
+#[derive(Clone)]
+pub struct ModelSwitcher(
+    Arc<dyn Fn(&str) -> Result<Arc<AgentLoop>, String> + Send + Sync>,
+);
+
+impl std::fmt::Debug for ModelSwitcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelSwitcher").finish_non_exhaustive()
+    }
+}
+
+impl ModelSwitcher {
+    /// Wrap a swap closure.
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&str) -> Result<Arc<AgentLoop>, String> + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
 }
 
 /// Pure TUI state. Driven by events; rendered into any [`Backend`].
@@ -172,6 +240,63 @@ pub struct ChatState {
     /// the single-loop default path. `None` preserves the Phase 1 single-loop
     /// behaviour.
     handoff: Option<Arc<AgentHandoff>>,
+    /// Slug of the currently active model, surfaced via `/model` palette.
+    active_model: Option<String>,
+    /// Catalog of selectable model slugs, surfaced via `/models` palette.
+    available_models: Vec<String>,
+    /// Hook invoked by `/switch <slug>` to rebuild the agent loop against a
+    /// different model. `None` when no real provider is wired (echo mode).
+    model_switcher: Option<ModelSwitcher>,
+    /// Hook invoked when the user types `!<cmd>`. `None` falls through to
+    /// LLM (input sent as plain prompt with `!` preserved).
+    shell_executor: Option<ShellExecutor>,
+    /// Ring of previously submitted user inputs (oldest first). Recalled
+    /// with ↑/↓ when the input buffer is empty (or the user is already
+    /// browsing). Capped at [`Self::INPUT_HISTORY_CAP`].
+    input_history: Vec<String>,
+    /// Active history index when browsing. `None` = not browsing.
+    /// `Some(i)` means `input_history[i]` is currently shown in the
+    /// input buffer; pressing ↑ moves toward index 0, ↓ moves toward
+    /// the present.
+    history_cursor: Option<usize>,
+    /// Prompts queued while a turn is in flight. Flushed FIFO once
+    /// `submit()` finishes the current turn. The last entry can be
+    /// pulled back into the input buffer via ↑ before it sends.
+    pending_queue: Vec<String>,
+    /// When the user pressed Ctrl+C / Ctrl+D once and the second press
+    /// would actually exit. Cleared after [`Self::EXIT_ARM_WINDOW`]
+    /// or once any other key lands. Mirrors Claude Code's
+    /// "press Ctrl+C again to exit" UX.
+    exit_armed_at: Option<Instant>,
+    /// Receiver for the in-flight turn's result. `submit()` spawns the
+    /// provider on a worker thread and stores the rx side here; the
+    /// event loop drains it via [`Self::poll_turn_completion`] each
+    /// tick so the TUI keeps rendering (and the `(thinking…)` placeholder
+    /// stays animated) while the provider runs.
+    pending_rx: Option<mpsc::Receiver<TurnAsyncResult>>,
+    /// Timer started when `submit()` kicked off the in-flight turn.
+    pending_started: Option<Instant>,
+    /// Turn id assigned to the in-flight async turn so that
+    /// [`Self::finalize_turn`] can fold metrics in under the same id.
+    last_turn_id: Option<TurnId>,
+    /// Receiver for per-token text chunks emitted by the provider
+    /// during an in-flight async turn. Drained alongside
+    /// [`Self::pending_rx`] on each event-loop tick to drive the live
+    /// "typing" render. Cleared in [`Self::finalize_turn`].
+    chunk_rx: Option<mpsc::Receiver<Block>>,
+    /// Accumulated streaming text for the in-flight turn. Rendered
+    /// under the latest `Turn::User` while the provider runs.
+    streaming_text: String,
+    /// Subagent registry surfaced via the `/subagents` palette
+    /// command. Seeded with `SubagentRegistry::with_builtins()` and
+    /// extended at startup with `<config>/stratum/subagents/*.toml`.
+    subagents: stratum_runtime::subagent::SubagentRegistry,
+    /// Stable session id stamped on this chat; used by
+    /// `--resume <id>` to reload the saved transcript.
+    session_id: stratum_runtime::SessionId,
+    /// Wall-clock instant this chat started; folded into the persisted
+    /// transcript so `stratum sessions list` can order by creation.
+    created_at: SystemTime,
     /// Role currently driving the chat, when multi-agent mode is active.
     ///
     /// `None` in single-loop mode (no handoff installed). `Some(role)` after
@@ -188,6 +313,13 @@ impl Default for ChatState {
 }
 
 impl ChatState {
+    /// Max entries retained in the input-recall history.
+    pub const INPUT_HISTORY_CAP: usize = 200;
+
+    /// Window during which a second Ctrl+C / Ctrl+D actually exits.
+    /// Outside this window the arm decays and the first press re-arms.
+    pub const EXIT_ARM_WINDOW: Duration = Duration::from_secs(2);
+
     /// Build a fresh state with the given header (status bar) and tier.
     #[must_use]
     pub fn new(provider: EchoProvider, tier: Tier, status: String) -> Self {
@@ -229,6 +361,22 @@ impl ChatState {
             in_flight_since: None,
             last_token_count: 0,
             handoff: None,
+            active_model: None,
+            available_models: Vec::new(),
+            model_switcher: None,
+            shell_executor: None,
+            input_history: Vec::new(),
+            history_cursor: None,
+            pending_queue: Vec::new(),
+            exit_armed_at: None,
+            pending_rx: None,
+            pending_started: None,
+            last_turn_id: None,
+            chunk_rx: None,
+            streaming_text: String::new(),
+            subagents: stratum_runtime::subagent::SubagentRegistry::with_builtins(),
+            session_id: stratum_runtime::SessionId::new_random(),
+            created_at: SystemTime::now(),
             current_role: None,
         }
     }
@@ -270,6 +418,118 @@ impl ChatState {
     #[must_use]
     pub const fn has_handoff(&self) -> bool {
         self.handoff.is_some()
+    }
+
+    /// Set the slug surfaced by the `/model` palette command.
+    #[must_use]
+    pub fn with_active_model(mut self, slug: impl Into<String>) -> Self {
+        self.active_model = Some(slug.into());
+        self
+    }
+
+    /// Seed the list surfaced by the `/models` palette command.
+    #[must_use]
+    pub fn with_available_models(mut self, slugs: Vec<String>) -> Self {
+        self.available_models = slugs;
+        self
+    }
+
+    /// Install the `/switch` palette hook.
+    #[must_use]
+    pub fn with_model_switcher(mut self, sw: ModelSwitcher) -> Self {
+        self.model_switcher = Some(sw);
+        self
+    }
+
+    /// Replace the internal `TuiPromptResponder` so the TUI's permission
+    /// modal queue is the SAME one the wired `AgentLoop` posts requests
+    /// to. Required when the loop is built externally (LLM path) and
+    /// uses `TuiPromptResponder` instead of `AllowAllResponder`. Without
+    /// this, the loop would post requests into a detached queue that the
+    /// TUI never drains and turns hang forever.
+    #[must_use]
+    pub fn with_permission_prompter(mut self, prompter: Arc<TuiPromptResponder>) -> Self {
+        self.permission_prompter = prompter;
+        self
+    }
+
+    /// Install the `!cmd` shell executor hook.
+    #[must_use]
+    pub fn with_shell_executor(mut self, ex: ShellExecutor) -> Self {
+        self.shell_executor = Some(ex);
+        self
+    }
+
+    /// Session id stamped on this chat. Surfaced on exit so the user can
+    /// reload via `stratum chat --resume <id>`.
+    #[must_use]
+    pub fn session_id(&self) -> &stratum_runtime::SessionId {
+        &self.session_id
+    }
+
+    /// Snapshot the in-memory chat transcript as a persistable
+    /// [`stratum_runtime::Transcript`]. The block payload uses
+    /// the on-disk projection so blocks survive a binary upgrade.
+    #[must_use]
+    pub fn to_persisted_transcript(&self) -> stratum_runtime::Transcript {
+        use stratum_runtime::{
+            TranscriptBlock, TranscriptBlockKind, TranscriptTurn, TRANSCRIPT_SCHEMA_VERSION,
+        };
+        let now = SystemTime::now();
+        let mut turns: Vec<TranscriptTurn> = Vec::with_capacity(self.transcript.len());
+        for t in &self.transcript {
+            match t {
+                Turn::User(text) => turns.push(TranscriptTurn::User {
+                    at: now,
+                    text: text.clone(),
+                }),
+                Turn::Assistant(blocks) => {
+                    let on_disk: Vec<TranscriptBlock> = blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            Block::Text { text } => Some(TranscriptBlock {
+                                kind: TranscriptBlockKind::Text,
+                                text: text.clone(),
+                            }),
+                            Block::ToolCall { tool, args, .. } => Some(TranscriptBlock {
+                                kind: TranscriptBlockKind::ToolCall {
+                                    tool_id: tool.clone(),
+                                },
+                                text: args.clone(),
+                            }),
+                            Block::ToolResult { output, .. } => Some(TranscriptBlock {
+                                kind: TranscriptBlockKind::Text,
+                                text: format!("[result] {output}"),
+                            }),
+                            Block::Cancelled { reason } => Some(TranscriptBlock {
+                                kind: TranscriptBlockKind::Text,
+                                text: format!("[cancelled] {reason}"),
+                            }),
+                            Block::Usage { .. } | Block::Done => None,
+                        })
+                        .collect();
+                    turns.push(TranscriptTurn::Assistant {
+                        at: now,
+                        blocks: on_disk,
+                    });
+                }
+                Turn::Cancelled => turns.push(TranscriptTurn::System {
+                    at: now,
+                    text: "[cancelled]".to_string(),
+                }),
+                Turn::Command { text, ok, message: _ } => turns.push(TranscriptTurn::Command {
+                    at: now,
+                    text: text.clone(),
+                    ok: *ok,
+                }),
+            }
+        }
+        stratum_runtime::Transcript {
+            schema_version: TRANSCRIPT_SCHEMA_VERSION,
+            session_id: self.session_id.clone(),
+            created_at: self.created_at,
+            turns,
+        }
     }
 
     /// Status-bar label describing the active role.
@@ -451,6 +711,13 @@ impl ChatState {
 
     /// Apply a keyboard event.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // Ignore Release / Repeat events; only Press counts. Kitty CSI-u
+        // and some terminals deliver Press + Release pairs which would
+        // otherwise double-fire every handler (e.g. ↑ skipping past the
+        // most recent history entry, Enter submitting twice).
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
         // Permission modal owns the keyboard while a request is pending.
         if let Some(pending) = self.permission_prompter.peek_request() {
             if let KeyCode::Char(c) = key.code {
@@ -480,23 +747,146 @@ impl ChatState {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // Any keystroke that isn't a Ctrl+C / Ctrl+D resets the
+        // double-press exit gesture.
+        if !(ctrl && matches!(key.code, KeyCode::Char('c' | 'C' | 'd' | 'D'))) {
+            self.exit_armed_at = None;
+        }
         match key.code {
-            KeyCode::Esc => self.quit = true,
-            KeyCode::Char('c' | 'C') if ctrl => {
-                self.cancel.cancel();
-                self.transcript.push(Turn::Cancelled);
-                self.quit = true;
+            KeyCode::Esc => {
+                if self.history_cursor.is_some() {
+                    self.history_cursor = None;
+                    self.input.clear();
+                } else {
+                    self.quit = true;
+                }
             }
-            KeyCode::Char('/') if self.input.is_empty() => {
+            KeyCode::Char('c' | 'C' | 'd' | 'D') if ctrl => {
+                self.handle_exit_signal();
+            }
+            // `/` opens the palette only on Ctrl+/ now; bare `/` is
+            // typed as a literal so the user can write `/switch <slug>`
+            // (and any other palette command with args) in the input box.
+            KeyCode::Char('/') if ctrl => {
                 self.palette = Some(Palette::new());
             }
-            KeyCode::Char(c) => self.input.push(c),
+            // Universal newline: Ctrl+J inserts a literal LF. Used when
+            // the terminal does not support kitty CSI-u disambiguation
+            // and therefore folds Shift+Enter into bare Enter (the
+            // default on stock iTerm2 and macOS Terminal.app). Mirrors
+            // git's commit-message convention.
+            KeyCode::Char('j' | 'J') if ctrl => {
+                self.input.push('\n');
+            }
+            KeyCode::Up => self.history_up(),
+            KeyCode::Down => self.history_down(),
+            KeyCode::Char(c) => {
+                self.history_cursor = None;
+                self.input.push(c);
+            }
             KeyCode::Backspace => {
+                self.history_cursor = None;
                 self.input.pop();
             }
-            KeyCode::Enter => self.submit(),
+            KeyCode::Enter => {
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
+                if shift || alt {
+                    self.input.push('\n');
+                } else {
+                    self.submit();
+                    // In tests the assertion happens immediately after
+                    // `handle_key(Enter)`, so block until the async turn
+                    // settles. Production TUI relies on the event loop's
+                    // `poll_turn_completion` instead.
+                    #[cfg(test)]
+                    self.block_until_idle();
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Two-press exit gesture mirroring Claude Code:
+    ///   - first press: if a turn is in flight, cancel it and arm the
+    ///     exit timer; if idle, just arm the exit timer and surface a
+    ///     hint in the status bar
+    ///   - second press within [`Self::EXIT_ARM_WINDOW`]: actually quit
+    ///   - after the window elapses the arm clears so a stale first
+    ///     press doesn't combo with a later one
+    fn handle_exit_signal(&mut self) {
+        if self.in_flight_since.is_some() {
+            self.cancel.cancel();
+            self.transcript.push(Turn::Cancelled);
+            self.exit_armed_at = Some(Instant::now());
+            return;
+        }
+        match self.exit_armed_at {
+            Some(t) if t.elapsed() <= Self::EXIT_ARM_WINDOW => {
+                self.quit = true;
+            }
+            _ => {
+                self.exit_armed_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// True when the exit hint should render in the status bar.
+    #[must_use]
+    pub fn exit_armed(&self) -> bool {
+        self.exit_armed_at
+            .map_or(false, |t| t.elapsed() <= Self::EXIT_ARM_WINDOW)
+    }
+
+    fn history_up(&mut self) {
+        // Pulling the most-recent queued message back into the input
+        // wins over walking submit-history, mirroring Claude Code: queue
+        // edit is the more common reason to press ↑ on a busy session.
+        if self.in_flight_since.is_some() && !self.pending_queue.is_empty() {
+            if let Some(last) = self.pending_queue.pop() {
+                self.input = last;
+            }
+            return;
+        }
+        if self.input_history.is_empty() {
+            return;
+        }
+        let next = match self.history_cursor {
+            None => self.input_history.len() - 1,
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.history_cursor = Some(next);
+        self.input = self.input_history[next].clone();
+    }
+
+    fn history_down(&mut self) {
+        let Some(i) = self.history_cursor else {
+            return;
+        };
+        if i + 1 >= self.input_history.len() {
+            self.history_cursor = None;
+            self.input.clear();
+            return;
+        }
+        let next = i + 1;
+        self.history_cursor = Some(next);
+        self.input = self.input_history[next].clone();
+    }
+
+    fn record_input_history(&mut self, entry: &str) {
+        if entry.is_empty() {
+            return;
+        }
+        if self.input_history.last().map_or(false, |last| last == entry) {
+            return;
+        }
+        self.input_history.push(entry.to_string());
+        if self.input_history.len() > Self::INPUT_HISTORY_CAP {
+            let drop = self.input_history.len() - Self::INPUT_HISTORY_CAP;
+            self.input_history.drain(0..drop);
+        }
+        self.history_cursor = None;
     }
 
     /// Internal palette-flush bridge: the palette emits a bare command
@@ -602,11 +992,64 @@ impl ChatState {
                 message: HELP_TEXT.to_string(),
             },
             "agents" => self.dispatch_agents(),
+            "subagents" => self.dispatch_subagents(),
             "parallel" => {
                 let tail = trimmed.strip_prefix("parallel").unwrap_or("").trim();
                 self.dispatch_parallel(tail)
             }
             "budget" => self.dispatch_budget(),
+            "model" | "active" => {
+                // `/model` with no arg shows the active slug.
+                // `/model <slug>` is an alias for `/switch <slug>` so users
+                // can do model selection without remembering two commands.
+                if let Some(slug) = arg {
+                    return self.dispatch_switch(slug);
+                }
+                PaletteOutcome::Acknowledged {
+                    message: match self.active_model.as_deref() {
+                        Some(slug) => format!("active model: {slug}"),
+                        None => "active model: echo (no real LLM provider attached)".to_string(),
+                    },
+                }
+            }
+            "models" => {
+                if self.available_models.is_empty() {
+                    PaletteOutcome::Acknowledged {
+                        message: "no models in catalog; run `stratum models sync`".to_string(),
+                    }
+                } else {
+                    let active = self.active_model.as_deref();
+                    let listed = self
+                        .available_models
+                        .iter()
+                        .map(|s| {
+                            if Some(s.as_str()) == active {
+                                format!("* {s}")
+                            } else {
+                                format!("  {s}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    PaletteOutcome::Acknowledged {
+                        message: format!("available models:\n{listed}"),
+                    }
+                }
+            }
+            "tier" => PaletteOutcome::Acknowledged {
+                message: format!("tier: {:?}", self.tier).to_lowercase(),
+            },
+            "switch" => {
+                let Some(slug) = arg else {
+                    return PaletteOutcome::Rejected {
+                        message: "usage: /switch <slug>".to_string(),
+                    };
+                };
+                self.dispatch_switch(slug)
+            }
+            "version" => PaletteOutcome::Acknowledged {
+                message: format!("stratum {}", env!("CARGO_PKG_VERSION")),
+            },
             "quit" | "exit" => {
                 self.quit = true;
                 PaletteOutcome::Acknowledged {
@@ -615,6 +1058,34 @@ impl ChatState {
             }
             _ => PaletteOutcome::Rejected {
                 message: format!("unknown command: {cmd}"),
+            },
+        }
+    }
+
+    /// Shared switch logic backing `/switch <slug>` and `/model <slug>`.
+    fn dispatch_switch(&mut self, slug: &str) -> PaletteOutcome {
+        let Some(sw) = self.model_switcher.clone() else {
+            return PaletteOutcome::Rejected {
+                message: "/switch unavailable in echo mode".to_string(),
+            };
+        };
+        if !self.available_models.is_empty()
+            && !self.available_models.iter().any(|s| s == slug)
+        {
+            return PaletteOutcome::Rejected {
+                message: format!("unknown slug: {slug} (run /models to list available)"),
+            };
+        }
+        match (sw.0)(slug) {
+            Ok(new_loop) => {
+                self.agent_loop = new_loop;
+                self.active_model = Some(slug.to_string());
+                PaletteOutcome::Acknowledged {
+                    message: format!("switched to {slug}"),
+                }
+            }
+            Err(e) => PaletteOutcome::Rejected {
+                message: format!("/switch failed: {e}"),
             },
         }
     }
@@ -640,6 +1111,28 @@ impl ChatState {
         let current = self.current_role.map_or("default", |role| role_name(role));
         PaletteOutcome::Acknowledged {
             message: format!("roles: {joined} (current: {current})"),
+        }
+    }
+
+    /// Render the `/subagents` palette command output.
+    ///
+    /// Lists every registered subagent (built-in + user-defined) with
+    /// its description. Built-ins always present; user definitions come
+    /// from `<config>/stratum/subagents/*.toml`.
+    fn dispatch_subagents(&self) -> PaletteOutcome {
+        if self.subagents.is_empty() {
+            return PaletteOutcome::Rejected {
+                message: "no subagents registered".to_string(),
+            };
+        }
+        let lines: Vec<String> = self
+            .subagents
+            .list()
+            .iter()
+            .map(|s| format!("  {} — {}", s.name, s.description))
+            .collect();
+        PaletteOutcome::Acknowledged {
+            message: format!("subagents:\n{}", lines.join("\n")),
         }
     }
 
@@ -790,6 +1283,23 @@ impl ChatState {
         self.input.clear();
         self.input.push_str(prompt);
         self.submit();
+        self.block_until_idle();
+    }
+
+    /// Spin-wait until any pending async turn settles. Used by the
+    /// `--prompt` non-interactive path and by tests so they observe a
+    /// completed transcript right after `submit_with_prompt`. Interactive
+    /// TUI callers must NOT use this — the whole point of the async
+    /// submit is to keep the TUI responsive while the provider runs.
+    pub fn block_until_idle(&mut self) {
+        loop {
+            if !self.poll_turn_completion() && self.pending_rx.is_none() {
+                return;
+            }
+            if self.pending_rx.is_some() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 
     /// Join the most recent [`Turn::Assistant`] entry's text blocks into a
@@ -819,6 +1329,34 @@ impl ChatState {
         }
     }
 
+    /// Message from the most recent `Turn::Command`. Used by the
+    /// `--prompt` path to render `!cmd` shell output instead of erroring
+    /// "no text blocks" when the user's input was intercepted by the
+    /// palette / shell-prefix layer rather than going through the LLM.
+    #[must_use]
+    pub fn last_command_message(&self) -> Option<String> {
+        self.transcript.iter().rev().find_map(|t| match t {
+            Turn::Command { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+    }
+
+    /// Extract the first `Block::Cancelled` reason from the most recent
+    /// assistant turn. Lets the CLI surface real provider failures
+    /// (e.g., llama.cpp decode errors) instead of a generic
+    /// "no text blocks" message.
+    #[must_use]
+    pub fn last_assistant_failure_reason(&self) -> Option<String> {
+        let blocks = self.transcript.iter().rev().find_map(|t| match t {
+            Turn::Assistant(b) => Some(b),
+            _ => None,
+        })?;
+        blocks.iter().find_map(|b| match b {
+            Block::Cancelled { reason } => Some(reason.clone()),
+            _ => None,
+        })
+    }
+
     /// Submit the current input through the [`AgentLoop`] and append the
     /// resulting blocks to the transcript.
     ///
@@ -831,59 +1369,232 @@ impl ChatState {
         if self.input.trim().is_empty() {
             return;
         }
+        // Slash-prefix intercept: when the user typed a complete palette
+        // command directly (e.g. `/switch qwen-7b`), route it through the
+        // palette dispatch instead of sending to the LLM. This lets the
+        // user pass args to palette commands without juggling the
+        // palette UI's autocomplete state.
+        if self.input.starts_with('/') {
+            let cmd = std::mem::take(&mut self.input);
+            self.record_input_history(&cmd);
+            let _ = self.execute_palette_command(&cmd);
+            return;
+        }
+        // If a turn is already running, queue this prompt and return.
+        // The event loop calls `drain_queue` when the turn finishes.
+        if self.in_flight_since.is_some() {
+            let queued = std::mem::take(&mut self.input);
+            self.pending_queue.push(queued);
+            return;
+        }
+        // `!cmd` shell-prefix intercept — bypass LLM and route directly to
+        // the wired shell executor. Falls through to the LLM path when no
+        // executor is installed (so `!` is just a normal character).
+        if let Some(rest) = self.input.strip_prefix('!') {
+            if let Some(exec) = self.shell_executor.clone() {
+                let cmd = rest.trim().to_string();
+                let raw = std::mem::take(&mut self.input);
+                self.record_input_history(&raw);
+                if cmd.is_empty() {
+                    self.transcript.push(Turn::Command {
+                        text: "!".to_string(),
+                        ok: false,
+                        message: "usage: !<shell command>".to_string(),
+                    });
+                    return;
+                }
+                let (ok, message) = match (exec.0)(&cmd) {
+                    Ok(out) => (true, out),
+                    Err(e) => (false, e),
+                };
+                self.transcript.push(Turn::Command {
+                    text: format!("!{cmd}"),
+                    ok,
+                    message,
+                });
+                return;
+            }
+        }
         let prompt = std::mem::take(&mut self.input);
+        self.record_input_history(&prompt);
+        // Optimistic user-message display: push the user turn BEFORE the
+        // provider runs so the next render shows it immediately. The
+        // assistant turn lands after `run_turn` returns below.
+        self.transcript.push(Turn::User(prompt.clone()));
         let turn_id = TurnId(self.next_turn_id);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
 
         // Mark the turn as in-flight so `status_bar_text` renders the live
-        // `[generating… <N>s]` indicator. Cleared unconditionally at the end.
+        // `[generating… <N>s]` indicator. Cleared by `poll_turn_completion`.
         self.in_flight_since = Some(Instant::now());
+        self.pending_started = Some(Instant::now());
+        self.last_turn_id = Some(turn_id);
 
         let ctx = TurnContext {
             user_prompt: prompt.clone(),
             model: ModelId::from("echo"),
             turn_id,
-            started_at: std::time::SystemTime::now(),
+            started_at: SystemTime::now(),
         };
 
-        let role_timer = RoleTimer::start();
-        let (blocks, last_turn_result, handoff_lines, final_role) =
-            if let Some(handoff) = self.handoff.as_ref() {
-                self.run_turn_via_handoff(handoff.as_ref(), ctx, &prompt)
-            } else {
-                let turn_result = self.agent_loop.run_turn(ctx, &self.cancel);
-                let blocks = turn_result.blocks.clone();
-                (blocks, Some(turn_result), Vec::new(), None)
-            };
-        let step_ms = role_timer.stop_ms();
-        // Multi-agent mode only: track which role drove the chain to its
-        // final hop. Single-loop mode leaves `current_role` untouched (None).
-        if let Some(role) = final_role {
+        // Handoff path stays synchronous for now — multi-role chains
+        // build a chain summary mid-flight and need the lifetimes of
+        // `self.handoff` etc. The async path covers the common single-loop
+        // case where the perceived "frozen UI" is acute.
+        if let Some(handoff) = self.handoff.clone() {
+            let role_timer = RoleTimer::start();
+            let (blocks, last_turn_result, handoff_lines, final_role) =
+                self.run_turn_via_handoff(handoff.as_ref(), ctx, &prompt);
+            let step_ms = role_timer.stop_ms();
+            self.finalize_turn(TurnAsyncResult {
+                blocks,
+                turn_result: last_turn_result,
+                handoff_lines,
+                final_role,
+                step_ms,
+            });
+            return;
+        }
+
+        // Async path: spawn the provider on a worker thread so the
+        // event loop keeps rendering (and the `(thinking…)` placeholder
+        // stays visible) while the provider runs. A second channel
+        // streams per-token chunks back so the UI can render text as it
+        // arrives instead of waiting for the whole turn to settle.
+        let (tx, rx) = mpsc::channel();
+        let (chunk_tx, chunk_rx) = mpsc::channel();
+        self.streaming_text.clear();
+        let agent_loop = Arc::clone(&self.agent_loop);
+        let cancel = self.cancel.clone();
+        thread::spawn(move || {
+            let role_timer = RoleTimer::start();
+            let turn_result = agent_loop.run_turn_streaming(ctx, &cancel, chunk_tx);
+            let blocks = turn_result.blocks.clone();
+            let _ = tx.send(TurnAsyncResult {
+                blocks,
+                turn_result: Some(turn_result),
+                handoff_lines: Vec::new(),
+                final_role: None,
+                step_ms: role_timer.stop_ms(),
+            });
+        });
+        self.pending_rx = Some(rx);
+        self.chunk_rx = Some(chunk_rx);
+    }
+
+    /// Drain the async-turn channel and, if a result is ready, fold it
+    /// into the transcript. Returns `true` when a turn settled this
+    /// tick. Called from the event loop each iteration.
+    pub fn poll_turn_completion(&mut self) -> bool {
+        // Drain any streaming chunks first so the partial-text render
+        // catches up before we check for a final result.
+        if let Some(crx) = self.chunk_rx.as_ref() {
+            while let Ok(block) = crx.try_recv() {
+                if let Block::Text { text } = block {
+                    self.streaming_text.push_str(&text);
+                }
+            }
+        }
+        let Some(rx) = self.pending_rx.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.pending_rx = None;
+                self.finalize_turn(result);
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Worker thread dropped the sender before sending —
+                // surface as a cancellation marker so the UI doesn't
+                // hang waiting on a channel that will never deliver.
+                self.pending_rx = None;
+                self.transcript.push(Turn::Cancelled);
+                self.in_flight_since = None;
+                self.pending_started = None;
+                true
+            }
+        }
+    }
+
+    /// Shared finalization for both the sync handoff path and the
+    /// async single-loop path. Updates transcript, metrics, role label
+    /// and clears the in-flight indicator.
+    fn finalize_turn(&mut self, result: TurnAsyncResult) {
+        if let Some(role) = result.final_role {
             self.current_role = Some(role);
         }
-
+        let turn_id = self.last_turn_id.unwrap_or(TurnId(0));
         let mut recorder = TurnRecorder::new(turn_id);
-        for block in &blocks {
+        for block in &result.blocks {
             recorder.record_block(block);
         }
-        recorder.record_step("generate", step_ms);
+        recorder.record_step("generate", result.step_ms);
 
-        // Coarse 4-chars-per-token approximation across assistant text blocks.
-        // Replaces (not accumulates) `last_token_count` so the status bar
-        // reflects only the most recent turn — matching `last_metrics`.
-        let tokens_generated = approximate_token_count(&blocks);
+        let tokens_generated = approximate_token_count(&result.blocks);
         self.last_token_count = tokens_generated;
         self.last_metrics = Some(recorder.finish());
 
-        self.transcript.push(Turn::User(prompt));
-        self.transcript.push(Turn::Assistant(blocks));
-        for line in handoff_lines {
+        // Decide what to push. Three cases:
+        //  1. blocks contain a renderable Text/Usage/Cancelled — push as-is.
+        //  2. blocks are non-empty but only contain unrenderable variants
+        //     (ToolCall / ToolResult / Done) AND we have streaming text
+        //     the user saw — synthesize a Text block from streaming_text
+        //     so the visible response isn't replaced by a blank turn.
+        //  3. blocks are empty (zero-block provider error path) OR
+        //     genuinely have nothing to show — push as-is for parity with
+        //     the existing E_NO_BLOCKS test fixtures.
+        let has_renderable = result.blocks.iter().any(|b| {
+            matches!(b, Block::Text { .. } | Block::Usage { .. } | Block::Cancelled { .. })
+        });
+        let stream_was_just_json = looks_like_tool_call_json(self.streaming_text.trim());
+        if !has_renderable
+            && !result.blocks.is_empty()
+            && !self.streaming_text.is_empty()
+            && !stream_was_just_json
+        {
+            // Streaming captured real assistant text the user already
+            // saw; preserve it so the final view doesn't blank out.
+            let mut synth = result.blocks.clone();
+            synth.insert(
+                0,
+                Block::Text {
+                    text: self.streaming_text.clone(),
+                },
+            );
+            self.transcript.push(Turn::Assistant(synth));
+        } else {
+            // Either we have text blocks already, or the streamed text
+            // was just the tool-call JSON the model emitted — let the
+            // ToolCall / ToolResult markers render it cleanly.
+            self.transcript.push(Turn::Assistant(result.blocks));
+        }
+        for line in result.handoff_lines {
             self.transcript.push(line);
         }
-        self.last_turn_result = last_turn_result;
+        self.last_turn_result = result.turn_result;
 
-        // Turn finished: drop the in-flight indicator.
         self.in_flight_since = None;
+        self.pending_started = None;
+        self.chunk_rx = None;
+        self.streaming_text.clear();
+    }
+
+    /// Flush the front of `pending_queue` into a fresh `submit()` call.
+    /// Called by the event loop after each tick so queued prompts auto-fire
+    /// when the prior turn lands. Mirrors Claude Code's "you sent another
+    /// message while I was thinking" UX.
+    pub fn drain_queue(&mut self) {
+        if self.in_flight_since.is_some() {
+            return;
+        }
+        if self.pending_queue.is_empty() {
+            return;
+        }
+        let next = self.pending_queue.remove(0);
+        self.input = next;
+        self.submit();
     }
 
     /// Drive one turn through the supplied [`AgentHandoff`]. Returns the
@@ -1033,7 +1744,29 @@ impl ChatState {
         reason = "render walks every overlay (status, chat, palette, modal); splitting fragments the buffer plumbing for no gain"
     )]
     pub fn render(&self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
-        let palette_height = if self.palette.is_some() { 10 } else { 3 };
+        // Input pane height grows with both:
+        //  - explicit `\n` (Shift+Enter / Ctrl+J / Alt+Enter)
+        //  - long single-line input that wraps because the terminal is
+        //    narrower than the line length
+        // Without the wrap term, a 300-char paste on an 80-col terminal
+        // would stay at 3 rows and the user couldn't see what they typed.
+        // Cap at 12 rows to leave space for the chat pane on small TTYs.
+        let palette_height = if self.palette.is_some() {
+            10
+        } else {
+            // Inner box width = area minus left/right border.
+            let inner_w = area.width.saturating_sub(2).max(1) as usize;
+            let mut visual_rows: u16 = 0;
+            for (i, line) in self.input.split('\n').enumerate() {
+                // First line has the "> " prompt eating 2 columns.
+                let lead = if i == 0 { 2 } else { 0 };
+                let chars = line.chars().count() + lead;
+                let wrapped = (chars + inner_w - 1) / inner_w;
+                visual_rows = visual_rows.saturating_add(wrapped.max(1) as u16);
+            }
+            // 1 row for the input contents minimum + 2 for borders.
+            visual_rows.max(1).saturating_add(2).min(12)
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1083,20 +1816,82 @@ impl ChatState {
             ));
         }
         status_spans.push(Span::raw(" · "));
-        status_spans.push(Span::raw("Esc/Ctrl-C exit"));
+        if self.exit_armed() {
+            status_spans.push(Span::styled(
+                "press Ctrl+C / Ctrl+D again to exit",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            status_spans.push(Span::raw("Esc/Ctrl-C exit"));
+        }
         let status = Paragraph::new(Line::from(status_spans));
         ratatui::widgets::Widget::render(status, chunks[0], buf);
 
         let mut lines: Vec<Line<'_>> = Vec::new();
-        for turn in &self.transcript {
+        let last_idx = self.transcript.len().saturating_sub(1);
+        for (idx, turn) in self.transcript.iter().enumerate() {
             match turn {
-                Turn::User(text) => lines.push(Line::from(vec![
-                    Span::styled("you: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(text.clone()),
-                ])),
+                Turn::User(text) => {
+                    // Render multi-line user prompts (Shift+Enter newlines)
+                    // line-by-line so they stay legible.
+                    let mut first = true;
+                    for piece in text.split('\n') {
+                        if first {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    "you: ",
+                                    Style::default().add_modifier(Modifier::BOLD),
+                                ),
+                                Span::raw(piece.to_string()),
+                            ]));
+                            first = false;
+                        } else {
+                            lines.push(Line::from(Span::raw(piece.to_string())));
+                        }
+                    }
+                    // If a turn is in flight and this is the most recent
+                    // user message, render either a "(thinking…)"
+                    // placeholder or the partial streaming text the
+                    // provider has emitted so far.
+                    if idx == last_idx && self.in_flight_since.is_some() {
+                        if self.streaming_text.is_empty() {
+                            lines.push(Line::from(Span::styled(
+                                "(thinking…)",
+                                Style::default().add_modifier(Modifier::DIM),
+                            )));
+                        } else if self.streaming_text.trim_start().starts_with('{')
+                            || self.streaming_text.trim_start().starts_with("```")
+                        {
+                            // Model is emitting a tool-call JSON; don't show
+                            // the raw braces. Render a compact marker until
+                            // the turn finalizes and the ToolCall block
+                            // takes over.
+                            lines.push(Line::from(Span::styled(
+                                "(calling tool…)",
+                                Style::default().add_modifier(Modifier::DIM),
+                            )));
+                        } else {
+                            let mut first = true;
+                            for piece in self.streaming_text.split('\n') {
+                                if first {
+                                    lines.push(Line::from(vec![
+                                        Span::styled(
+                                            "ai:  ",
+                                            Style::default().add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::raw(piece.to_string()),
+                                    ]));
+                                    first = false;
+                                } else {
+                                    lines.push(Line::from(Span::raw(piece.to_string())));
+                                }
+                            }
+                        }
+                    }
+                }
                 Turn::Assistant(blocks) => {
                     for block in blocks {
-                        if let Some(line) = render_block(block) {
+                        for line in render_block(block) {
                             lines.push(line);
                         }
                     }
@@ -1116,21 +1911,33 @@ impl ChatState {
                 }
             }
         }
+        // Split the chat pane when a permission request is pending so
+        // the modal lives at the BOTTOM (above the input) instead of
+        // overlaying the chat history. Claude Code-style.
+        let pending = self.peek_pending_permission();
+        let modal_h: u16 = if pending.is_some() { 5 } else { 0 };
+        let chat_split = if modal_h > 0 {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(modal_h)])
+                .split(chunks[1])
+        } else {
+            std::rc::Rc::new([chunks[1]])
+        };
         let chat = Paragraph::new(lines)
             .block(TuiBlock::default().borders(Borders::ALL).title("chat"))
             .wrap(Wrap { trim: false });
-        ratatui::widgets::Widget::render(chat, chunks[1], buf);
+        ratatui::widgets::Widget::render(chat, chat_split[0], buf);
 
-        // Permission-request modal renders as an overlay inside the chat
-        // pane when a request is pending. We peek without popping so the
-        // modal persists across re-renders until a decision is supplied.
-        if let Some(pending) = self.peek_pending_permission() {
+        if let Some(pending) = pending {
             let modal_lines: Vec<Line<'_>> = vec![
-                Line::from(Span::styled(
-                    "permission request",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::raw(describe_request(&pending.request))),
+                Line::from(vec![
+                    Span::styled(
+                        "permission required: ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(describe_request(&pending.request)),
+                ]),
                 Line::from(Span::styled(
                     "[a] allow once  [s] allow session  [f] allow forever  [d] deny  [F] deny forever",
                     Style::default().add_modifier(Modifier::DIM),
@@ -1140,11 +1947,11 @@ impl ChatState {
                 .block(
                     TuiBlock::default()
                         .borders(Borders::ALL)
-                        .title("permission"),
+                        .title("permission")
+                        .border_style(Style::default().add_modifier(Modifier::BOLD)),
                 )
                 .wrap(Wrap { trim: false });
-            // Overlay across the chat pane only (chunks[1]).
-            ratatui::widgets::Widget::render(modal, chunks[1], buf);
+            ratatui::widgets::Widget::render(modal, chat_split[1], buf);
         }
 
         if let Some(palette) = self.palette.as_ref() {
@@ -1166,8 +1973,46 @@ impl ChatState {
                 .block(TuiBlock::default().borders(Borders::ALL).title("palette"));
             ratatui::widgets::Widget::render(palette_widget, chunks[2], buf);
         } else {
-            let input = Paragraph::new(Line::from(vec![Span::raw("> "), Span::raw(&self.input)]))
-                .block(TuiBlock::default().borders(Borders::ALL).title("input"));
+            // Multiline input: split on `\n` so Shift+Enter newlines
+            // render as proper lines, and let `Wrap { trim: false }` soft-wrap
+            // long lines to the box width so the user can see what they're
+            // typing even past the visible terminal column.
+            let queue_n = self.pending_queue.len();
+            let title = if queue_n > 0 {
+                format!("input (queue: {queue_n})")
+            } else {
+                "input".to_string()
+            };
+            // Visible block cursor at the end of the user's input so they
+            // can see where typed characters will land. ratatui's Frame
+            // cursor would be cleaner but render() only has access to the
+            // raw Buffer here; appending a glyph in-band is reliable and
+            // works on every terminal regardless of cursor-style support.
+            const CURSOR_GLYPH: &str = "▏";
+            let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
+            let mut input_lines: Vec<Line<'_>> = Vec::new();
+            let segments: Vec<&str> = self.input.split('\n').collect();
+            let last_seg_idx = segments.len().saturating_sub(1);
+            for (i, seg) in segments.iter().enumerate() {
+                let mut spans: Vec<Span<'_>> = Vec::new();
+                if i == 0 {
+                    spans.push(Span::raw("> "));
+                }
+                spans.push(Span::raw((*seg).to_string()));
+                if i == last_seg_idx {
+                    spans.push(Span::styled(CURSOR_GLYPH, cursor_style));
+                }
+                input_lines.push(Line::from(spans));
+            }
+            if input_lines.is_empty() {
+                input_lines.push(Line::from(vec![
+                    Span::raw("> "),
+                    Span::styled(CURSOR_GLYPH, cursor_style),
+                ]));
+            }
+            let input = Paragraph::new(input_lines)
+                .block(TuiBlock::default().borders(Borders::ALL).title(title))
+                .wrap(Wrap { trim: false });
             ratatui::widgets::Widget::render(input, chunks[2], buf);
         }
     }
@@ -1237,7 +2082,18 @@ fn describe_request(req: &PermissionRequest) -> String {
             |p| format!("connect to {host}:{p}"),
         ),
         PermissionRequest::FileWrite { path } => format!("write to {}", path.display()),
-        PermissionRequest::ToolUse { tool_id } => format!("invoke tool {tool_id}"),
+        PermissionRequest::ToolUse { tool_id, args } => {
+            // Truncate long arg blobs so the modal stays readable on
+            // narrow terminals. Full JSON still goes to the event log.
+            let preview = if args.is_empty() {
+                String::new()
+            } else if args.len() <= 200 {
+                format!(" {args}")
+            } else {
+                format!(" {}…", &args[..200])
+            };
+            format!("invoke tool {tool_id}{preview}")
+        }
     }
 }
 
@@ -1304,21 +2160,83 @@ fn approximate_token_count(blocks: &[Block]) -> u64 {
     total_chars / CHARS_PER_TOKEN
 }
 
-fn render_block(block: &Block) -> Option<Line<'_>> {
+/// Cheap shape check: does the string look like a JSON tool call
+/// (`{"tool":"…","args":…}`)? Used to decide whether streamed text
+/// should be promoted into a synthesized `Block::Text` or skipped in
+/// favor of the dispatcher's structured ToolCall + ToolResult blocks.
+fn looks_like_tool_call_json(s: &str) -> bool {
+    let s = s.trim();
+    let s = s.strip_prefix("```json").unwrap_or(s);
+    let s = s.strip_prefix("```").unwrap_or(s);
+    let s = s.trim_start();
+    s.starts_with('{') && s.contains("\"tool\"") && s.contains("\"args\"")
+}
+
+fn render_block(block: &Block) -> Vec<Line<'_>> {
     match block {
-        Block::Text { text } => Some(Line::from(vec![
-            Span::styled("ai:  ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(text.clone()),
-        ])),
-        Block::Usage { prompt, completion } => Some(Line::from(Span::styled(
+        Block::Text { text } => {
+            // Split on `\n` so the rendered Assistant turn keeps the
+            // same line layout the streaming render used. Otherwise the
+            // final block is one wrapped Paragraph line while streaming
+            // shows multiple lines — text reflows mid-finalize and looks
+            // like the message changed.
+            let mut lines = Vec::new();
+            let mut first = true;
+            for piece in text.split('\n') {
+                if first {
+                    lines.push(Line::from(vec![
+                        Span::styled("ai:  ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(piece.to_string()),
+                    ]));
+                    first = false;
+                } else {
+                    lines.push(Line::from(Span::raw(piece.to_string())));
+                }
+            }
+            lines
+        }
+        Block::ToolCall { tool, args, .. } => {
+            // Compact summary instead of the raw JSON the model emitted.
+            let preview = if args.len() <= 120 {
+                args.clone()
+            } else {
+                format!("{}…", &args[..120])
+            };
+            vec![Line::from(vec![
+                Span::styled(
+                    "→ tool ",
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(tool.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(preview, Style::default().add_modifier(Modifier::DIM)),
+            ])]
+        }
+        Block::ToolResult { output, .. } => {
+            // First line of the tool result, dimmed.
+            let first = output.lines().next().unwrap_or("").to_string();
+            let preview = if first.len() <= 120 {
+                first
+            } else {
+                format!("{}…", &first[..120])
+            };
+            vec![Line::from(vec![
+                Span::styled(
+                    "← result ",
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(preview, Style::default().add_modifier(Modifier::DIM)),
+            ])]
+        }
+        Block::Usage { prompt, completion } => vec![Line::from(Span::styled(
             format!("(usage: prompt={prompt} completion={completion})"),
             Style::default().add_modifier(Modifier::DIM),
-        ))),
-        Block::Cancelled { reason } => Some(Line::from(Span::styled(
+        ))],
+        Block::Cancelled { reason } => vec![Line::from(Span::styled(
             format!("(cancelled: {reason})"),
             Style::default().add_modifier(Modifier::ITALIC),
-        ))),
-        Block::Done | Block::ToolCall { .. } | Block::ToolResult { .. } => None,
+        ))],
+        Block::Done => Vec::new(),
     }
 }
 
@@ -1340,7 +2258,13 @@ pub fn status_for(paths: &Paths) -> String {
 pub fn run(paths: &Paths, tier: Tier) -> StratumResult<()> {
     let provider = EchoProvider::new("echo: ");
     let state = ChatState::new(provider, tier, status_for(paths));
-    run_with_state(state)
+    let store = open_session_store(paths);
+    run_with_state(state, store)
+}
+
+fn open_session_store(paths: &Paths) -> Option<stratum_runtime::TranscriptStore> {
+    let dir = paths.state.join("sessions");
+    stratum_runtime::TranscriptStore::open(dir).ok()
 }
 
 /// Drive the live TUI against a caller-supplied [`ChatState`]. Used by the
@@ -1349,21 +2273,57 @@ pub fn run(paths: &Paths, tier: Tier) -> StratumResult<()> {
 ///
 /// # Errors
 /// Propagates terminal-init failures as [`io::Error`].
-pub fn run_with_state(mut state: ChatState) -> StratumResult<()> {
+pub fn run_with_state(
+    mut state: ChatState,
+    saver: Option<stratum_runtime::TranscriptStore>,
+) -> StratumResult<()> {
     let mut stdout = io::stdout();
     enable_raw_mode().map_err(map_io_error)?;
     execute!(stdout, EnterAlternateScreen).map_err(map_io_error)?;
+    // Best-effort: ask the terminal to disambiguate modifier+Enter via
+    // the Kitty keyboard protocol. Supported on iTerm2 (>=3.5),
+    // Kitty, WezTerm, foot. Other terminals silently ignore it and
+    // fall back to plain Enter (Shift+Enter then arrives as bare Enter,
+    // which we still treat as submit; users can use Alt+Enter on those
+    // terminals — see the alternate binding in `handle_key`).
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(map_io_error)?;
     let result = event_loop(&mut terminal, &mut state);
+    let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    // Persist the transcript so `--resume <id>` can reload it. The save
+    // is best-effort: a failure should not turn into a confusing TUI
+    // crash on exit, so we just note it on stderr.
+    let session_id = state.session_id().clone();
+    let mut saved = false;
+    if let Some(store) = saver {
+        let t = state.to_persisted_transcript();
+        if !t.turns.is_empty() {
+            match store.save_atomic(&t) {
+                Ok(_) => saved = true,
+                Err(e) => eprintln!("\nstratum: failed to save session {session_id}: {e}"),
+            }
+        }
+    }
+    eprintln!("\nstratum: chat ended.");
+    if saved {
+        eprintln!("  session id:    {session_id}");
+        eprintln!("  resume:        stratum chat --resume {session_id}");
+        eprintln!("  list sessions: stratum chat --resume   (no id)");
+    }
+    eprintln!("  switch model:  stratum chat --model <slug>");
+    eprintln!("  list models:   stratum models list");
     result
 }
 
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>, state: &mut ChatState) -> StratumResult<()> {
     loop {
-        let evt = if event::poll(Duration::from_millis(100)).map_err(map_io_error)? {
+        let evt = if event::poll(Duration::from_millis(50)).map_err(map_io_error)? {
             Some(event::read().map_err(map_io_error)?)
         } else {
             None
@@ -1386,6 +2346,11 @@ fn step<B: Backend>(
     if let Some(Event::Key(key)) = event {
         state.handle_key(*key);
     }
+    // Poll the async turn-result channel before draining the queue so a
+    // freshly-settled turn unblocks the next queued prompt on the same
+    // tick instead of waiting another 100ms.
+    state.poll_turn_completion();
+    state.drain_queue();
     Ok(())
 }
 
@@ -1468,18 +2433,35 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_quits_and_pushes_cancelled() {
+    fn ctrl_c_first_press_arms_exit_without_quitting() {
         let mut s = state();
         s.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert!(s.should_quit());
-        assert!(matches!(s.transcript().last(), Some(Turn::Cancelled)));
+        assert!(!s.should_quit(), "first Ctrl+C must not quit");
+        assert!(s.exit_armed(), "first Ctrl+C must arm exit");
     }
 
     #[test]
-    fn ctrl_uppercase_c_also_cancels() {
+    fn ctrl_c_second_press_quits() {
         let mut s = state();
-        s.handle_key(key(KeyCode::Char('C'), KeyModifiers::CONTROL));
-        assert!(s.should_quit());
+        s.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        s.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(s.should_quit(), "second Ctrl+C must quit");
+    }
+
+    #[test]
+    fn ctrl_d_within_window_quits_after_ctrl_c() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        s.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(s.should_quit(), "Ctrl+D after Ctrl+C must quit");
+    }
+
+    #[test]
+    fn typed_char_disarms_exit() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        s.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(!s.exit_armed(), "typing must disarm exit");
     }
 
     #[test]
@@ -1491,10 +2473,18 @@ mod tests {
     }
 
     #[test]
-    fn slash_with_empty_input_opens_palette() {
+    fn ctrl_slash_opens_palette() {
+        let mut s = state();
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL));
+        assert!(s.palette_open());
+    }
+
+    #[test]
+    fn slash_with_empty_input_is_literal() {
         let mut s = state();
         s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
-        assert!(s.palette_open());
+        assert!(!s.palette_open());
+        assert_eq!(s.input(), "/");
     }
 
     #[test]
@@ -1509,7 +2499,7 @@ mod tests {
     #[test]
     fn palette_esc_closes_without_execute() {
         let mut s = state();
-        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL));
         s.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!s.palette_open());
         assert!(s.transcript().is_empty());
@@ -1518,7 +2508,7 @@ mod tests {
     #[test]
     fn palette_enter_executes_command() {
         let mut s = state();
-        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL));
         // First alphabetical match is "active" — unknown to the
         // dispatcher, so it lands as a rejected command turn.
         s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
@@ -1529,7 +2519,7 @@ mod tests {
     #[test]
     fn palette_quit_command_sets_quit() {
         let mut s = state();
-        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL));
         for c in "qui".chars() {
             s.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
         }
@@ -1545,7 +2535,7 @@ mod tests {
     #[test]
     fn palette_ctrl_c_closes_without_executing() {
         let mut s = state();
-        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL));
         s.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(!s.palette_open());
         assert!(s.transcript().is_empty());
@@ -1554,7 +2544,7 @@ mod tests {
     #[test]
     fn palette_typing_filters() {
         let mut s = state();
-        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL));
         s.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE));
         s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
         let Some(Turn::Command { text, .. }) = s.transcript().last() else {
@@ -1651,7 +2641,7 @@ mod tests {
     #[test]
     fn render_shows_palette_when_open() {
         let mut s = state();
-        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        s.handle_key(key(KeyCode::Char('/'), KeyModifiers::CONTROL));
         s.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE));
         let text = rendered_text(&s, 60, 12);
         assert!(text.contains("palette"));
@@ -1674,6 +2664,9 @@ mod tests {
     #[test]
     fn render_shows_cancelled_marker() {
         let mut s = state();
+        // Force in-flight so the first Ctrl+C cancels (rather than just
+        // arming exit). The two-press exit gesture is covered separately.
+        s.in_flight_since = Some(Instant::now());
         s.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         let text = rendered_text(&s, 60, 10);
         assert!(text.contains("(cancelled)"));
@@ -1698,54 +2691,91 @@ mod tests {
     #[test]
     fn render_block_text_emits_ai_prefix() {
         let block = Block::Text { text: "hi".into() };
-        let line = render_block(&block).unwrap();
-        let rendered: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        let lines = render_block(&block);
+        assert_eq!(lines.len(), 1);
+        let rendered: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
         assert!(rendered.contains("ai:"));
         assert!(rendered.contains("hi"));
     }
 
     #[test]
+    fn render_block_text_splits_on_newlines() {
+        let block = Block::Text {
+            text: "one\ntwo\nthree".into(),
+        };
+        let lines = render_block(&block);
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
     fn render_block_usage_emits_meter() {
-        let line = render_block(&Block::Usage {
+        let lines = render_block(&Block::Usage {
             prompt: 3,
             completion: 4,
-        })
-        .unwrap();
-        let rendered: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        });
+        assert_eq!(lines.len(), 1);
+        let rendered: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
         assert!(rendered.contains("usage"));
     }
 
     #[test]
-    fn render_block_done_returns_none() {
-        assert!(render_block(&Block::Done).is_none());
+    fn render_block_done_returns_empty() {
+        assert!(render_block(&Block::Done).is_empty());
     }
 
     #[test]
-    fn render_block_tool_call_returns_none() {
-        assert!(render_block(&Block::ToolCall {
+    fn render_block_tool_call_renders_marker() {
+        let block = Block::ToolCall {
             id: "t1".into(),
             tool: "fs.read".into(),
             args: "{}".into(),
-        })
-        .is_none());
+        };
+        let lines = render_block(&block);
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(rendered.contains("tool"));
+        assert!(rendered.contains("fs.read"));
     }
 
     #[test]
-    fn render_block_tool_result_returns_none() {
-        assert!(render_block(&Block::ToolResult {
+    fn render_block_tool_result_renders_marker() {
+        let block = Block::ToolResult {
             id: "t1".into(),
             output: "ok".into(),
-        })
-        .is_none());
+        };
+        let lines = render_block(&block);
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(rendered.contains("result"));
+        assert!(rendered.contains("ok"));
     }
 
     #[test]
-    fn render_block_cancelled_returns_some_with_reason() {
+    fn render_block_cancelled_returns_reason() {
         let block = Block::Cancelled {
             reason: "STRAT-E4002".into(),
         };
-        let line = render_block(&block).unwrap();
-        let rendered: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        let lines = render_block(&block);
+        assert_eq!(lines.len(), 1);
+        let rendered: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
         assert!(rendered.contains("STRAT-E4002"));
     }
 
@@ -2737,7 +3767,7 @@ mod tests {
         let prompter = TuiPromptResponder::new(Duration::from_secs(1));
         let p = PendingPrompt {
             id: PromptId(99),
-            request: PermissionRequest::ToolUse {
+            request: PermissionRequest::ToolUse { args: String::new(),
                 tool_id: "fs.write".into(),
             },
             issued_at: SystemTime::UNIX_EPOCH,
@@ -2806,7 +3836,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/x"),
         };
         assert!(describe_request(&file).contains("/tmp/x"));
-        let tool = PermissionRequest::ToolUse {
+        let tool = PermissionRequest::ToolUse { args: String::new(),
             tool_id: "fs.write".into(),
         };
         assert!(describe_request(&tool).contains("fs.write"));
@@ -2817,7 +3847,7 @@ mod tests {
         let mut s = state();
         let pending = PendingPrompt {
             id: PromptId(5),
-            request: PermissionRequest::ToolUse {
+            request: PermissionRequest::ToolUse { args: String::new(),
                 tool_id: "fs.write".into(),
             },
             issued_at: SystemTime::UNIX_EPOCH,
@@ -2835,7 +3865,7 @@ mod tests {
         let mut s = state();
         let pending = PendingPrompt {
             id: PromptId(6),
-            request: PermissionRequest::ToolUse {
+            request: PermissionRequest::ToolUse { args: String::new(),
                 tool_id: "fs.write".into(),
             },
             issued_at: SystemTime::UNIX_EPOCH,
@@ -2851,7 +3881,7 @@ mod tests {
         let s = state();
         let pending = PendingPrompt {
             id: PromptId(7),
-            request: PermissionRequest::ToolUse {
+            request: PermissionRequest::ToolUse { args: String::new(),
                 tool_id: "fs.write".into(),
             },
             issued_at: SystemTime::UNIX_EPOCH,

@@ -46,6 +46,24 @@ pub trait Provider: std::fmt::Debug + Send + Sync + 'static {
     /// Run a synchronous generation. The provider polls `cancel` between
     /// tokens and emits `Block::Cancelled` if it fires before completion.
     fn generate(&self, request: &GenerateRequest, cancel: &CancelToken) -> Vec<Block>;
+
+    /// Streaming variant. Implementations that can emit blocks
+    /// incrementally (e.g. token-by-token text) should override this to
+    /// call `on_chunk` for each emitted block. The default impl wraps
+    /// `generate`: it produces no real streaming, but UI callers always
+    /// see the same final result regardless of provider support.
+    fn generate_streaming(
+        &self,
+        request: &GenerateRequest,
+        cancel: &CancelToken,
+        on_chunk: &dyn Fn(&Block),
+    ) -> Vec<Block> {
+        let blocks = self.generate(request, cancel);
+        for b in &blocks {
+            on_chunk(b);
+        }
+        blocks
+    }
 }
 
 /// Deterministic echo provider for end-to-end loop tests.

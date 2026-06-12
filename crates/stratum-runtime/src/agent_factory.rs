@@ -271,6 +271,7 @@ impl AgentFactory {
             plan_mode: self.config.plan_mode,
             max_turn_duration: Duration::from_millis(self.config.max_turn_duration_ms),
             max_tool_calls_per_turn: self.config.max_tool_calls_per_turn,
+            max_agentic_steps: AgentLoopConfig::default().max_agentic_steps,
         };
 
         AgentLoop::builder()
@@ -637,7 +638,9 @@ mod tests {
         let res = loop_.run_turn(ctx("call tool"), &CancelToken::new());
         match res.outcome {
             TurnOutcome::ToolFailure { tool_id, code } => {
-                assert_eq!(tool_id, "fs.read#1");
+                // ToolFailure reports the tool name, not the per-call
+                // correlation id.
+                assert_eq!(tool_id, "fs.read");
                 assert_eq!(code, "STRAT-E5004");
             }
             other => panic!("expected ToolFailure STRAT-E5004, got {other:?}"),
