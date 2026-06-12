@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version       = "0.2.5"
+version       = "0.2.6"
 edition       = "2021"
 rust-version  = "1.90"
 authors       = ["Krishnendu <krishnenduchatterjee25@gmail.com>"]
@@ -79,6 +79,10 @@ llama-cpp-2     = { version = "0.1", default-features = false }
 # Used to UTF-8-decode per-token byte pieces returned from llama.cpp.
 # Only pulled in alongside `llama-cpp-2` via the `provider-llama-cpp` feature.
 encoding_rs     = { version = "0.8" }
+# Tarball extraction for `self-update --apply`. Default features only
+# include `gz` compression which is what GitHub Releases serve.
+tar             = { version = "0.4", default-features = false }
+flate2          = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [profile.release]
 lto             = "thin"

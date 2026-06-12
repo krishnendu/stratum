@@ -965,11 +965,11 @@ impl AgentLoop {
 /// this we truncate with an ellipsis. Caps prompt growth so the
 /// agentic loop does not blow past `n_ctx` (causing
 /// `GGML_ASSERT(n_tokens_all <= cparams.n_batch)` mid-decode).
-const MAX_RESULT_BYTES: usize = 4096;
+const MAX_RESULT_BYTES: usize = 12_000;
 /// Hard cap on the total continuation-prompt size. Above this we drop
 /// older tool results in favor of the most recent ones — the model
 /// needs the latest evidence more than the earliest.
-const MAX_CONTINUATION_BYTES: usize = 16384;
+const MAX_CONTINUATION_BYTES: usize = 24_000;
 
 fn build_continuation_prompt(original: &str, blocks: &[Block]) -> String {
     use std::fmt::Write;

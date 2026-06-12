@@ -2478,6 +2478,34 @@ fn chat_command(
     if let Some(slug) = auto_select_model(paths, tier) {
         return chat_with_model(&slug, args, paths, tier, resumed, out, err);
     }
+    // First-run UX: provider-llama-cpp built in but catalog empty.
+    // Print a helpful one-shot install command pointing at Gemma 4 E4B
+    // (the documented default) so the user can get a real chat session
+    // running without reading the docs.
+    #[cfg(feature = "provider-llama-cpp")]
+    {
+        let chat_count = ModelCatalog::load(&paths.state.join("models.json"))
+            .map(|c| {
+                c.filter_by_task(stratum_runtime::ModelTask::Chat).len()
+            })
+            .unwrap_or(0);
+        if chat_count == 0 && args.prompt.is_none() {
+            let _ = writeln!(err, "stratum: no chat model in catalog.");
+            let _ = writeln!(err, "");
+            let _ = writeln!(err, "  To install the recommended default (Gemma 4 E4B IT — official Google QAT,");
+            let _ = writeln!(err, "  ~4.8 GB, runs at ~80 tok/s on Apple Silicon Metal), run:");
+            let _ = writeln!(err, "");
+            let _ = writeln!(err, "    stratum models add --slug gemma-4-e4b --family gemma \\\\");
+            let _ = writeln!(err, "      --display-name 'Gemma 4 E4B IT (QAT Q4_0)' \\\\");
+            let _ = writeln!(err, "      --tier high --task chat --size-mib 4916 --quantization q4_0 \\\\");
+            let _ = writeln!(err, "      --url 'https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B_q4_0-it.gguf' \\\\");
+            let _ = writeln!(err, "      --sha256 e8b6a059ba86947a44ace84d6e5679795bc41862c25c30513142588f0e9dba1d \\\\");
+            let _ = writeln!(err, "      --bytes 5154939136 --license gemma");
+            let _ = writeln!(err, "");
+            let _ = writeln!(err, "  Then re-run `stratum chat`. (Falling back to EchoProvider for now.)");
+            let _ = writeln!(err, "");
+        }
+    }
 
     // No --model: keep EchoProvider behavior. `--prompt` still works for
     // the scripted path; otherwise fall through to the interactive TUI.
@@ -2644,7 +2672,7 @@ impl CliProviderResolver {
             model_path: target,
             n_ctx: self.n_ctx,
             n_threads: None,
-            n_gpu_layers: 0,
+            n_gpu_layers: 999, // offload all layers when Metal/CUDA available (auto-disabled on CPU-only builds)
             seed: 42,
         };
         let provider = LlamaCppProvider::open(&cfg)
@@ -3173,15 +3201,28 @@ fn auto_select_model(paths: &Paths, host_tier: Tier) -> Option<String> {
         Tier::Medium => ModelTier::Medium,
         Tier::High => ModelTier::High,
     };
-    // Walk from host tier DOWN, EXACT-tier match (not `<=`). `recommend_for`
-    // picks the smallest entry where `entry.tier <= target`, which on a
-    // High host picks the 0.5B Low entry. We want the most capable model
-    // the host can run, so we prefer matches at host_tier first and only
-    // fall back when nothing at that tier exists.
-    //
-    // Within a tier, prefer a coder-tuned model for agentic / tool-use
-    // workloads (slugs containing `coder`), then fall back to the
-    // lex-first entry (matches BTreeMap iteration order).
+    // Hard preference list. Gemma 4 E4B wins by default: official Google
+    // QAT GGUF, fast (MatFormer ~4B effective), follows tool-call rules
+    // well. Coder-tuned models are listed lower so users can manually
+    // /switch when they want more aggressive tool emission.
+    const PREFERRED: &[&str] = &[
+        "gemma-4-e4b",
+        "gemma-3-4b",
+        "qwen-coder-7b",
+        "qwen-7b",
+    ];
+    for pref in PREFERRED {
+        if let Ok(slug) = pref.parse() {
+            if catalog
+                .get(&slug)
+                .is_some_and(|e| e.task.contains(&ModelTask::Chat))
+            {
+                return Some((*pref).to_owned());
+            }
+        }
+    }
+    // Fallback: walk from host tier DOWN, exact-tier match. Pick the
+    // first entry at that tier when no preferred slug is installed.
     let walk: &[ModelTier] = match cli_tier {
         ModelTier::Xl => &[ModelTier::Xl, ModelTier::High, ModelTier::Medium, ModelTier::Low],
         ModelTier::High => &[ModelTier::High, ModelTier::Medium, ModelTier::Low],
@@ -3196,9 +3237,6 @@ fn auto_select_model(paths: &Paths, host_tier: Tier) -> Option<String> {
             .collect();
         if entries.is_empty() {
             continue;
-        }
-        if let Some(coder) = entries.iter().find(|e| e.slug.as_ref().contains("coder")) {
-            return Some(coder.slug.as_ref().to_owned());
         }
         return Some(entries[0].slug.as_ref().to_owned());
     }
@@ -3377,7 +3415,7 @@ fn resolve_llama_provider(
         model_path: target,
         n_ctx,
         n_threads: None,
-        n_gpu_layers: 0,
+        n_gpu_layers: 999, // offload all layers when Metal/CUDA available (auto-disabled on CPU-only builds)
         seed: 42,
     };
     LlamaCppProvider::open(&cfg)
@@ -3401,6 +3439,7 @@ fn default_tool_catalog() -> Vec<(String, String)> {
         ("fs.read".to_string(), "read a workspace file".to_string()),
         ("fs.write".to_string(), "create or overwrite a workspace file".to_string()),
         ("fs.edit".to_string(), "single-occurrence string replace in a workspace file".to_string()),
+        ("fs.tree".to_string(), "directory listing of the workspace (depth-capped)".to_string()),
         ("grep".to_string(), "recursive regex search across the workspace".to_string()),
         ("glob".to_string(), "find files matching a shell-style glob".to_string()),
         ("shell.exec".to_string(), "run a read-only shell command (ls cat pwd head tail wc echo git)".to_string()),
@@ -4663,6 +4702,19 @@ fn apply_upgrade_with_artifact(
         );
     }
 
+    // If the downloaded artifact looks like a gzipped tarball (`.tar.gz`
+    // or `.tgz`), extract the first regular file inside and replace
+    // `new_tmp` with the extracted payload. Lets release manifests
+    // point at conventional `.tar.gz` archives while self-update still
+    // ends up swapping in a raw executable.
+    let is_tarball = artifact.url.ends_with(".tar.gz") || artifact.url.ends_with(".tgz");
+    if is_tarball {
+        if let Err(msg) = extract_first_file_from_targz(&new_tmp) {
+            let _ = std::fs::remove_file(&new_tmp);
+            let _ = writeln!(err, "STRAT-E1001 tarball extract failed: {msg}");
+            return ExitCode::from(1);
+        }
+    }
     if let Err(msg) = make_executable(&new_tmp) {
         let _ = std::fs::remove_file(&new_tmp);
         let _ = writeln!(err, "STRAT-E1001 {msg}");
@@ -4721,6 +4773,34 @@ fn sibling_with_suffix(base: &Path, suffix: &str) -> PathBuf {
 /// the number of bytes written. The transport is `ureq` HTTPS for production
 /// URLs; HTTP is permitted only when `allow_insecure` is `true` AND the
 /// process is allowed to use insecure flags (see [`insecure_flags_allowed`]).
+/// Replace `path` (a downloaded `.tar.gz`) with the contents of the
+/// first regular file inside the archive. Used by `self-update --apply`
+/// so manifests can ship `.tar.gz` URLs without breaking the assumption
+/// that the artifact is a raw executable.
+fn extract_first_file_from_targz(path: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    let entries = archive.entries().map_err(|e| format!("entries: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("entry: {e}"))?;
+        let header = entry.header().clone();
+        if header.entry_type().is_file() {
+            // Replace the original tarball with the extracted file
+            // contents (atomic enough — caller still validates via
+            // make_executable + atomic_swap after we return).
+            let tmp = path.with_extension("extract.tmp");
+            let mut out = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
+            std::io::copy(&mut entry, &mut out).map_err(|e| format!("copy: {e}"))?;
+            out.sync_all().map_err(|e| format!("sync: {e}"))?;
+            drop(out);
+            std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
+            return Ok(());
+        }
+    }
+    Err("no regular file inside tarball".to_string())
+}
+
 fn download_and_verify(
     url: &str,
     dest: &Path,

@@ -989,9 +989,124 @@ impl ToolDispatcher for SubagentToolDispatcher {
     }
 }
 
+/// Directory-tree listing of the workspace. Cheaper than `glob` for
+/// "show me the layout" queries; depth-capped to keep output bounded.
+#[derive(Debug, Clone)]
+pub struct FsTreeToolDispatcher {
+    id: String,
+    root: PathBuf,
+    /// Maximum tree depth from the workspace root. 0 = root listing only.
+    max_depth: u32,
+    /// Maximum number of entries returned across the entire walk.
+    max_entries: usize,
+}
+
+impl FsTreeToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "fs.tree";
+    /// Default recursion depth.
+    pub const DEFAULT_DEPTH: u32 = 4;
+    /// Default ceiling on returned entries.
+    pub const DEFAULT_MAX_ENTRIES: usize = 1_000;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            max_depth: Self::DEFAULT_DEPTH,
+            max_entries: Self::DEFAULT_MAX_ENTRIES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for FsTreeToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let depth = match inv.args.get("depth") {
+            Some(Value::Number(n)) => n.as_u64().map_or(self.max_depth, |x| x.min(16) as u32),
+            _ => self.max_depth,
+        };
+        let canonical_root = match self.root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return self.err(
+                    E_DISPATCH_READ_FAILED,
+                    format!("workspace root unreadable: {e}"),
+                )
+            }
+        };
+        let mut entries: Vec<String> = Vec::new();
+        let mut stack: Vec<(PathBuf, u32)> = vec![(canonical_root.clone(), 0)];
+        let mut total_bytes: u64 = 0;
+        while let Some((dir, level)) = stack.pop() {
+            if level > depth {
+                continue;
+            }
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                if entries.len() >= self.max_entries {
+                    break;
+                }
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with('.') || name == "target" || name == "node_modules" {
+                        continue;
+                    }
+                }
+                let rel = path.strip_prefix(&canonical_root).unwrap_or(&path);
+                let kind = entry.file_type().ok().map_or(' ', |ft| {
+                    if ft.is_dir() {
+                        '/'
+                    } else if ft.is_symlink() {
+                        '@'
+                    } else {
+                        ' '
+                    }
+                });
+                let line = format!("{}{}", rel.display(), kind);
+                total_bytes += line.len() as u64;
+                entries.push(line);
+                if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                    stack.push((path, level + 1));
+                }
+            }
+            if entries.len() >= self.max_entries {
+                break;
+            }
+        }
+        entries.sort();
+        let body = serde_json::json!({
+            "depth": depth,
+            "entries": entries,
+        });
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes: total_bytes,
+        }
+    }
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 /// Build the default dispatcher registry used by the agent loop.
-/// Includes: `fs.read`, `fs.write`, `fs.edit`, `grep`, `glob`,
-/// `shell.exec`.
+/// Includes: `fs.read`, `fs.write`, `fs.edit`, `fs.tree`, `grep`,
+/// `glob`, `shell.exec`.
 #[must_use]
 pub fn default_dispatchers(
     workspace_root: PathBuf,
@@ -1002,12 +1117,14 @@ pub fn default_dispatchers(
     let fs_read = FsReadToolDispatcher::new(workspace_root.clone());
     let fs_write = FsWriteToolDispatcher::new(workspace_root.clone());
     let fs_edit = FsEditToolDispatcher::new(workspace_root.clone());
+    let fs_tree = FsTreeToolDispatcher::new(workspace_root.clone());
     let grep = GrepToolDispatcher::new(workspace_root.clone());
     let glob = GlobToolDispatcher::new(workspace_root);
     let shell = ShellToolDispatcher::new(sandbox, base_spec);
     let _ = reg.register(Box::new(fs_read));
     let _ = reg.register(Box::new(fs_write));
     let _ = reg.register(Box::new(fs_edit));
+    let _ = reg.register(Box::new(fs_tree));
     let _ = reg.register(Box::new(grep));
     let _ = reg.register(Box::new(glob));
     let _ = reg.register(Box::new(shell));
@@ -1576,10 +1693,11 @@ mod tests {
             passthrough_spec_in(tmp.path()),
         );
         let ids = reg.ids();
-        assert_eq!(ids.len(), 6);
+        assert_eq!(ids.len(), 7);
         assert!(ids.contains(&"fs.read"));
         assert!(ids.contains(&"fs.write"));
         assert!(ids.contains(&"fs.edit"));
+        assert!(ids.contains(&"fs.tree"));
         assert!(ids.contains(&"grep"));
         assert!(ids.contains(&"glob"));
         assert!(ids.contains(&"shell.exec"));
