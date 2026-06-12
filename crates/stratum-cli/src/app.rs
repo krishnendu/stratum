@@ -352,7 +352,7 @@ struct ServeArgs {
     model: Option<String>,
     /// Logical context window passed to the llama.cpp provider, in
     /// tokens. Only used together with `--model`.
-    #[arg(long, default_value_t = 2048)]
+    #[arg(long, default_value_t = 8192)]
     ctx: u32,
     /// Emit a single JSON object on startup describing the bound
     /// address. Without this flag, a prose line is printed instead.
@@ -462,7 +462,7 @@ struct ChatArgs {
     #[arg(long, value_name = "SLUG")]
     model: Option<String>,
     /// Logical context window passed to the llama.cpp provider, in tokens.
-    #[arg(long, default_value_t = 2048)]
+    #[arg(long, default_value_t = 8192)]
     ctx: u32,
     /// Maximum number of blocks the provider is allowed to emit per turn.
     #[arg(long = "max-blocks", default_value_t = 1)]

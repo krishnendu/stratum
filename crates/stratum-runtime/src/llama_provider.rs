@@ -471,12 +471,65 @@ impl LlamaCppProvider {
             produced = produced.saturating_add(1);
         }
 
-        if output.is_empty() {
+        // Strip chat-template sentinels that some GGUFs emit verbatim
+        // when llama.cpp's EOG token list does not include them (notably
+        // Gemma 4 IT files that ship a ChatML-flavored template).
+        let cleaned = strip_chat_sentinels(&output);
+        if cleaned.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(output))
+            Ok(Some(cleaned))
         }
     }
+}
+
+/// Remove trailing chat-template marker tokens that occasionally leak
+/// into the rendered output. Covers both ChatML (`<|im_end|>` etc.) and
+/// Gemma-style (`<end_of_turn>`, `<start_of_turn>`) sentinels so the
+/// user never sees them in a reply.
+fn strip_chat_sentinels(s: &str) -> String {
+    const SENTINELS: &[&str] = &[
+        "<|im_end|>",
+        "<|im_start|>",
+        "<|endoftext|>",
+        "<end_of_turn>",
+        "<start_of_turn>",
+        "<eos>",
+        "<bos>",
+    ];
+    let mut out = s.to_string();
+    loop {
+        let trimmed_end = out.trim_end().to_string();
+        let mut stripped = false;
+        for sentinel in SENTINELS {
+            if let Some(rest) = trimmed_end.strip_suffix(sentinel) {
+                out = rest.trim_end().to_string();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            out = trimmed_end;
+            break;
+        }
+    }
+    // Also drop any sentinel appearing inside the text (rare but
+    // observed on long generations); replace with empty so prose
+    // around it stays.
+    for sentinel in SENTINELS {
+        out = out.replace(sentinel, "");
+    }
+    // After sentinel removal, the leading user-turn block and any
+    // role labels ("user", "assistant", "model") may show up as
+    // orphan lines because the GGUF's chat template wrapped the
+    // prompt with ChatML headers. Keep only what comes after the
+    // LAST `assistant\n` or `model\n` role label, if any.
+    for marker in ["assistant\n", "model\n", "assistant\r\n", "model\r\n"] {
+        if let Some(idx) = out.rfind(marker) {
+            out = out[idx + marker.len()..].to_string();
+        }
+    }
+    out.trim().to_string()
 }
 
 impl Provider for LlamaCppProvider {

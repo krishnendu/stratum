@@ -961,28 +961,70 @@ impl AgentLoop {
 /// for the next agentic step. Simple text-append format is provider-
 /// agnostic; per-model formats (Qwen `<tool_call>`, Hermes ChatML, etc.)
 /// land when GBNF grammar wiring does.
+/// Max bytes per tool-result block in the continuation prompt. Beyond
+/// this we truncate with an ellipsis. Caps prompt growth so the
+/// agentic loop does not blow past `n_ctx` (causing
+/// `GGML_ASSERT(n_tokens_all <= cparams.n_batch)` mid-decode).
+const MAX_RESULT_BYTES: usize = 4096;
+/// Hard cap on the total continuation-prompt size. Above this we drop
+/// older tool results in favor of the most recent ones — the model
+/// needs the latest evidence more than the earliest.
+const MAX_CONTINUATION_BYTES: usize = 16384;
+
 fn build_continuation_prompt(original: &str, blocks: &[Block]) -> String {
     use std::fmt::Write;
+    // Collect tool call + result lines first so we can drop older ones
+    // when the total exceeds the budget.
+    let mut entries: Vec<String> = Vec::new();
+    for b in blocks {
+        match b {
+            Block::ToolCall { tool, args, .. } => {
+                let args_trunc = truncate_for_prompt(args, MAX_RESULT_BYTES);
+                entries.push(format!("Tool call: {tool} args={args_trunc}\n"));
+            }
+            Block::ToolResult { output, .. } => {
+                let out_trunc = truncate_for_prompt(output, MAX_RESULT_BYTES);
+                entries.push(format!("Result: {out_trunc}\n"));
+            }
+            _ => {}
+        }
+    }
+    // Drop oldest entries until under the global cap.
+    while entries
+        .iter()
+        .map(String::len)
+        .sum::<usize>()
+        .saturating_add(original.len())
+        > MAX_CONTINUATION_BYTES
+        && entries.len() > 2
+    {
+        entries.remove(0);
+    }
     let mut out = String::with_capacity(original.len() + 256);
     out.push_str(original);
     out.push_str("\n\n---\n");
     out.push_str("You issued the following tool calls and received these results:\n\n");
-    for b in blocks {
-        match b {
-            Block::ToolCall { tool, args, .. } => {
-                let _ = writeln!(out, "Tool call: {tool} args={args}");
-            }
-            Block::ToolResult { output, .. } => {
-                let _ = writeln!(out, "Result: {output}");
-            }
-            _ => {}
-        }
+    for e in entries {
+        out.push_str(&e);
     }
     out.push_str(
         "\nContinue. If you have enough information, give the final answer in plain text. \
          Otherwise issue another tool call.\n",
     );
     out
+}
+
+/// Cap `s` at `max` bytes, appending `…(truncated)` when shortened.
+/// Splits on a UTF-8 char boundary so we don't corrupt multibyte text.
+fn truncate_for_prompt(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…(truncated)", &s[..end])
 }
 
 // ---------------------------------------------------------------------------
