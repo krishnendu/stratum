@@ -3393,41 +3393,18 @@ fn resolve_llama_provider(
 /// verbs to emit when it wants to call a tool.
 #[cfg(feature = "provider-llama-cpp")]
 fn default_tool_catalog() -> Vec<(String, String)> {
+    // Keep descriptions ONE short line, no JSON examples. Otherwise the
+    // model dumps the example payloads back as plain text when a user
+    // asks "what tools do you have". Args/shapes belong in the few-shot
+    // examples in the system prompt, not in this catalog.
     vec![
-        (
-            "fs.read".to_string(),
-            r#"Read a file inside the workspace. Args: {"path":"<relative/path>"}."#.to_string(),
-        ),
-        (
-            "fs.write".to_string(),
-            r#"Write a file inside the workspace. Args: {"path":"<relative/path>","content":"<full file contents>"}."#
-                .to_string(),
-        ),
-        (
-            "fs.edit".to_string(),
-            r#"Replace a single occurrence of `old_string` with `new_string` in a workspace file. Args: {"path":"...","old_string":"...","new_string":"..."}."#
-                .to_string(),
-        ),
-        (
-            "grep".to_string(),
-            r#"Recursive regex search across the workspace. Args: {"pattern":"<regex>"}."#
-                .to_string(),
-        ),
-        (
-            "glob".to_string(),
-            r#"Find files matching a shell-style glob. Args: {"pattern":"**/*.rs"}."#
-                .to_string(),
-        ),
-        (
-            "shell.exec".to_string(),
-            r#"Run an allowlisted shell command. Args: {"command":"ls","args":["-la"]}. Allowed: echo, ls, cat, pwd, wc, head, tail, git. Use `git` with read-only subcommands like `diff`, `log`, `status`, `show`."#
-                .to_string(),
-        ),
-        (
-            "subagent.run".to_string(),
-            r#"Delegate a side task to a registered subagent. Args: {"name":"<subagent name>","task":"<plain-English task>"}. Available subagents: explore, code-reviewer, code-architect, general-purpose."#
-                .to_string(),
-        ),
+        ("fs.read".to_string(), "read a workspace file".to_string()),
+        ("fs.write".to_string(), "create or overwrite a workspace file".to_string()),
+        ("fs.edit".to_string(), "single-occurrence string replace in a workspace file".to_string()),
+        ("grep".to_string(), "recursive regex search across the workspace".to_string()),
+        ("glob".to_string(), "find files matching a shell-style glob".to_string()),
+        ("shell.exec".to_string(), "run a read-only shell command (ls cat pwd head tail wc echo git)".to_string()),
+        ("subagent.run".to_string(), "delegate a side task to a built-in subagent".to_string()),
     ]
 }
 

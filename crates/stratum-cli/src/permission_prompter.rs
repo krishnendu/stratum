@@ -110,6 +110,18 @@ impl TuiPromptResponder {
         guard.requests.front().cloned()
     }
 
+    /// Total queued permission requests (including the one currently
+    /// rendered in the modal). Used by the TUI to surface "+N more"
+    /// hints when multiple tools are queued.
+    #[must_use]
+    pub fn queue_len(&self) -> usize {
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.requests.len()
+    }
+
     /// Record a decision for prompt `id` and wake any waiter.
     pub fn submit_decision(&self, id: PromptId, decision: PermissionDecision) {
         {

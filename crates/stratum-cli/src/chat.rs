@@ -74,6 +74,7 @@ const HELP_TEXT: &str = "available commands:\n\
     /version — show stratum version\n\
     /agents — list registered roles (multi-agent mode only)\n\
     /subagents — list available subagents (built-in + user-defined)\n\
+    /agent <name> <task> — explicitly delegate <task> to subagent <name>\n\
     /parallel <role1,role2,…> — fan the next turn out across the listed roles \
 (multi-agent mode only)\n\
     /budget — show the latest turn metrics (tokens · ms · tok/s · turn id)\n\
@@ -993,6 +994,37 @@ impl ChatState {
             },
             "agents" => self.dispatch_agents(),
             "subagents" => self.dispatch_subagents(),
+            "agent" => {
+                // `/agent <name> <task>` queues an explicit subagent
+                // delegation as the next user turn. Cheap UX shim:
+                // re-injects the prompt as if the user typed
+                // "Use the <name> subagent to <task>". The model still
+                // emits `subagent.run` JSON, the agent loop dispatches.
+                let tail = trimmed.strip_prefix("agent").unwrap_or("").trim();
+                let mut parts = tail.splitn(2, char::is_whitespace);
+                let Some(name) = parts.next().filter(|s| !s.is_empty()) else {
+                    return PaletteOutcome::Rejected {
+                        message: "usage: /agent <name> <task>".to_string(),
+                    };
+                };
+                if self.subagents.get(name).is_none() {
+                    return PaletteOutcome::Rejected {
+                        message: format!(
+                            "unknown subagent: {name} (run /subagents to list)"
+                        ),
+                    };
+                }
+                let Some(task) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+                    return PaletteOutcome::Rejected {
+                        message: "usage: /agent <name> <task>".to_string(),
+                    };
+                };
+                self.input = format!("Use the {name} subagent to {task}");
+                self.submit();
+                PaletteOutcome::Acknowledged {
+                    message: format!("delegating to {name}"),
+                }
+            }
             "parallel" => {
                 let tail = trimmed.strip_prefix("parallel").unwrap_or("").trim();
                 self.dispatch_parallel(tail)
@@ -1924,12 +1956,29 @@ impl ChatState {
         } else {
             std::rc::Rc::new([chunks[1]])
         };
+        // Auto-scroll so the LATEST lines stay visible. ratatui's
+        // Paragraph renders top-down by default — when total lines exceed
+        // the pane height the bottom (newest) content gets cut off,
+        // which is exactly the opposite of what a chat UI wants. We
+        // compute a virtual scroll offset so the last `inner_h` lines
+        // render. PgUp/PgDn manual scrollback lands in a follow-up.
+        let inner_h = chat_split[0].height.saturating_sub(2) as usize;
+        let total = lines.len();
+        let scroll_y = total.saturating_sub(inner_h);
+        let scroll_y = u16::try_from(scroll_y).unwrap_or(u16::MAX);
         let chat = Paragraph::new(lines)
             .block(TuiBlock::default().borders(Borders::ALL).title("chat"))
-            .wrap(Wrap { trim: false });
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_y, 0));
         ratatui::widgets::Widget::render(chat, chat_split[0], buf);
 
         if let Some(pending) = pending {
+            let qlen = self.permission_prompter.queue_len();
+            let title_suffix = if qlen > 1 {
+                format!(" (+{} more)", qlen - 1)
+            } else {
+                String::new()
+            };
             let modal_lines: Vec<Line<'_>> = vec![
                 Line::from(vec![
                     Span::styled(
@@ -1937,6 +1986,10 @@ impl ChatState {
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(describe_request(&pending.request)),
+                    Span::styled(
+                        title_suffix,
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
                 ]),
                 Line::from(Span::styled(
                     "[a] allow once  [s] allow session  [f] allow forever  [d] deny  [F] deny forever",

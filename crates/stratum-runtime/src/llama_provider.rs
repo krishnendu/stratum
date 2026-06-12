@@ -253,7 +253,10 @@ impl LlamaCppProvider {
         // -- 1. IDENTITY (one sentence, top of prompt). --
         out.push_str(
             "You are Stratum, a friendly local coding assistant running on the user's \
-             machine.\n\n",
+             machine.\n\n\
+             CRITICAL: when you call a tool, the JSON object MUST be your entire reply. \
+             NO preamble. NO 'here is how'. NO surrounding prose. NO markdown fences. \
+             Just the JSON, alone on one line.\n\n",
         );
 
         // -- 2. MODES. Strict default = chat; tool use is the exception. --
@@ -537,36 +540,58 @@ impl Provider for LlamaCppProvider {
 /// don't break detection.
 fn text_to_blocks(text: String) -> Vec<Block> {
     let trimmed = strip_code_fence(text.trim());
-    // Did the model attempt a tool call (starts with `{` and mentions
-    // a "tool" key)? We track this so a malformed attempt doesn't fall
-    // back to rendering the raw JSON as user-visible text.
-    let looks_like_tool_attempt = trimmed.starts_with('{') && trimmed.contains("\"tool\"");
-    if let Some(stripped) = trimmed.strip_prefix('{') {
-        if let Some(end_idx) = find_balanced_close(stripped) {
-            let candidate = &trimmed[..=end_idx + 1];
-            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(candidate) {
-                if let (Some(serde_json::Value::String(tool)), Some(args_val)) =
-                    (map.get("tool"), map.get("args"))
-                {
-                    let args_str = serde_json::to_string(args_val).unwrap_or_else(|_| "{}".to_string());
-                    return vec![Block::ToolCall {
-                        id: format!("call-{tool}"),
-                        tool: tool.clone(),
-                        args: args_str,
-                    }];
-                }
+    // Try to find an embedded `{"tool":...,"args":...}` JSON object
+    // anywhere in the output — model often wraps it in markdown prose
+    // ("Here is how: { ... }") despite system-prompt instructions.
+    if let Some((start, end)) = find_tool_call_span(trimmed) {
+        let candidate = &trimmed[start..=end];
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(candidate) {
+            if let (Some(serde_json::Value::String(tool)), Some(args_val)) =
+                (map.get("tool"), map.get("args"))
+            {
+                let args_str =
+                    serde_json::to_string(args_val).unwrap_or_else(|_| "{}".to_string());
+                return vec![Block::ToolCall {
+                    id: format!("call-{tool}"),
+                    tool: tool.clone(),
+                    args: args_str,
+                }];
             }
         }
     }
+    // Did the model attempt a tool call but emit malformed JSON?
+    let looks_like_tool_attempt = trimmed.contains("\"tool\"") && trimmed.contains('{');
     if looks_like_tool_attempt {
-        // Malformed / unparseable tool call attempt. Replace with a
-        // human-readable marker instead of leaking the JSON.
         return vec![Block::Text {
             text: "(model tried to call a tool but emitted a malformed payload; ignoring)"
                 .to_string(),
         }];
     }
     vec![Block::Text { text }]
+}
+
+/// Locate the byte indices `(start, end)` of the first balanced JSON
+/// object in `s` that contains both `"tool"` and `"args"` keys. Returns
+/// `None` when no such span exists. Scan-anywhere; we don't require the
+/// JSON to be at position 0 because models routinely wrap it in prose.
+fn find_tool_call_span(s: &str) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    for start in 0..bytes.len() {
+        if bytes[start] != b'{' {
+            continue;
+        }
+        let rest = &s[start + 1..];
+        if let Some(end_off) = find_balanced_close(rest) {
+            let end = start + 1 + end_off;
+            let candidate = &s[start..=end];
+            // Cheap filter: only consider candidates that look like tool
+            // calls. Avoids parsing every brace pair as JSON.
+            if candidate.contains("\"tool\"") && candidate.contains("\"args\"") {
+                return Some((start, end));
+            }
+        }
+    }
+    None
 }
 
 /// Strip a leading / trailing markdown code fence (```json, ```text,
