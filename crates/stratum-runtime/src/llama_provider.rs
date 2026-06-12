@@ -41,6 +41,24 @@ const REPEAT_PENALTY_LAST_N: i32 = 64;
 /// One `Block` ≈ this many tokens for the placeholder block-budget math.
 const TOKENS_PER_BLOCK: u32 = 64;
 
+/// GBNF grammar that constrains tool-call emission to exactly one JSON
+/// object of shape `{"tool":"<id>","args":{...}}`. Wired in as a LAZY
+/// sampler: it is only enforced once the model emits a leading `{`,
+/// leaving plain-text replies entirely unconstrained.
+const TOOL_CALL_GBNF: &str = r#"root        ::= "{" ws "\"tool\"" ws ":" ws tool-id ws "," ws "\"args\"" ws ":" ws object ws "}"
+tool-id     ::= "\"" tool-name "\""
+tool-name   ::= "fs.read" | "fs.write" | "fs.edit" | "grep" | "glob" | "shell.exec" | "subagent.run"
+value       ::= object | array | string | number | "true" | "false" | "null"
+object      ::= "{" ws ( member ( ws "," ws member )* )? ws "}"
+member      ::= string ws ":" ws value
+array       ::= "[" ws ( value ( ws "," ws value )* )? ws "]"
+string      ::= "\"" char* "\""
+char        ::= [^"\\] | "\\" ( ["\\/bfnrt] | "u" hex hex hex hex )
+hex         ::= [0-9a-fA-F]
+number      ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [-+]? [0-9]+ )?
+ws          ::= [ \t\n]*
+"#;
+
 /// Process-wide handle to the llama.cpp backend.
 ///
 /// The backend must be initialized exactly once per process; doing it
@@ -187,15 +205,39 @@ impl LlamaCppProvider {
     }
 
     /// Build the sampler chain for one request.
+    ///
+    /// Opt-in GBNF grammar sampler: set `STRATUM_GBNF=1` to enable.
+    /// When enabled we prepend a LAZY grammar keyed on the `^\{`
+    /// trigger so the model can emit free-form text OR a single
+    /// well-formed `{"tool":"…","args":{…}}` object — never a malformed
+    /// hybrid. Off by default until the per-model grammar interaction
+    /// is hardened (some llama.cpp 0.1.146 builds assert mid-decode
+    /// when the lazy trigger fires on certain tokenizers).
     fn build_sampler(&self, req: &GenerateRequest) -> LlamaSampler {
         let seed = u32::try_from(self.seed & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-        LlamaSampler::chain_simple([
-            LlamaSampler::penalties(REPEAT_PENALTY_LAST_N, Self::repeat_penalty(req), 0.0, 0.0),
-            LlamaSampler::top_k(40),
-            LlamaSampler::top_p(Self::top_p(req), 1),
-            LlamaSampler::temp(Self::temperature(req)),
-            LlamaSampler::dist(seed),
-        ])
+        let mut samplers: Vec<LlamaSampler> = Vec::with_capacity(6);
+        if std::env::var_os("STRATUM_GBNF").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            if let Ok(grammar) = LlamaSampler::grammar_lazy_patterns(
+                &self.model,
+                TOOL_CALL_GBNF,
+                "root",
+                &["^\\{".to_string()],
+                &[],
+            ) {
+                samplers.push(grammar);
+            }
+        }
+        samplers.push(LlamaSampler::penalties(
+            REPEAT_PENALTY_LAST_N,
+            Self::repeat_penalty(req),
+            0.0,
+            0.0,
+        ));
+        samplers.push(LlamaSampler::top_k(40));
+        samplers.push(LlamaSampler::top_p(Self::top_p(req), 1));
+        samplers.push(LlamaSampler::temp(Self::temperature(req)));
+        samplers.push(LlamaSampler::dist(seed));
+        LlamaSampler::chain_simple(samplers)
     }
 
     /// Build the system message that tells the model which tools are
@@ -289,8 +331,10 @@ impl LlamaCppProvider {
         out
     }
 
-    fn format_chat_prompt(&self, prompt: &str) -> String {
-        let system = self.system_prompt();
+    fn format_chat_prompt_with(&self, prompt: &str, system_override: Option<&str>) -> String {
+        let system = system_override
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.system_prompt());
         let chatml_fallback = || {
             format!(
                 "<|im_start|>system\n{system}<|im_end|>\n\
@@ -358,7 +402,8 @@ impl LlamaCppProvider {
             .new_context(&self.backend, ctx_params)
             .map_err(|e| LlamaProviderError::Backend(e.to_string()))?;
 
-        let formatted_prompt = self.format_chat_prompt(&req.prompt);
+        let formatted_prompt =
+            self.format_chat_prompt_with(&req.prompt, req.system_override.as_deref());
         let prompt_tokens = self
             .model
             .str_to_token(&formatted_prompt, AddBos::Never)
@@ -588,7 +633,7 @@ pub fn echoey_smoke_text(provider: &LlamaCppProvider) -> Result<String, LlamaPro
         // 5 tokens budget — TOKENS_PER_BLOCK math rounds up, but the
         // EOG handler / sampler will short-circuit well before then on
         // a healthy model.
-        max_blocks: 1,
+        max_blocks: 1, system_override: None,
     };
     let cancel = CancelToken::new();
     provider

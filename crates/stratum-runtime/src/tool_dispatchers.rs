@@ -76,7 +76,15 @@ const E_DISPATCH_BAD_PATTERN: &str = "E_DISPATCH_BAD_PATTERN";
 ///
 /// Paranoid scaffold: every additional binary must be reviewed against the
 /// threat model in `plan/31-tool-sandbox-and-secrets.md`.
-pub const SHELL_DEFAULT_ALLOWLIST: &[&str] = &["echo", "ls", "cat", "pwd", "wc", "head", "tail"];
+pub const SHELL_DEFAULT_ALLOWLIST: &[&str] = &[
+    "echo", "ls", "cat", "pwd", "wc", "head", "tail",
+    // Read-only git operations. The shell dispatcher runs under a
+    // passthrough sandbox today, so any git subcommand that *modifies*
+    // history (commit / push / reset / rebase) is still implicitly
+    // denied by the model's reluctance to call it — and explicitly
+    // gateable via `with_allowlist` for hardened deployments.
+    "git",
+];
 
 /// `ToolDispatcher` for `shell.exec` calls. Composes a `SandboxSpawn`
 /// with a base `SandboxLaunchSpec` and a per-call wall-clock timeout.
@@ -865,6 +873,117 @@ impl ToolDispatcher for GlobToolDispatcher {
     fn supports(&self, tool_id: &str) -> bool {
         tool_id == Self::ID
     }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Dispatcher that delegates a single side-task to a registered
+/// subagent. Args: `{"name":"<subagent>","task":"<prompt>"}`.
+///
+/// The dispatcher runs the subagent's prompt body as a system override on
+/// the parent's `Provider` (single-shot, no nested tool dispatch — see
+/// `plan/37` §2.3 "no nesting" rule). Returns the model's text reply as
+/// the tool result.
+pub struct SubagentToolDispatcher {
+    id: String,
+    registry: std::sync::Arc<crate::subagent::SubagentRegistry>,
+    provider: std::sync::Arc<dyn crate::provider::Provider>,
+    max_blocks: u32,
+}
+
+impl std::fmt::Debug for SubagentToolDispatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubagentToolDispatcher")
+            .field("id", &self.id)
+            .field("registry_len", &self.registry.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SubagentToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "subagent.run";
+    /// Default cap on subagent block emission.
+    pub const DEFAULT_MAX_BLOCKS: u32 = 16;
+
+    /// Build a new subagent dispatcher backed by `registry` and `provider`.
+    #[must_use]
+    pub fn new(
+        registry: std::sync::Arc<crate::subagent::SubagentRegistry>,
+        provider: std::sync::Arc<dyn crate::provider::Provider>,
+    ) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            registry,
+            provider,
+            max_blocks: Self::DEFAULT_MAX_BLOCKS,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for SubagentToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let name = match inv.args.get("name") {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "subagent.run requires `name`"),
+        };
+        let task = match inv.args.get("task") {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "subagent.run requires `task`"),
+        };
+        let Some(sub) = self.registry.get(&name) else {
+            return self.err(
+                E_DISPATCH_MISSING_ARG,
+                format!("unknown subagent: {name}"),
+            );
+        };
+        let req = crate::provider::GenerateRequest {
+            model: stratum_types::ModelId::from("subagent"),
+            prompt: task,
+            max_blocks: self.max_blocks,
+            system_override: Some(sub.prompt.clone()),
+        };
+        let cancel = crate::cancel::CancelToken::new();
+        let blocks = self.provider.generate(&req, &cancel);
+        let text: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                stratum_types::Block::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        if text.is_empty() {
+            return self.err(
+                E_DISPATCH_READ_FAILED,
+                "subagent returned no text blocks",
+            );
+        }
+        let body = serde_json::json!({
+            "subagent": name,
+            "answer": text,
+        });
+        let bytes = text.len() as u64;
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes,
+        }
+    }
+
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+
     fn id(&self) -> &str {
         &self.id
     }

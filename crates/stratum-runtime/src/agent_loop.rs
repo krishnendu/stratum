@@ -537,7 +537,7 @@ impl AgentLoop {
         let req = GenerateRequest {
             model: ctx.model.clone(),
             prompt: ctx.user_prompt.clone(),
-            max_blocks: 64,
+            max_blocks: 64, system_override: None,
         };
         let child_cancel = cancel.child();
 
@@ -1865,7 +1865,7 @@ mod tests {
             &GenerateRequest {
                 model: ModelId::from("x"),
                 prompt: String::new(),
-                max_blocks: 0,
+                max_blocks: 0, system_override: None,
             },
             &CancelToken::new(),
         );
@@ -1874,7 +1874,7 @@ mod tests {
             &GenerateRequest {
                 model: ModelId::from("x"),
                 prompt: String::new(),
-                max_blocks: 0,
+                max_blocks: 0, system_override: None,
             },
             &CancelToken::new(),
         );
@@ -1893,7 +1893,7 @@ mod tests {
             &GenerateRequest {
                 model: ModelId::from("x"),
                 prompt: String::new(),
-                max_blocks: 0,
+                max_blocks: 0, system_override: None,
             },
             &cancel,
         );
@@ -1906,7 +1906,7 @@ mod tests {
             &GenerateRequest {
                 model: ModelId::from("x"),
                 prompt: String::new(),
-                max_blocks: 0,
+                max_blocks: 0, system_override: None,
             },
             &CancelToken::new(),
         );

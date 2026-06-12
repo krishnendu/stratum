@@ -820,7 +820,7 @@ mod tests {
             &GenerateRequest {
                 model: ModelId::from("any"),
                 prompt: "x".into(),
-                max_blocks: 1,
+                max_blocks: 1, system_override: None,
             },
             &CancelToken::new(),
         );

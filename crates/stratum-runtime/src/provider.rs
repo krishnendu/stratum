@@ -26,6 +26,13 @@ pub struct GenerateRequest {
     pub prompt: String,
     /// Maximum number of `Block`s to emit (excluding `Done`/`Cancelled`).
     pub max_blocks: u32,
+    /// Optional system-message override. When `Some`, the provider uses
+    /// this string as the system prompt for this request instead of its
+    /// default. Subagent dispatch (per `plan/37`) sets this so the
+    /// subagent runs with its own role + tool restrictions while sharing
+    /// the parent's `Provider` instance.
+    #[serde(default)]
+    pub system_override: Option<String>,
 }
 
 /// Trait every concrete provider implements.
@@ -142,6 +149,7 @@ mod tests {
             model: ModelId::from("echo"),
             prompt: prompt.to_string(),
             max_blocks,
+            system_override: None,
         }
     }
 

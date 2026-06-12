@@ -3173,12 +3173,34 @@ fn auto_select_model(paths: &Paths, host_tier: Tier) -> Option<String> {
         Tier::Medium => ModelTier::Medium,
         Tier::High => ModelTier::High,
     };
-    // Walk tier downward so a `Low`-tagged model is acceptable on a `High`
-    // host: small first, escalate if nothing matches.
-    for tier in [ModelTier::Low, cli_tier] {
-        if let Some(entry) = catalog.recommend_for(tier, ModelTask::Chat) {
-            return Some(entry.slug.as_ref().to_owned());
+    // Walk from host tier DOWN, EXACT-tier match (not `<=`). `recommend_for`
+    // picks the smallest entry where `entry.tier <= target`, which on a
+    // High host picks the 0.5B Low entry. We want the most capable model
+    // the host can run, so we prefer matches at host_tier first and only
+    // fall back when nothing at that tier exists.
+    //
+    // Within a tier, prefer a coder-tuned model for agentic / tool-use
+    // workloads (slugs containing `coder`), then fall back to the
+    // lex-first entry (matches BTreeMap iteration order).
+    let walk: &[ModelTier] = match cli_tier {
+        ModelTier::Xl => &[ModelTier::Xl, ModelTier::High, ModelTier::Medium, ModelTier::Low],
+        ModelTier::High => &[ModelTier::High, ModelTier::Medium, ModelTier::Low],
+        ModelTier::Medium => &[ModelTier::Medium, ModelTier::Low],
+        ModelTier::Low => &[ModelTier::Low],
+    };
+    for tier in walk {
+        let entries: Vec<&_> = catalog
+            .filter_by_tier(*tier)
+            .into_iter()
+            .filter(|e| e.task.contains(&ModelTask::Chat))
+            .collect();
+        if entries.is_empty() {
+            continue;
         }
+        if let Some(coder) = entries.iter().find(|e| e.slug.as_ref().contains("coder")) {
+            return Some(coder.slug.as_ref().to_owned());
+        }
+        return Some(entries[0].slug.as_ref().to_owned());
     }
     None
 }
@@ -3398,7 +3420,12 @@ fn default_tool_catalog() -> Vec<(String, String)> {
         ),
         (
             "shell.exec".to_string(),
-            r#"Run an allowlisted shell command. Args: {"command":"ls","args":["-la"]}. Allowed: echo, ls, cat, pwd, wc, head, tail."#
+            r#"Run an allowlisted shell command. Args: {"command":"ls","args":["-la"]}. Allowed: echo, ls, cat, pwd, wc, head, tail, git. Use `git` with read-only subcommands like `diff`, `log`, `status`, `show`."#
+                .to_string(),
+        ),
+        (
+            "subagent.run".to_string(),
+            r#"Delegate a side task to a registered subagent. Args: {"name":"<subagent name>","task":"<plain-English task>"}. Available subagents: explore, code-reviewer, code-architect, general-purpose."#
                 .to_string(),
         ),
     ]
@@ -3442,7 +3469,18 @@ fn build_llama_agent_loop(
         backend: BackendChoice::Passthrough,
     };
     let spawn = SandboxSpawn::new(SandboxBackend::Passthrough);
-    let dispatcher = Arc::new(default_dispatchers(cwd, spawn, spec));
+    let mut reg = default_dispatchers(cwd, spawn, spec);
+    // Wire the subagent dispatcher so the parent loop can delegate
+    // side-tasks to registered subagents via `subagent.run`.
+    let subagent_registry = Arc::new(
+        stratum_runtime::subagent::SubagentRegistry::with_builtins(),
+    );
+    let subagent_dispatcher = stratum_runtime::tool_dispatchers::SubagentToolDispatcher::new(
+        subagent_registry,
+        provider.clone(),
+    );
+    let _ = reg.register(Box::new(subagent_dispatcher));
+    let dispatcher = Arc::new(reg);
 
     AgentLoop::builder()
         .with_provider(provider)
@@ -4378,6 +4416,7 @@ fn echo(json: bool, prompt: &[String], max_blocks: u32, out: &mut dyn Write) -> 
         model: ModelId::from("echo"),
         prompt: prompt.join(" "),
         max_blocks,
+        system_override: None,
     };
     let cancel = CancelToken::new();
     let blocks = provider.generate(&request, &cancel);
@@ -5251,7 +5290,10 @@ fn events_tail(
 /// Filesystem location of the transcript directory under the configured
 /// state root. Mirrors what the future chat persistence layer writes to.
 fn transcripts_dir(paths: &Paths) -> PathBuf {
-    paths.state.join("transcripts")
+    // Aligned with `chat::open_session_store` which writes there. Prior
+    // `transcripts/` value was a save/load mismatch — `--resume <id>`
+    // could not find files the chat layer had just written.
+    paths.state.join("sessions")
 }
 
 /// Open the on-disk [`TranscriptStore`] rooted at `<state>/transcripts/`,
