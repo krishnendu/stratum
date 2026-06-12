@@ -1551,7 +1551,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stratum-cli"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "clap",
  "clap_complete",
@@ -1573,7 +1573,7 @@ dependencies = [
 
 [[package]]
 name = "stratum-eval"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "clap",
  "serde",
@@ -1585,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "stratum-runtime"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "dirs",
  "encoding_rs",
@@ -1608,7 +1608,7 @@ dependencies = [
 
 [[package]]
 name = "stratum-testkit"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "stratum-types"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "proptest",
  "serde",
@@ -2393,7 +2393,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "tempfile",
  "thiserror",

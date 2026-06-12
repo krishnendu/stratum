@@ -496,6 +496,11 @@ fn strip_chat_sentinels(s: &str) -> String {
         "<start_of_turn>",
         "<eos>",
         "<bos>",
+        // Qwen3 / DeepSeek-R1 thinking-mode tags. The whole `<think>...
+        // </think>` chain-of-thought block is internal scratch; we strip
+        // it so the user sees only the final answer.
+        "<think>",
+        "</think>",
     ];
     let mut out = s.to_string();
     loop {
@@ -510,6 +515,19 @@ fn strip_chat_sentinels(s: &str) -> String {
         }
         if !stripped {
             out = trimmed_end;
+            break;
+        }
+    }
+    // Strip entire `<think>…</think>` chain-of-thought blocks before
+    // the per-sentinel pass — these are model scratch and should never
+    // surface in the final answer.
+    while let Some(start) = out.find("<think>") {
+        if let Some(rel_end) = out[start..].find("</think>") {
+            let end = start + rel_end + "</think>".len();
+            out.replace_range(start..end, "");
+        } else {
+            // Unterminated — drop from <think> onwards.
+            out.truncate(start);
             break;
         }
     }
