@@ -23,10 +23,10 @@ class StratumLlamaCpp < Formula
   desc "Stratum — your local model crew (with real local LLM inference via llama.cpp)"
   homepage "https://github.com/krishnendu/stratum"
   license any_of: ["Apache-2.0", "MIT"]
-  version "0.2.1"  # MAINTAINER: bump on each release; sourced from the same tag as `stratum`
+  version "0.2.9"  # MAINTAINER: bump on each release; sourced from the same tag as `stratum`
 
-  url "https://github.com/krishnendu/stratum/archive/refs/tags/v0.2.1.tar.gz"
-  sha256 "cb5d60ef3a68e87b234ba9bf75a1616d019330aba078d9447abb8ae6db349467"
+  url "https://github.com/krishnendu/stratum/archive/refs/tags/v0.2.9.tar.gz"
+  sha256 "0fdeee794f9bcfb9997843f7a4aff5a5634aa0dbd5bdb2a4ff1c8a0aba01f8ef"
 
   conflicts_with "stratum",
     because: "both install a `stratum` binary; pick the prebuilt or the LLM-enabled build"
