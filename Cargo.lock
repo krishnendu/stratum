@@ -2463,7 +2463,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stratum-backend-local"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "serde_json",
  "stratum-runtime",
@@ -2474,7 +2474,7 @@ dependencies = [
 
 [[package]]
 name = "stratum-cli"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2497,7 +2497,7 @@ dependencies = [
 
 [[package]]
 name = "stratum-eval"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "clap",
  "serde",
@@ -2509,7 +2509,7 @@ dependencies = [
 
 [[package]]
 name = "stratum-runtime"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "dirs",
  "encoding_rs",
@@ -2535,7 +2535,7 @@ dependencies = [
 
 [[package]]
 name = "stratum-testkit"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -2545,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "stratum-tui"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -2559,7 +2559,7 @@ dependencies = [
 
 [[package]]
 name = "stratum-tui-api"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -2569,7 +2569,7 @@ dependencies = [
 
 [[package]]
 name = "stratum-types"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "proptest",
  "serde",
@@ -3502,7 +3502,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "tempfile",
  "thiserror",
