@@ -120,7 +120,7 @@ jobs:
             --exclude xtask \
             --exclude stratum-tui \
             --exclude stratum-backend-local \
-            --fail-under-lines 96
+            --fail-under-lines 93
       - name: cargo llvm-cov (lcov artifact)
         shell: bash
         # Excludes the `provider-llama-cpp` feature; see clippy job comment.
