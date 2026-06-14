@@ -44,6 +44,44 @@ pub enum Block {
     },
 }
 
+impl Block {
+    /// If this block is a `ToolCall`, return its args parsed into a
+    /// JSON object map. Returns `None` for non-ToolCall variants OR
+    /// when the args string isn't a JSON object (an array, a number,
+    /// or malformed JSON).
+    ///
+    /// Centralises the JSON-string-to-typed-map conversion that
+    /// every dispatcher would otherwise re-implement. Cheap on the
+    /// happy path — serde_json is forgiving and tail-recursive over
+    /// short objects.
+    #[must_use]
+    pub fn tool_args(&self) -> Option<serde_json::Map<String, serde_json::Value>> {
+        if let Block::ToolCall { args, .. } = self {
+            serde_json::from_str::<serde_json::Value>(args)
+                .ok()
+                .and_then(|v| match v {
+                    serde_json::Value::Object(m) => Some(m),
+                    _ => None,
+                })
+        } else {
+            None
+        }
+    }
+
+    /// Extract a single string-valued arg from a `ToolCall`. Returns
+    /// `None` for non-ToolCall variants, missing keys, or non-string
+    /// values. The common dispatcher pattern is "fetch path / command
+    /// / pattern" — this saves the parse + downcast boilerplate.
+    #[must_use]
+    pub fn tool_arg_str(&self, key: &str) -> Option<String> {
+        self.tool_args()
+            .as_ref()?
+            .get(key)?
+            .as_str()
+            .map(str::to_string)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +134,66 @@ mod tests {
         let s = serde_json::to_string(&b).unwrap();
         let back: Block = serde_json::from_str(&s).unwrap();
         assert_eq!(b, back);
+    }
+
+    #[test]
+    fn tool_args_returns_map_on_well_formed_args() {
+        let b = Block::ToolCall {
+            id: "t1".into(),
+            tool: "fs.read".into(),
+            args: r#"{"path":"README.md","encoding":"utf-8"}"#.into(),
+        };
+        let map = b.tool_args().unwrap();
+        assert_eq!(map.get("path").unwrap().as_str(), Some("README.md"));
+        assert_eq!(map.get("encoding").unwrap().as_str(), Some("utf-8"));
+    }
+
+    #[test]
+    fn tool_args_returns_none_on_malformed_json() {
+        let b = Block::ToolCall {
+            id: "t1".into(),
+            tool: "x".into(),
+            args: "not json".into(),
+        };
+        assert!(b.tool_args().is_none());
+    }
+
+    #[test]
+    fn tool_args_returns_none_when_not_a_toolcall() {
+        let b = Block::Text { text: "hi".into() };
+        assert!(b.tool_args().is_none());
+    }
+
+    #[test]
+    fn tool_args_returns_none_on_array_root() {
+        // `{}` is the contract; arrays / numbers don't satisfy it.
+        let b = Block::ToolCall {
+            id: "t1".into(),
+            tool: "x".into(),
+            args: "[1,2,3]".into(),
+        };
+        assert!(b.tool_args().is_none());
+    }
+
+    #[test]
+    fn tool_arg_str_extracts_known_key() {
+        let b = Block::ToolCall {
+            id: "t1".into(),
+            tool: "fs.read".into(),
+            args: r#"{"path":"a.txt"}"#.into(),
+        };
+        assert_eq!(b.tool_arg_str("path").as_deref(), Some("a.txt"));
+        assert!(b.tool_arg_str("missing").is_none());
+    }
+
+    #[test]
+    fn tool_arg_str_returns_none_for_non_string_value() {
+        let b = Block::ToolCall {
+            id: "t1".into(),
+            tool: "x".into(),
+            args: r#"{"count":42}"#.into(),
+        };
+        assert!(b.tool_arg_str("count").is_none());
     }
 
     #[test]

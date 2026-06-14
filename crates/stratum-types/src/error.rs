@@ -144,6 +144,9 @@ pub mod codes {
     pub const E5004_TOOL_DENIED: ErrorCode = ErrorCode::new_static("STRAT-E5004");
     /// Sandbox egress denied by net allowlist.
     pub const E5005_NET_DENIED: ErrorCode = ErrorCode::new_static("STRAT-E5005");
+    /// Tool call rejected by the schema gate — required arg missing, or
+    /// shell.exec command not on the allowlist.
+    pub const E5006_TOOL_SCHEMA: ErrorCode = ErrorCode::new_static("STRAT-E5006");
 
     // E6xxx — network / update / telemetry
     /// Update signature verification failed.

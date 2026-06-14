@@ -40,7 +40,7 @@ fn case(id: &str, prompt: &str, expected: &[&str], forbidden: &[&str]) -> EvalCa
         prompt: prompt.into(),
         expected_substrings: expected.iter().map(|s| (*s).to_string()).collect(),
         forbidden_substrings: forbidden.iter().map(|s| (*s).to_string()).collect(),
-        max_blocks: 32, system_override: None,
+        max_blocks: 32,
     }
 }
 

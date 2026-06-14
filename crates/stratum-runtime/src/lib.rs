@@ -47,6 +47,36 @@ pub mod budget_meter;
 pub mod cancel;
 /// Hierarchical cancellation cascade with reasons + RAII deadlines.
 pub mod cancel_cascade;
+/// Deterministic Caveman compressor — heuristic prose → fragment
+/// for inter-agent messages and tool-result re-injection.
+pub mod caveman;
+/// Reviewer pass — score an assistant draft with a SECOND provider
+/// (anti-self-bias per plan/17).
+pub mod reviewer;
+/// `STRATUM.md` walk-up loader with `@file` imports (plan/39).
+pub mod memory_loader;
+/// Auto-memory storage layer — per-repo MEMORY.md index + body files
+/// the agent maintains across sessions (plan/40).
+pub mod auto_memory;
+/// Permission rule DSL — `fs.write(*.rs)`, `Bash(npm *)` (plan/30 §10.1).
+pub mod permission_rules;
+/// Four-tier settings loader (managed/user/project/local, plan/30 §10).
+pub mod settings_loader;
+/// `.stratumignore` matcher for fs.* + glob + grep (plan/30 §3.1).
+pub mod stratumignore;
+/// Hooks runtime — settings.json hooks dispatcher (plan/42).
+pub mod hooks;
+/// Filesystem hot-reload for settings / agents / hooks (plan/30 §10.3).
+pub mod hot_reload;
+/// Canonical multi-role orchestrator wrapping AgentLoop with router +
+/// reviewer + polish per plan/03 + plan/17.
+pub mod orchestrator;
+/// Context compressor trait — Caveman v1, LLMLingua-2 plug point.
+pub mod compressor;
+/// Role-based model swap controller (plan/02 §Roster).
+pub mod role_router;
+/// Candle-backed provider scaffold (Phase 2 v2 embeddings landing).
+pub mod candle_provider;
 /// Remote `ModelCatalog` sync over HTTPS — fetch + validate + atomic write.
 pub mod catalog_sync;
 /// `claude -p` subprocess transport for the Stratum LLM-judge.
@@ -290,7 +320,7 @@ pub use prompt_template::{
     RenderedPrompt, TemplateId, TemplateIdError, ToolResultSnippet,
 };
 pub use prompts::{system_prompt, PromptRole};
-pub use provider::{EchoProvider, GenerateRequest, Provider};
+pub use provider::{ChatHistoryTurn, EchoProvider, GenerateRequest, Provider, SamplerParams};
 pub use provider_cache::{CacheError, CacheSlot, ProviderCache, ProviderKey};
 pub use rag::{chunk_document, Chunk, ChunkPlan, ChunkSpan, DocumentId, RagDocument, RagIndex};
 pub use rag_index_builder::{

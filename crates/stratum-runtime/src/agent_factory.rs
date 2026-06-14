@@ -272,6 +272,11 @@ impl AgentFactory {
             max_turn_duration: Duration::from_millis(self.config.max_turn_duration_ms),
             max_tool_calls_per_turn: self.config.max_tool_calls_per_turn,
             max_agentic_steps: AgentLoopConfig::default().max_agentic_steps,
+            // Production factory: schema-validate tool calls so missing
+            // required args (fs.write w/o `content`, fs.edit w/o
+            // `old_string`) are caught before dispatch instead of
+            // silently corrupting files.
+            validate_tool_args: true,
         };
 
         AgentLoop::builder()
@@ -367,6 +372,7 @@ mod tests {
             model: ModelId::from("echo"),
             turn_id: TurnId(1),
             started_at: t0(),
+            history: Vec::new(),
         }
     }
 
@@ -406,6 +412,17 @@ mod tests {
             id: id.into(),
             tool: tool.into(),
             args: "{}".into(),
+        }
+    }
+
+    /// fs.read call with a syntactically valid `path` arg. Use this when
+    /// the test wants the call to clear the schema gate
+    /// (`validate_tool_args = true`) and reach the permission gate.
+    fn fs_read_call(id: &str) -> Block {
+        Block::ToolCall {
+            id: id.into(),
+            tool: "fs.read".into(),
+            args: r#"{"path":"hello.txt"}"#.into(),
         }
     }
 
@@ -623,10 +640,7 @@ mod tests {
 
     #[test]
     fn permission_mode_deny_all_fails_tool_call_with_e5004() {
-        let scripted = Arc::new(ScriptedProvider::new(vec![tool_call(
-            "fs.read#1",
-            "fs.read",
-        )]));
+        let scripted = Arc::new(ScriptedProvider::new(vec![fs_read_call("fs.read#1")]));
         let loop_ = AgentFactory::new()
             .with_provider(scripted)
             .with_config(AgentFactoryConfig {
@@ -652,10 +666,7 @@ mod tests {
         // The runtime layer maps Prompt -> DenyAllResponder. This test
         // pins that contract — the CLI is the layer that swaps in the
         // real interactive responder.
-        let scripted = Arc::new(ScriptedProvider::new(vec![tool_call(
-            "fs.read#1",
-            "fs.read",
-        )]));
+        let scripted = Arc::new(ScriptedProvider::new(vec![fs_read_call("fs.read#1")]));
         let loop_ = AgentFactory::new()
             .with_provider(scripted)
             .with_config(AgentFactoryConfig {
@@ -820,7 +831,10 @@ mod tests {
             &GenerateRequest {
                 model: ModelId::from("any"),
                 prompt: "x".into(),
-                max_blocks: 1, system_override: None,
+                max_blocks: 1,
+                system_override: None,
+                history: Vec::new(),
+                sampler: crate::provider::SamplerParams::default(),
             },
             &CancelToken::new(),
         );

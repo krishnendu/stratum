@@ -1,6 +1,6 @@
 [package]
 name         = "stratum-cli"
-description  = "Stratum CLI entry point."
+description  = "Stratum — your local model crew. Local-first chat with an LLM agent."
 version      = { workspace = true }
 edition      = { workspace = true }
 rust-version = { workspace = true }
@@ -28,6 +28,10 @@ provider-llama-cpp = ["stratum-runtime/provider-llama-cpp"]
 [dependencies]
 stratum-types       = { path = "../stratum-types" }
 stratum-runtime     = { path = "../stratum-runtime" }
+# stratum-tui — palette/theme/brand split. The full chat renderer
+# still lives in this crate (~7K lines); Phase B's final move is a
+# focused-session follow-up.
+stratum-tui         = { path = "../stratum-tui" }
 clap                = { workspace = true }
 clap_complete       = { workspace = true }
 serde               = { workspace = true }

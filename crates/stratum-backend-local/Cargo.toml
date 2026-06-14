@@ -1,0 +1,25 @@
+[package]
+name         = "stratum-backend-local"
+description  = "Reference BackendApi implementation that runs the in-process Stratum AgentLoop. Wraps any Provider — echo for tests, llama.cpp for inference, future bring-your-own-impl for remote daemons."
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+homepage     = { workspace = true }
+readme       = { workspace = true }
+keywords     = { workspace = true }
+categories   = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+stratum-tui-api = { path = "../stratum-tui-api" }
+stratum-runtime = { path = "../stratum-runtime" }
+stratum-types   = { path = "../stratum-types" }
+tokio-util      = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

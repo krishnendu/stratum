@@ -1,0 +1,7 @@
+{"name":"glob-rust-files","model_output":"{\"tool\":\"glob\",\"args\":{\"pattern\":\"**/*.rs\"}}","expect":{"min_blocks":1,"max_blocks":1,"contains_tool_call":"glob"}}
+{"name":"fs-read-readme","model_output":"{\"tool\":\"fs.read\",\"args\":{\"path\":\"README.md\"}}","expect":{"contains_tool_call":"fs.read"}}
+{"name":"grep-foo","model_output":"{\"tool\":\"grep\",\"args\":{\"pattern\":\"fn main\"}}","expect":{"contains_tool_call":"grep"}}
+{"name":"fs-tree","model_output":"{\"tool\":\"fs.tree\",\"args\":{}}","expect":{"contains_tool_call":"fs.tree"}}
+{"name":"shell-allowlisted","model_output":"{\"tool\":\"shell.exec\",\"args\":{\"command\":\"ls -la\"}}","expect":{"contains_tool_call":"shell.exec"}}
+{"name":"qwen-format-glob","model_output":"<tool_call>{\"name\":\"glob\",\"arguments\":{\"pattern\":\"src/**/*.rs\"}}</tool_call>","expect":{"contains_tool_call":"glob"}}
+{"name":"qwen-format-edit","model_output":"<tool_call>{\"name\":\"fs.edit\",\"arguments\":{\"path\":\"a.rs\",\"old_string\":\"x\",\"new_string\":\"y\"}}</tool_call>","expect":{"contains_tool_call":"fs.edit"}}

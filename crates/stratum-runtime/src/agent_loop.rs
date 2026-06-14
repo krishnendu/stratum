@@ -122,6 +122,12 @@ pub struct AgentLoopConfig {
     /// Hard upper bound on the agentic recursion depth — guards against
     /// loops that never emit a non-tool-call block.
     pub max_agentic_steps: u8,
+    /// Whether to reject tool calls missing required string args
+    /// (`fs.write` without `content`, etc.) before dispatch. Defaults
+    /// to `false` so tests that script raw `"{}"` args don't trip
+    /// schema checks they don't care about. The CLI flips this to
+    /// `true` in production.
+    pub validate_tool_args: bool,
 }
 
 impl Default for AgentLoopConfig {
@@ -135,6 +141,7 @@ impl Default for AgentLoopConfig {
             // building the LLM-backed loop; tests and EchoProvider
             // callers can rely on the single-iteration semantics.
             max_agentic_steps: 0,
+            validate_tool_args: false,
         }
     }
 }
@@ -155,6 +162,13 @@ pub struct TurnContext {
     /// Wall-clock instant the turn started — used as the
     /// `now` argument for permission and FSM evaluation.
     pub started_at: SystemTime,
+    /// Prior turns (user/assistant in chronological order) sent to
+    /// the provider so the model can answer follow-ups instead of
+    /// hallucinating context. Empty for the first turn of a session.
+    /// Tool-call JSON and sentinels MUST be pre-stripped by the
+    /// caller before insertion here.
+    #[serde(default)]
+    pub history: Vec<crate::provider::ChatHistoryTurn>,
 }
 
 /// Output of [`AgentLoop::run_turn`].
@@ -537,7 +551,10 @@ impl AgentLoop {
         let req = GenerateRequest {
             model: ctx.model.clone(),
             prompt: ctx.user_prompt.clone(),
-            max_blocks: 64, system_override: None,
+            max_blocks: 64,
+            system_override: None,
+            history: ctx.history.clone(),
+            sampler: crate::provider::SamplerParams::default(),
         };
         let child_cancel = cancel.child();
 
@@ -691,6 +708,118 @@ impl AgentLoop {
             // correlation id and gets carried into the matching
             // `Block::ToolResult` below.
             let id = tool_name.clone();
+            // Allowlist gate: short-circuit unknown tools BEFORE the
+            // permission flow so the user doesn't see a fake
+            // permission prompt for a hallucinated name. Preserves
+            // the STRAT-E5005 ToolFailure outcome the original
+            // post-dispatch path produced (documented contract), but
+            // also pushes a ToolResult block so the rejection is
+            // surfaced in the transcript and the model sees it on
+            // its NEXT turn via the multi-turn history fix (D).
+            //
+            // Only fire when the dispatcher has SOME registered tools.
+            // An empty dispatcher means we're in a test fixture or a
+            // permission-only path; defer to the legacy post-dispatch
+            // E5005 contract so existing test expectations still hold.
+            let dispatcher_populated = !self.dispatcher.ids().is_empty();
+            if dispatcher_populated && !self.dispatcher.supports(&id) {
+                let known = self.dispatcher.ids().join(", ");
+                let msg = format!(
+                    "Unknown tool: {id}. Available: {known}."
+                );
+                blocks.push(Block::ToolResult {
+                    id: call_id.clone(),
+                    output: msg,
+                });
+                let outcome = TurnOutcome::ToolFailure {
+                    tool_id: id,
+                    code: "STRAT-E5005".into(),
+                };
+                let _ = driver.apply(
+                    TurnEvent::Finish {
+                        outcome: outcome.clone(),
+                    },
+                    ctx.started_at,
+                );
+                return TurnResult {
+                    turn_id: ctx.turn_id,
+                    outcome,
+                    blocks,
+                    transitions: driver.history().to_vec(),
+                    events_emitted,
+                };
+            }
+            // Schema gate: catch tool calls missing required args
+            // (e.g. fs.write with no `content`, fs.edit with no
+            // `old_string`). Returns ToolFailure E5006 so callers
+            // can distinguish schema errors from missing tools.
+            // Gated on the config flag because tests script ToolCall
+            // blocks with raw `"{}"` args and don't expect schema
+            // checks to short-circuit them — production sets the
+            // flag true via the CLI.
+            if self.config.validate_tool_args {
+            // Pre-block disallowed shell.exec commands. The sandbox
+            // would reject them anyway, but going through the
+            // permission flow first is bad UX: the user gets asked
+            // to approve `rm -rf /` and then sees a generic dispatch
+            // failure. Refusing up front is cleaner.
+            if id == "shell.exec" {
+                if let Some(why) = disallowed_shell_command(&args_json) {
+                    let msg = format!(
+                        "shell.exec rejected: {why}. \
+                         Use one of: ls, cat, pwd, head, tail, wc, echo, git."
+                    );
+                    blocks.push(Block::ToolResult {
+                        id: call_id.clone(),
+                        output: msg,
+                    });
+                    let outcome = TurnOutcome::ToolFailure {
+                        tool_id: id,
+                        code: "STRAT-E5006".into(),
+                    };
+                    let _ = driver.apply(
+                        TurnEvent::Finish {
+                            outcome: outcome.clone(),
+                        },
+                        ctx.started_at,
+                    );
+                    return TurnResult {
+                        turn_id: ctx.turn_id,
+                        outcome,
+                        blocks,
+                        transitions: driver.history().to_vec(),
+                        events_emitted,
+                    };
+                }
+            }
+            if let Some(missing) = missing_required_args(&id, &args_json) {
+                let msg = format!(
+                    "{id} called without required arg(s): {missing}. \
+                     Re-issue the call with the missing fields."
+                );
+                blocks.push(Block::ToolResult {
+                    id: call_id.clone(),
+                    output: msg,
+                });
+                let outcome = TurnOutcome::ToolFailure {
+                    tool_id: id,
+                    code: "STRAT-E5006".into(),
+                };
+                let _ = driver.apply(
+                    TurnEvent::Finish {
+                        outcome: outcome.clone(),
+                    },
+                    ctx.started_at,
+                );
+                return TurnResult {
+                    turn_id: ctx.turn_id,
+                    outcome,
+                    blocks,
+                    transitions: driver.history().to_vec(),
+                    events_emitted,
+                };
+            }
+            }  // end if dispatcher_populated (schema gate)
             if tool_checks >= self.config.max_tool_calls_per_turn {
                 // Budget exhausted before this call ran — fail fast with
                 // a structured `BudgetExceeded` outcome so the caller can
@@ -915,12 +1044,27 @@ impl AgentLoop {
             .filter(|b| matches!(b, Block::ToolResult { .. }))
             .count();
         if dispatched_count > 0 && step < self.config.max_agentic_steps {
+            // Duplicate-call guard: if the agent just dispatched the
+            // SAME tool with the SAME args it dispatched on the prior
+            // step (peeked via the most recent ToolCall pair), don't
+            // continue — the model is spinning. Observed on
+            // qwen3-0.6b where it'd fire fs.tree 5+ times in a row.
+            if is_duplicate_of_prior_call(&ctx.user_prompt, &blocks) {
+                return TurnResult {
+                    turn_id: ctx.turn_id,
+                    outcome: TurnOutcome::Success,
+                    blocks,
+                    transitions: driver.history().to_vec(),
+                    events_emitted,
+                };
+            }
             let continuation_prompt = build_continuation_prompt(&ctx.user_prompt, &blocks);
             let next_ctx = TurnContext {
                 user_prompt: continuation_prompt,
                 model: ctx.model.clone(),
                 turn_id: ctx.turn_id,
                 started_at: ctx.started_at,
+                history: ctx.history.clone(),
             };
             let sub = self.run_turn_inner(next_ctx, cancel, chunk_tx, step.saturating_add(1));
             // Merge the inner step's blocks + events into ours and adopt
@@ -971,6 +1115,103 @@ const MAX_RESULT_BYTES: usize = 12_000;
 /// needs the latest evidence more than the earliest.
 const MAX_CONTINUATION_BYTES: usize = 24_000;
 
+/// Inspect the args JSON for `shell.exec` and return `Some(reason)`
+/// if the command's first token is NOT in the read-only allowlist.
+/// The allowlist intentionally mirrors what the docs in the system
+/// prompt advertise so users + models stay in sync.
+fn disallowed_shell_command(args_json: &str) -> Option<String> {
+    const ALLOWLIST: &[&str] = &["ls", "cat", "pwd", "head", "tail", "wc", "echo", "git"];
+    let v: serde_json::Value = serde_json::from_str(args_json).ok()?;
+    let raw = v
+        .get("command")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("cmd").and_then(|x| x.as_str()))
+        .unwrap_or("");
+    let trimmed = raw.trim_start();
+    let first = trimmed.split_whitespace().next().unwrap_or("");
+    if first.is_empty() {
+        return Some("empty command".to_string());
+    }
+    if ALLOWLIST.contains(&first) {
+        None
+    } else {
+        Some(format!("`{first}` not in the read-only allowlist"))
+    }
+}
+
+/// Validate the args JSON against the per-tool required-field
+/// schema. Returns `Some(missing_csv)` when one or more required
+/// fields are absent (or non-string), `None` when the call is
+/// well-formed enough to dispatch. Keeps the check declarative —
+/// each known tool lists its required string fields — so adding a
+/// new tool's schema is a single line.
+fn missing_required_args(tool: &str, args_json: &str) -> Option<String> {
+    const REQUIRED: &[(&str, &[&str])] = &[
+        ("fs.read", &["path"]),
+        ("fs.write", &["path", "content"]),
+        ("fs.edit", &["path", "old_string", "new_string"]),
+        ("fs.tree", &[]),
+        ("glob", &["pattern"]),
+        ("grep", &["pattern"]),
+        ("shell.exec", &["command"]),
+        ("subagent.run", &["name", "task"]),
+    ];
+    let required = REQUIRED.iter().find_map(|(t, fields)| {
+        if *t == tool { Some(*fields) } else { None }
+    })?;
+    if required.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(args_json).ok()?;
+    let obj = v.as_object()?;
+    let mut missing: Vec<&str> = Vec::new();
+    for field in required {
+        match obj.get(*field) {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => {}
+            Some(serde_json::Value::Null) | None => missing.push(*field),
+            Some(_) => {
+                // Non-string where string expected — count as missing
+                // so the model is forced to re-emit with the right shape.
+                missing.push(*field);
+            }
+        }
+    }
+    if missing.is_empty() {
+        None
+    } else {
+        Some(missing.join(", "))
+    }
+}
+
+/// True when the current step's tool call repeats one already
+/// embedded in `prior_prompt`. The prior_prompt is the previous
+/// continuation prompt (which lists prior tool calls verbatim), so if
+/// the JSON `{"tool":..,"args":..}` we're about to dispatch again
+/// already appears there, we're spinning. Used to break loops where
+/// small models keep firing the same call.
+fn is_duplicate_of_prior_call(prior_prompt: &str, this_blocks: &[Block]) -> bool {
+    // Find the LAST ToolCall in this turn's blocks — that's the call
+    // the agent would re-issue in the next continuation.
+    let latest = this_blocks.iter().rev().find_map(|b| match b {
+        Block::ToolCall { tool, args, .. } => Some((tool.as_str(), args.as_str())),
+        _ => None,
+    });
+    let Some((tool, args)) = latest else {
+        return false;
+    };
+    let needle = format!("\"tool\":\"{tool}\"");
+    let mut hits = 0_usize;
+    for line in prior_prompt.lines() {
+        if line.contains(&needle) && line.contains(args) {
+            hits += 1;
+            if hits >= 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn build_continuation_prompt(original: &str, blocks: &[Block]) -> String {
     use std::fmt::Write;
     // Collect tool call + result lines first so we can drop older ones
@@ -983,7 +1224,14 @@ fn build_continuation_prompt(original: &str, blocks: &[Block]) -> String {
                 entries.push(format!("Tool call: {tool} args={args_trunc}\n"));
             }
             Block::ToolResult { output, .. } => {
-                let out_trunc = truncate_for_prompt(output, MAX_RESULT_BYTES);
+                // Compress the tool result via the deterministic
+                // Caveman compressor before re-injecting it into the
+                // continuation context. The model gets more budget
+                // for its actual answer because filler words are
+                // dropped. Paths, code blocks, JSON, error codes
+                // round-trip verbatim per plan/09 Style guard.
+                let compressed = crate::caveman::compress(output);
+                let out_trunc = truncate_for_prompt(&compressed, MAX_RESULT_BYTES);
                 entries.push(format!("Result: {out_trunc}\n"));
             }
             _ => {}
@@ -1008,8 +1256,11 @@ fn build_continuation_prompt(original: &str, blocks: &[Block]) -> String {
         out.push_str(&e);
     }
     out.push_str(
-        "\nContinue. If you have enough information, give the final answer in plain text. \
-         Otherwise issue another tool call.\n",
+        "\nContinue. If the results above answer the user's question, write a short, \
+         friendly plain-English reply that summarises what you found. NO JSON. NO \
+         tool calls. NO restating the tool name. NO repeating the raw output. \
+         If you genuinely need another tool call to finish, emit one — otherwise \
+         a chat-mode reply.\n",
     );
     out
 }
@@ -1088,6 +1339,83 @@ mod tests {
     use std::time::UNIX_EPOCH;
     use stratum_types::Capability;
 
+    // ---- helper-fn unit tests (no AgentLoop needed) -----------------
+
+    #[test]
+    fn missing_required_args_detects_missing_path_on_fs_read() {
+        assert_eq!(missing_required_args("fs.read", "{}").as_deref(), Some("path"));
+    }
+
+    #[test]
+    fn missing_required_args_passes_well_formed_fs_write() {
+        assert!(missing_required_args(
+            "fs.write",
+            r#"{"path":"a","content":"hi"}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn missing_required_args_detects_missing_content_on_fs_write() {
+        let m = missing_required_args("fs.write", r#"{"path":"a"}"#);
+        assert_eq!(m.as_deref(), Some("content"));
+    }
+
+    #[test]
+    fn missing_required_args_detects_both_missing_old_and_new_on_fs_edit() {
+        let m = missing_required_args("fs.edit", r#"{"path":"a"}"#);
+        assert_eq!(m.as_deref(), Some("old_string, new_string"));
+    }
+
+    #[test]
+    fn missing_required_args_returns_none_for_unknown_tool() {
+        assert!(missing_required_args("does.not.exist", "{}").is_none());
+    }
+
+    #[test]
+    fn missing_required_args_returns_none_for_zero_required_fields() {
+        assert!(missing_required_args("fs.tree", "{}").is_none());
+    }
+
+    #[test]
+    fn missing_required_args_detects_empty_string() {
+        let m = missing_required_args("fs.read", r#"{"path":""}"#);
+        assert_eq!(m.as_deref(), Some("path"));
+    }
+
+    #[test]
+    fn is_duplicate_of_prior_call_fires_on_repeat() {
+        let prior = "Tool: {\"tool\":\"glob\",\"args\":{\"pattern\":\"*.rs\"}} → results";
+        let this_turn = vec![Block::ToolCall {
+            id: "x".into(),
+            tool: "glob".into(),
+            args: r#"{"pattern":"*.rs"}"#.into(),
+        }];
+        assert!(is_duplicate_of_prior_call(prior, &this_turn));
+    }
+
+    #[test]
+    fn is_duplicate_of_prior_call_does_not_fire_on_different_args() {
+        let prior = "Tool: {\"tool\":\"glob\",\"args\":{\"pattern\":\"*.rs\"}} → results";
+        let this_turn = vec![Block::ToolCall {
+            id: "x".into(),
+            tool: "glob".into(),
+            args: r#"{"pattern":"*.toml"}"#.into(),
+        }];
+        assert!(!is_duplicate_of_prior_call(prior, &this_turn));
+    }
+
+    #[test]
+    fn is_duplicate_of_prior_call_false_when_no_prior_history() {
+        let prior = "fresh first-step prompt";
+        let this_turn = vec![Block::ToolCall {
+            id: "x".into(),
+            tool: "glob".into(),
+            args: r#"{"pattern":"*.rs"}"#.into(),
+        }];
+        assert!(!is_duplicate_of_prior_call(prior, &this_turn));
+    }
+
     // -- fixtures ------------------------------------------------------
 
     fn t0() -> SystemTime {
@@ -1117,6 +1445,7 @@ mod tests {
             model: ModelId::from("echo"),
             turn_id: TurnId(1),
             started_at: t0(),
+            history: Vec::new(),
         }
     }
 
@@ -1907,7 +2236,10 @@ mod tests {
             &GenerateRequest {
                 model: ModelId::from("x"),
                 prompt: String::new(),
-                max_blocks: 0, system_override: None,
+                max_blocks: 0,
+                system_override: None,
+                history: Vec::new(),
+                sampler: crate::provider::SamplerParams::default(),
             },
             &CancelToken::new(),
         );
@@ -1916,7 +2248,10 @@ mod tests {
             &GenerateRequest {
                 model: ModelId::from("x"),
                 prompt: String::new(),
-                max_blocks: 0, system_override: None,
+                max_blocks: 0,
+                system_override: None,
+                history: Vec::new(),
+                sampler: crate::provider::SamplerParams::default(),
             },
             &CancelToken::new(),
         );
@@ -1935,7 +2270,10 @@ mod tests {
             &GenerateRequest {
                 model: ModelId::from("x"),
                 prompt: String::new(),
-                max_blocks: 0, system_override: None,
+                max_blocks: 0,
+                system_override: None,
+                history: Vec::new(),
+                sampler: crate::provider::SamplerParams::default(),
             },
             &cancel,
         );
@@ -1948,7 +2286,10 @@ mod tests {
             &GenerateRequest {
                 model: ModelId::from("x"),
                 prompt: String::new(),
-                max_blocks: 0, system_override: None,
+                max_blocks: 0,
+                system_override: None,
+                history: Vec::new(),
+                sampler: crate::provider::SamplerParams::default(),
             },
             &CancelToken::new(),
         );

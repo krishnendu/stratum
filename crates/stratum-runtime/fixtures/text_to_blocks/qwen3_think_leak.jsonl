@@ -1,0 +1,8 @@
+{"name":"qwen3-think-then-tool","model_output":"<think>Should I use a tool here? The user wants a glob.</think>{\"tool\":\"glob\",\"args\":{\"pattern\":\"**/*.rs\"}}","strip_sentinels_first":true,"expect":{"min_blocks":1,"max_blocks":1,"contains_tool_call":"glob","forbids_text_substr":["<think>","Should I use a tool"]}}
+{"name":"plain-greeting","model_output":"Hello! How can I help?","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"Hello!"}}
+{"name":"prose-around-tool-call","model_output":"Let me check the README:\n{\"tool\":\"fs.read\",\"args\":{\"path\":\"README.md\"}}\nThen I'll edit it.","expect":{"min_blocks":3,"max_blocks":3,"contains_tool_call":"fs.read","contains_text_substr":"Let me check"}}
+{"name":"qwen-tag-shape","model_output":"<tool_call>{\"name\":\"grep\",\"arguments\":{\"pattern\":\"TODO\"}}</tool_call>","expect":{"min_blocks":1,"max_blocks":1,"contains_tool_call":"grep"}}
+{"name":"prose-mentioning-tool-word","model_output":"The `tool` field in the {config} controls X.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"tool"}}
+{"name":"sentinel-leak-trimmed","model_output":"Hello!<|im_end|>","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"Hello!"}}
+{"name":"empty-tool-tag-falls-through","model_output":"<tool_call></tool_call>","expect":{"forbids_tool_call":true}}
+{"name":"two-tool-calls","model_output":"{\"tool\":\"fs.read\",\"args\":{\"path\":\"a\"}}\n{\"tool\":\"fs.read\",\"args\":{\"path\":\"b\"}}","expect":{"min_blocks":2,"max_blocks":2}}

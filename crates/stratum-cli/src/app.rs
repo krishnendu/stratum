@@ -472,6 +472,12 @@ struct ChatArgs {
     /// open the interactive TUI.
     #[arg(long, value_name = "STR")]
     prompt: Option<String>,
+    /// Output format for `--prompt` mode. `text` (default) streams the
+    /// assistant reply as plain text. `json` emits one structured
+    /// object with blocks + metrics. `stream-json` emits one JSON
+    /// object per block as NDJSON. Per plan/43.
+    #[arg(long = "output-format", value_name = "FMT", default_value = "text")]
+    output_format: String,
     /// Append structured runtime events to this JSONL file (one record per
     /// line; persists across runs).
     #[arg(long = "events-jsonl", value_name = "PATH")]
@@ -2510,6 +2516,10 @@ fn chat_command(
     // No --model: keep EchoProvider behavior. `--prompt` still works for
     // the scripted path; otherwise fall through to the interactive TUI.
     if let Some(prompt) = args.prompt.as_deref() {
+        if prompt.trim().is_empty() {
+            let _ = writeln!(err, "stratum: --prompt was empty; nothing to send");
+            return ExitCode::from(2);
+        }
         let provider = EchoProvider::new("echo: ");
         let mut state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths));
         if let Some(path) = args.events_jsonl.as_deref() {
@@ -2523,7 +2533,7 @@ fn chat_command(
             state = state.with_resumed_transcript(t);
         }
         state.submit_with_prompt(prompt);
-        return print_assistant_text(&state, out, err);
+        return print_assistant(&state, out, err, &args.output_format);
     }
 
     if let Some(path) = args.events_jsonl.as_deref() {
@@ -2674,6 +2684,10 @@ impl CliProviderResolver {
             n_threads: None,
             n_gpu_layers: 999, // offload all layers when Metal/CUDA available (auto-disabled on CPU-only builds)
             seed: 42,
+            // GBNF stays config-level off; user can force on with
+            // STRATUM_GBNF=1 for one run.
+            enable_gbnf: false,
+            kv_cache_type: stratum_runtime::llama_provider::KvCacheKind::parse(&std::env::var("STRATUM_KV_CACHE").unwrap_or_default()),
         };
         let provider = LlamaCppProvider::open(&cfg)
             .map_err(|e| ProviderResolveError::Backend(format!("open {slug}: {e}")))?;
@@ -2785,8 +2799,12 @@ fn chat_with_agents_dir(
         state = state.with_resumed_transcript(t);
     }
     if let Some(prompt) = args.prompt.as_deref() {
+        if prompt.trim().is_empty() {
+            let _ = writeln!(err, "stratum: --prompt was empty; nothing to send");
+            return ExitCode::from(2);
+        }
         state.submit_with_prompt(prompt);
-        return print_assistant_text(&state, out, err);
+        return print_assistant(&state, out, err, &args.output_format);
     }
     match crate::chat::run_with_state(state, stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -2861,6 +2879,7 @@ fn chat_parallel_prompt(
         model: ModelId::from("echo"),
         turn_id: TurnId(0),
         started_at: SystemTime::now(),
+        history: Vec::new(),
     };
     let intent = IntentRouter::default().classify(prompt);
     let cancel = CancelToken::new();
@@ -3313,14 +3332,24 @@ fn chat_with_model(
         .with_active_model(slug)
         .with_available_models(catalog_slugs(paths))
         .with_model_switcher(switcher)
-        .with_shell_executor(shell_executor);
+        .with_shell_executor(shell_executor)
+        .with_history_path(paths.state.join("input_history.jsonl"))
+        .with_theme_paths(
+            paths.state.join("theme.txt"),
+            crate::theme::themes_dir_for(&paths.config),
+        )
+        .with_statusline(std::env::var("STRATUM_STATUSLINE").unwrap_or_default());
     if let Some(prompt) = args.prompt.as_deref() {
+        if prompt.trim().is_empty() {
+            let _ = writeln!(err, "stratum: --prompt was empty; nothing to send");
+            return ExitCode::from(2);
+        }
         if let Some(t) = resumed {
             print_resumed_transcript(&t, out);
             state = state.with_resumed_transcript(t);
         }
         state.submit_with_prompt(prompt);
-        return print_assistant_text(&state, out, err);
+        return print_assistant(&state, out, err, &args.output_format);
     }
     if let Some(t) = resumed {
         state = state.with_resumed_transcript(t);
@@ -3340,6 +3369,27 @@ fn chat_with_model(
 /// disk (downloading + SHA-verifying when needed), and open a
 /// [`LlamaCppProvider`]. Every failure mode emits a STRAT-E1001 diag
 /// to `err` and returns exit code 1.
+/// CLI default context window; matches `#[arg(default_value_t = …)]`.
+/// Used by the per-slug recommended_n_ctx_for_slug fallback to tell
+/// "user kept the default" apart from "user set 8192 deliberately"
+/// — only the former triggers the slug-specific override.
+#[cfg(feature = "provider-llama-cpp")]
+const DEFAULT_N_CTX: u32 = 8192;
+
+/// Recommended `n_ctx` per known model slug. Returns the user override
+/// unchanged when the slug isn't recognised. Smaller models pay less
+/// KV-cache pressure with 4096; 7B+ benefits from the full 8192.
+#[cfg(feature = "provider-llama-cpp")]
+fn recommended_n_ctx_for_slug(slug: &str, fallback: u32) -> u32 {
+    match slug {
+        "qwen3-0.6b" | "deepseek-r1-1.5b" => 4096,
+        "gemma-4-e2b" | "gemma-4-e4b" => 8192,
+        "deepseek-r1-7b" | "qwen-coder-7b" => 6144,
+        "deepseek-coder-v2-lite" => 6144,
+        _ => fallback,
+    }
+}
+
 #[cfg(feature = "provider-llama-cpp")]
 fn resolve_llama_provider(
     slug: &str,
@@ -3411,15 +3461,33 @@ fn resolve_llama_provider(
             })?;
     }
 
+    // If the user kept the default n_ctx, apply a per-model recommended
+    // value: small models (0.6B / 1.5B) work better with 4K so KV
+    // pressure stays low; 7B+ get the full 8K.
+    let effective_ctx = if n_ctx == DEFAULT_N_CTX {
+        recommended_n_ctx_for_slug(slug, n_ctx)
+    } else {
+        n_ctx
+    };
     let cfg = LlamaCppProviderConfig {
         model_path: target,
-        n_ctx,
+        n_ctx: effective_ctx,
         n_threads: None,
         n_gpu_layers: 999, // offload all layers when Metal/CUDA available (auto-disabled on CPU-only builds)
         seed: 42,
+        // GBNF default-off; STRATUM_GBNF=1 forces on for a single run.
+        enable_gbnf: false,
+            kv_cache_type: stratum_runtime::llama_provider::KvCacheKind::parse(&std::env::var("STRATUM_KV_CACHE").unwrap_or_default()),
     };
+    // Build memory context once at provider open. Per plan/39 §10
+    // hot-reload would re-run this every turn; v1 ships a load-once
+    // semantic (`/memory reload` is a follow-up).
+    let memory_text = build_memory_context(paths);
     LlamaCppProvider::open(&cfg)
-        .map(|p| p.with_tools(default_tool_catalog()))
+        .map(|p| {
+            p.with_tools(default_tool_catalog())
+                .with_memory_context(memory_text)
+        })
         .map_err(|e| {
             let _ = writeln!(err, "STRAT-E1001 provider open failed: {e}");
             ExitCode::from(1)
@@ -3430,6 +3498,22 @@ fn resolve_llama_provider(
 /// ids registered by [`default_dispatchers`] so the model knows what
 /// verbs to emit when it wants to call a tool.
 #[cfg(feature = "provider-llama-cpp")]
+/// Build the workspace memory context: `STRATUM.md` hierarchy +
+/// auto-memory index, ready to splice into the provider's system
+/// prompt. Cheap — runs once at provider open.
+#[cfg(feature = "provider-llama-cpp")]
+fn build_memory_context(paths: &Paths) -> String {
+    use stratum_runtime::memory_loader::{self, LoaderConfig};
+    let cwd = std::env::current_dir().ok();
+    let user_path = paths.config.join("STRATUM.md");
+    let cfg = LoaderConfig {
+        managed_path: None,
+        user_path: Some(user_path),
+        cwd,
+    };
+    memory_loader::concat(&memory_loader::load(&cfg))
+}
+
 fn default_tool_catalog() -> Vec<(String, String)> {
     // Keep descriptions ONE short line, no JSON examples. Otherwise the
     // model dumps the example payloads back as plain text when a user
@@ -3510,6 +3594,7 @@ fn build_llama_agent_loop(
         .with_dispatcher(dispatcher)
         .with_config(AgentLoopConfig {
             max_agentic_steps: 5,
+            validate_tool_args: true,
             ..AgentLoopConfig::default()
         })
         .build()
@@ -3537,6 +3622,29 @@ fn print_assistant_text(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    print_assistant(state, out, err, "text")
+}
+
+/// Dispatch the print path by output format. Per plan/43 §3.
+fn print_assistant(
+    state: &crate::chat::ChatState,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    format: &str,
+) -> ExitCode {
+    match format {
+        "json" => print_assistant_json(state, out, err),
+        "stream-json" => print_assistant_stream_json(state, out, err),
+        // Anything else falls through to text (the safe default).
+        _ => print_assistant_text_inner(state, out, err),
+    }
+}
+
+fn print_assistant_text_inner(
+    state: &crate::chat::ChatState,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     if let Some(text) = state.last_assistant_text() {
         if writeln!(out, "{text}").is_err() {
             return ExitCode::from(74);
@@ -3547,12 +3655,139 @@ fn print_assistant_text(
             return ExitCode::from(74);
         }
         ExitCode::SUCCESS
+    } else if let Some(summary) = state.last_assistant_tool_summary() {
+        if writeln!(out, "{summary}").is_err() {
+            return ExitCode::from(74);
+        }
+        ExitCode::SUCCESS
     } else if let Some(reason) = state.last_assistant_failure_reason() {
         let _ = writeln!(err, "STRAT-E1001 provider failed: {reason}");
         ExitCode::from(1)
     } else {
         let _ = writeln!(err, "STRAT-E1001 provider returned no text blocks");
         ExitCode::from(1)
+    }
+}
+
+/// JSON output: one object with the full last turn's shape. Per
+/// plan/43 §3.1.
+fn print_assistant_json(
+    state: &crate::chat::ChatState,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let env = build_turn_envelope(state);
+    let rendered = match serde_json::to_string_pretty(&env) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 serialization failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if writeln!(out, "{rendered}").is_err() {
+        return ExitCode::from(74);
+    }
+    if matches!(env.outcome.as_str(), "failure") {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// NDJSON output: one JSON object per block, plus a trailing summary
+/// object with `done: true`. Per plan/43 §3.2.
+fn print_assistant_stream_json(
+    state: &crate::chat::ChatState,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let env = build_turn_envelope(state);
+    for block in &env.blocks {
+        let rendered = match serde_json::to_string(block) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 serialization failed: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+    }
+    let footer = serde_json::json!({
+        "done": true,
+        "session_id": env.session_id,
+        "turn_id": env.turn_id,
+        "model": env.model,
+        "metrics": env.metrics,
+        "outcome": env.outcome,
+    });
+    if writeln!(out, "{footer}").is_err() {
+        return ExitCode::from(74);
+    }
+    if matches!(env.outcome.as_str(), "failure") {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// One non-interactive turn's JSON envelope. Used by both the
+/// pretty-JSON output and the stream-json footer.
+#[derive(serde::Serialize)]
+struct TurnEnvelope {
+    session_id: String,
+    turn_id: u64,
+    model: String,
+    blocks: Vec<serde_json::Value>,
+    metrics: serde_json::Value,
+    outcome: String,
+}
+
+fn build_turn_envelope(state: &crate::chat::ChatState) -> TurnEnvelope {
+    use stratum_runtime::TurnId;
+    let last_assistant_blocks = state
+        .transcript()
+        .iter()
+        .rev()
+        .find_map(|t| match t {
+            crate::chat::Turn::Assistant(b) => Some(b.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let blocks: Vec<serde_json::Value> = last_assistant_blocks
+        .iter()
+        .map(|b| serde_json::to_value(b).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let outcome = if last_assistant_blocks.is_empty()
+        && state.last_assistant_failure_reason().is_some()
+    {
+        "failure".to_string()
+    } else if last_assistant_blocks.is_empty() {
+        "empty".to_string()
+    } else {
+        "success".to_string()
+    };
+    let metrics = match state.last_turn_metrics() {
+        Some(m) => serde_json::json!({
+            "prompt_tokens": m.prompt_tokens,
+            "completion_tokens": m.completion_tokens,
+            "total_blocks": m.total_blocks,
+            "started_at": m.started_at,
+            "completed_at": m.completed_at,
+        }),
+        None => serde_json::Value::Null,
+    };
+    TurnEnvelope {
+        session_id: state.session_id().to_string(),
+        turn_id: state
+            .last_turn_id_value()
+            .map(|TurnId(n)| n)
+            .unwrap_or(0),
+        model: state.active_model().unwrap_or_default(),
+        blocks,
+        metrics,
+        outcome,
     }
 }
 
@@ -4433,6 +4668,8 @@ fn echo(json: bool, prompt: &[String], max_blocks: u32, out: &mut dyn Write) -> 
         prompt: prompt.join(" "),
         max_blocks,
         system_override: None,
+        history: Vec::new(),
+        sampler: stratum_runtime::SamplerParams::default(),
     };
     let cancel = CancelToken::new();
     let blocks = provider.generate(&request, &cancel);

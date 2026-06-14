@@ -628,6 +628,32 @@ pub fn parse_simple_ftl(s: &str) -> Result<MessageCatalog, I18nError> {
     Ok(MessageCatalog { locale, messages })
 }
 
+/// Default English message catalog — parses the bundled `en.ftl`
+/// shipped under `crates/stratum-runtime/i18n/`.
+///
+/// # Errors
+/// Returns `Err` only if the bundled file is malformed (which would
+/// be a compile-time-detectable bug — CI runs this in the i18n tests).
+pub fn default_en_catalog() -> Result<MessageCatalog, I18nError> {
+    parse_simple_ftl(BUNDLED_EN_FTL)
+}
+
+/// Build the default [`I18nBundle`] — en as both active and fallback.
+/// CLI callers use this until a `--locale` flag lands.
+///
+/// # Errors
+/// Same as [`default_en_catalog`].
+pub fn default_bundle() -> Result<I18nBundle, I18nError> {
+    let cat = default_en_catalog()?;
+    let mut bundle = I18nBundle::new(cat.locale.clone());
+    bundle.insert_catalog(cat);
+    Ok(bundle)
+}
+
+/// Bundled English catalog text — pulled in at compile time so the
+/// runtime ships with at least one locale even on minimal builds.
+const BUNDLED_EN_FTL: &str = include_str!("../i18n/en.ftl");
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1278,5 +1304,41 @@ n.count = { $n }
         assert_eq!(FluentArg::Float(1.0).to_string(), "1.0000");
         assert_eq!(FluentArg::Bool(true).to_string(), "true");
         assert_eq!(FluentArg::Bool(false).to_string(), "false");
+    }
+
+    // ---- Bundled en.ftl regression tests --------------------------------
+
+    #[test]
+    fn bundled_en_catalog_parses() {
+        let cat = default_en_catalog().expect("bundled en.ftl must parse");
+        assert_eq!(cat.locale.as_str(), "en");
+        assert!(cat.messages.len() >= 20);
+    }
+
+    #[test]
+    fn bundled_en_catalog_has_known_message_ids() {
+        let cat = default_en_catalog().unwrap();
+        for id in [
+            "stratum-greeting",
+            "stratum-tagline",
+            "tool-unknown",
+            "turn-thinking",
+            "cmd-compact-done",
+            "memory-saved",
+            "err-provider-no-text",
+        ] {
+            let mid = MessageId::new(id).unwrap();
+            assert!(cat.messages.contains_key(&mid), "missing id: {id}");
+        }
+    }
+
+    #[test]
+    fn default_bundle_resolves_at_least_one_message() {
+        let bundle = default_bundle().unwrap();
+        let id = MessageId::new("stratum-greeting").unwrap();
+        let resolved = bundle
+            .lookup(&LocaleId::new("en").unwrap(), &id, &Default::default())
+            .unwrap();
+        assert!(!resolved.is_empty());
     }
 }

@@ -4,8 +4,10 @@
 #![warn(missing_docs)]
 
 mod app;
+mod brand;
 mod chat;
 mod palette;
+mod theme;
 
 use std::process::ExitCode;
 

@@ -1,0 +1,5 @@
+{"name":"explain-pointers","model_output":"A pointer holds a memory address, letting you refer to data indirectly without copying it.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"memory address"}}
+{"name":"explain-closure","model_output":"A closure is an anonymous function that captures variables from its enclosing scope.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"closure"}}
+{"name":"explain-async","model_output":"Async functions return a future you await; the runtime polls it when ready.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"future"}}
+{"name":"explain-borrow-checker","model_output":"The borrow checker proves at compile time that no two mutable references can alias.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"borrow"}}
+{"name":"explain-with-code-fence","model_output":"Here's a basic loop:\n```rust\nfor i in 0..10 { println!(\"{i}\"); }\n```\nIt prints 0 through 9.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"```rust"}}

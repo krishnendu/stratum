@@ -951,6 +951,8 @@ impl ToolDispatcher for SubagentToolDispatcher {
             prompt: task,
             max_blocks: self.max_blocks,
             system_override: Some(sub.prompt.clone()),
+            history: Vec::new(),
+            sampler: crate::provider::SamplerParams::default(),
         };
         let cancel = crate::cancel::CancelToken::new();
         let blocks = self.provider.generate(&req, &cancel);
@@ -1104,9 +1106,363 @@ impl ToolDispatcher for FsTreeToolDispatcher {
     }
 }
 
+/// `ToolDispatcher` for `git.diff`. Runs a read-only `git diff` rooted at
+/// the workspace and returns the patch text.
+///
+/// # Arguments
+///
+/// - `path` (optional, string) — restrict the diff to a single file. Path
+///   policy: must be relative, no `..`, canonicalized result must stay
+///   inside the workspace root.
+/// - `staged` (optional, bool) — true selects `--cached` (the staged
+///   diff). Default false (working-tree diff).
+/// - `since` (optional, string) — a ref to diff against (e.g. `main` or
+///   a commit sha). Validated against `[A-Za-z0-9_./-]{1,80}` to refuse
+///   shell metachars and unbounded input.
+#[derive(Debug, Clone)]
+pub struct GitDiffToolDispatcher {
+    id: String,
+    root: PathBuf,
+    timeout: Duration,
+    max_bytes: u64,
+}
+
+impl GitDiffToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "git.diff";
+    /// Default per-call wall-clock timeout: 30 seconds.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Default cap on returned patch size: 2 MiB.
+    pub const DEFAULT_MAX_BYTES: u64 = 2 << 20;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            timeout: Self::DEFAULT_TIMEOUT,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for GitDiffToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let staged = matches!(inv.args.get("staged"), Some(Value::Bool(true)));
+        let since = match inv.args.get("since") {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            None | Some(Value::Null) => None,
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "git.diff `since` must be string"),
+        };
+        if let Some(ref s) = since {
+            if !is_safe_ref(s) {
+                return self.err(E_DISPATCH_MISSING_ARG, "git.diff `since` has unsafe chars");
+            }
+        }
+        let path_arg = match inv.args.get("path") {
+            Some(Value::String(s)) if !s.is_empty() => Some(PathBuf::from(s)),
+            None | Some(Value::Null) => None,
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "git.diff `path` must be string"),
+        };
+        if let Some(ref p) = path_arg {
+            if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
+                return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+            }
+        }
+
+        let mut args: Vec<String> = vec![
+            "--no-pager".into(),
+            "diff".into(),
+            "--no-color".into(),
+        ];
+        if staged {
+            args.push("--cached".into());
+        }
+        if let Some(s) = since {
+            args.push(s);
+        }
+        if let Some(p) = path_arg {
+            args.push("--".into());
+            args.push(p.display().to_string());
+        }
+
+        run_git(&self.root, &args, self.timeout, self.max_bytes).map_or_else(
+            |e| e.into_tool_result(&self.id),
+            |out| ToolResult::Ok {
+                tool_id: self.id.clone(),
+                body: serde_json::json!({
+                    "patch": String::from_utf8_lossy(&out.stdout).into_owned(),
+                    "truncated": out.truncated,
+                }),
+                bytes: out.stdout.len() as u64,
+            },
+        )
+    }
+
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// `ToolDispatcher` for `git.log`. Returns recent commits in a stable
+/// tab-separated shape.
+///
+/// # Arguments
+///
+/// - `path` (optional) — restrict the log to a single file
+/// - `max` (optional, number) — entries to return; default 20, max 200
+/// - `since` (optional, ref-shaped string) — show commits since `<ref>`
+#[derive(Debug, Clone)]
+pub struct GitLogToolDispatcher {
+    id: String,
+    root: PathBuf,
+    timeout: Duration,
+    max_bytes: u64,
+}
+
+impl GitLogToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "git.log";
+    /// Default per-call wall-clock timeout: 15 seconds.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+    /// Default cap on returned text: 256 KiB.
+    pub const DEFAULT_MAX_BYTES: u64 = 256 << 10;
+    /// Default number of commits returned.
+    pub const DEFAULT_MAX_ENTRIES: u64 = 20;
+    /// Hard cap on the per-call `max` argument.
+    pub const HARD_MAX_ENTRIES: u64 = 200;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            timeout: Self::DEFAULT_TIMEOUT,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for GitLogToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let max = match inv.args.get("max") {
+            Some(Value::Number(n)) => n
+                .as_u64()
+                .map_or(Self::DEFAULT_MAX_ENTRIES, |x| x.clamp(1, Self::HARD_MAX_ENTRIES)),
+            _ => Self::DEFAULT_MAX_ENTRIES,
+        };
+        let since = match inv.args.get("since") {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            None | Some(Value::Null) => None,
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "git.log `since` must be string"),
+        };
+        if let Some(ref s) = since {
+            if !is_safe_ref(s) {
+                return self.err(E_DISPATCH_MISSING_ARG, "git.log `since` has unsafe chars");
+            }
+        }
+        let path_arg = match inv.args.get("path") {
+            Some(Value::String(s)) if !s.is_empty() => Some(PathBuf::from(s)),
+            None | Some(Value::Null) => None,
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "git.log `path` must be string"),
+        };
+        if let Some(ref p) = path_arg {
+            if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
+                return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+            }
+        }
+
+        let max_arg = format!("-n{max}");
+        let mut args: Vec<String> = vec![
+            "--no-pager".into(),
+            "log".into(),
+            "--no-color".into(),
+            "--date=iso-strict".into(),
+            // %x09 = TAB. Stable, machine-parseable shape:
+            //   <short-hash>\t<iso-date>\t<author>\t<subject>
+            "--pretty=format:%h%x09%ad%x09%an%x09%s".into(),
+            max_arg,
+        ];
+        if let Some(s) = since {
+            args.push(s);
+        }
+        if let Some(p) = path_arg {
+            args.push("--".into());
+            args.push(p.display().to_string());
+        }
+
+        run_git(&self.root, &args, self.timeout, self.max_bytes).map_or_else(
+            |e| e.into_tool_result(&self.id),
+            |out| {
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                let commits: Vec<serde_json::Value> = text
+                    .lines()
+                    .filter_map(|line| {
+                        let mut parts = line.splitn(4, '\t');
+                        let hash = parts.next()?;
+                        let date = parts.next()?;
+                        let author = parts.next()?;
+                        let subject = parts.next()?;
+                        Some(serde_json::json!({
+                            "hash": hash,
+                            "date": date,
+                            "author": author,
+                            "subject": subject,
+                        }))
+                    })
+                    .collect();
+                let bytes = out.stdout.len() as u64;
+                ToolResult::Ok {
+                    tool_id: self.id.clone(),
+                    body: serde_json::json!({
+                        "commits": commits,
+                        "truncated": out.truncated,
+                    }),
+                    bytes,
+                }
+            },
+        )
+    }
+
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// `ToolDispatcher` for `read_image`. Returns base64-encoded image bytes
+/// plus a sniffed MIME type. The agent loop forwards this through the
+/// multimodal provider path; this dispatcher only handles the read.
+#[derive(Debug, Clone)]
+pub struct ReadImageToolDispatcher {
+    id: String,
+    root: PathBuf,
+    max_bytes: u64,
+}
+
+impl ReadImageToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "read_image";
+    /// Default cap on a single image read: 5 MiB.
+    pub const DEFAULT_MAX_BYTES: u64 = 5 << 20;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for ReadImageToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let requested = match inv.args.get("path") {
+            Some(Value::String(s)) if !s.is_empty() => PathBuf::from(s),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "read_image requires `path`"),
+        };
+        if requested.is_absolute()
+            || requested
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+
+        let canonical_root = match self.root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return self.err(
+                    E_DISPATCH_READ_FAILED,
+                    format!("workspace root unreadable: {e}"),
+                )
+            }
+        };
+        let joined = self.root.join(&requested);
+        let canonical_target = match joined.canonicalize() {
+            Ok(p) => p,
+            Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("path unreadable: {e}")),
+        };
+        if !canonical_target.starts_with(&canonical_root) {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+
+        let metadata = match std::fs::metadata(&canonical_target) {
+            Ok(m) => m,
+            Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("stat failed: {e}")),
+        };
+        if metadata.len() > self.max_bytes {
+            return self.err(
+                E_DISPATCH_SIZE_CAP,
+                format!("image exceeds {} byte cap", self.max_bytes),
+            );
+        }
+        let bytes = match std::fs::read(&canonical_target) {
+            Ok(b) => b,
+            Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("read failed: {e}")),
+        };
+        let mime = sniff_image_mime(&canonical_target, &bytes).unwrap_or("application/octet-stream");
+        let raw_len = bytes.len() as u64;
+        let encoded = base64_encode(&bytes);
+        let body = serde_json::json!({
+            "path": canonical_target.display().to_string(),
+            "mime": mime,
+            "data_base64": encoded,
+        });
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes: raw_len,
+        }
+    }
+
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 /// Build the default dispatcher registry used by the agent loop.
 /// Includes: `fs.read`, `fs.write`, `fs.edit`, `fs.tree`, `grep`,
-/// `glob`, `shell.exec`.
+/// `glob`, `shell.exec`, `git.diff`, `git.log`, `read_image`.
 #[must_use]
 pub fn default_dispatchers(
     workspace_root: PathBuf,
@@ -1119,8 +1475,11 @@ pub fn default_dispatchers(
     let fs_edit = FsEditToolDispatcher::new(workspace_root.clone());
     let fs_tree = FsTreeToolDispatcher::new(workspace_root.clone());
     let grep = GrepToolDispatcher::new(workspace_root.clone());
-    let glob = GlobToolDispatcher::new(workspace_root);
+    let glob = GlobToolDispatcher::new(workspace_root.clone());
     let shell = ShellToolDispatcher::new(sandbox, base_spec);
+    let git_diff = GitDiffToolDispatcher::new(workspace_root.clone());
+    let git_log = GitLogToolDispatcher::new(workspace_root.clone());
+    let read_image = ReadImageToolDispatcher::new(workspace_root);
     let _ = reg.register(Box::new(fs_read));
     let _ = reg.register(Box::new(fs_write));
     let _ = reg.register(Box::new(fs_edit));
@@ -1128,6 +1487,9 @@ pub fn default_dispatchers(
     let _ = reg.register(Box::new(grep));
     let _ = reg.register(Box::new(glob));
     let _ = reg.register(Box::new(shell));
+    let _ = reg.register(Box::new(git_diff));
+    let _ = reg.register(Box::new(git_log));
+    let _ = reg.register(Box::new(read_image));
     reg
 }
 
@@ -1205,6 +1567,193 @@ fn tail_text(s: &str, max_chars: usize) -> String {
     }
     let start = s.chars().count().saturating_sub(max_chars);
     s.chars().skip(start).collect()
+}
+
+// ---- git helper ----------------------------------------------------------
+
+/// Captured outcome of a successful `run_git` invocation.
+struct GitOutput {
+    stdout: Vec<u8>,
+    truncated: bool,
+}
+
+enum GitRunError {
+    Spawn(std::io::Error),
+    Timeout,
+    NonZero { status: i32, stderr_tail: String },
+    Wait(std::io::Error),
+}
+
+impl GitRunError {
+    fn into_tool_result(self, tool_id: &str) -> ToolResult {
+        let (code, message) = match self {
+            Self::Spawn(e) => (E_DISPATCH_SPAWN_FAILED, format!("git spawn failed: {e}")),
+            Self::Timeout => (E_DISPATCH_TIMEOUT, "git timeout".to_string()),
+            Self::NonZero { status, stderr_tail } => (
+                E_DISPATCH_EXIT_NONZERO,
+                format!("git exit {status}: {stderr_tail}"),
+            ),
+            Self::Wait(e) => (E_DISPATCH_SPAWN_FAILED, format!("git wait failed: {e}")),
+        };
+        ToolResult::Err {
+            tool_id: tool_id.to_string(),
+            code: code.to_string(),
+            message,
+        }
+    }
+}
+
+/// Run `git <args>` rooted at `cwd` with a wall-clock `timeout`. Truncates
+/// captured stdout at `max_bytes` and reports it via [`GitOutput::truncated`].
+///
+/// Environment is reset to a minimal allowlist so the child's behavior is
+/// reproducible and does not leak the caller's shell aliases. `GIT_PAGER`
+/// is forced empty in case the caller forgot `--no-pager`.
+fn run_git(
+    cwd: &Path,
+    args: &[String],
+    timeout: Duration,
+    max_bytes: u64,
+) -> Result<GitOutput, GitRunError> {
+    let Some(git_bin) = which_in_path("git") else {
+        return Err(GitRunError::Spawn(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "git not on PATH",
+        )));
+    };
+    let mut cmd = std::process::Command::new(&git_bin);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+        .env("GIT_PAGER", "")
+        .env("LANG", "C.UTF-8")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(GitRunError::Spawn)?;
+    match wait_with_timeout(&mut child, timeout) {
+        WaitOutcome::Exited {
+            status,
+            stdout,
+            stderr,
+        } => {
+            if status == 0 {
+                let truncated = (stdout.len() as u64) > max_bytes;
+                let capped = if truncated {
+                    stdout
+                        .into_iter()
+                        .take(usize::try_from(max_bytes).unwrap_or(usize::MAX))
+                        .collect()
+                } else {
+                    stdout
+                };
+                Ok(GitOutput {
+                    stdout: capped,
+                    truncated,
+                })
+            } else {
+                let tail = String::from_utf8_lossy(&stderr).into_owned();
+                Err(GitRunError::NonZero {
+                    status,
+                    stderr_tail: tail_text(&tail, 256),
+                })
+            }
+        }
+        WaitOutcome::Timeout => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(GitRunError::Timeout)
+        }
+        WaitOutcome::WaitFailed(e) => Err(GitRunError::Wait(e)),
+    }
+}
+
+/// Refs (sha, branch, tag) accept `[A-Za-z0-9._/-]` and must be 1..=80
+/// chars. Refuses leading `-` so it can't be parsed as a flag, and refuses
+/// `..` which `git` treats as a range and we cannot validate further.
+fn is_safe_ref(s: &str) -> bool {
+    if s.is_empty() || s.len() > 80 || s.starts_with('-') || s.contains("..") {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+}
+
+// ---- image helpers -------------------------------------------------------
+
+fn sniff_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
+    // Magic-byte sniff first; fall back to extension if the bytes are
+    // ambiguous. Order matters — JPEG has multiple framings.
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(&[b'B', b'M']) {
+        return Some("image/bmp");
+    }
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        Some("bmp") => Some("image/bmp"),
+        Some("svg") => Some("image/svg+xml"),
+        _ => None,
+    }
+}
+
+/// Standard alphabet base64 with `=` padding. Kept inline to avoid pulling
+/// the `base64` crate into the runtime dep graph for a single use site.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHA: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut iter = bytes.chunks_exact(3);
+    for chunk in &mut iter {
+        let b0 = chunk[0];
+        let b1 = chunk[1];
+        let b2 = chunk[2];
+        out.push(ALPHA[(b0 >> 2) as usize] as char);
+        out.push(ALPHA[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(ALPHA[(((b1 & 0b1111) << 2) | (b2 >> 6)) as usize] as char);
+        out.push(ALPHA[(b2 & 0b111111) as usize] as char);
+    }
+    let rem = iter.remainder();
+    match rem.len() {
+        0 => {}
+        1 => {
+            let b0 = rem[0];
+            out.push(ALPHA[(b0 >> 2) as usize] as char);
+            out.push(ALPHA[((b0 & 0b11) << 4) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let b0 = rem[0];
+            let b1 = rem[1];
+            out.push(ALPHA[(b0 >> 2) as usize] as char);
+            out.push(ALPHA[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+            out.push(ALPHA[((b1 & 0b1111) << 2) as usize] as char);
+            out.push('=');
+        }
+        _ => unreachable!(),
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1693,7 +2242,7 @@ mod tests {
             passthrough_spec_in(tmp.path()),
         );
         let ids = reg.ids();
-        assert_eq!(ids.len(), 7);
+        assert_eq!(ids.len(), 10);
         assert!(ids.contains(&"fs.read"));
         assert!(ids.contains(&"fs.write"));
         assert!(ids.contains(&"fs.edit"));
@@ -1701,6 +2250,9 @@ mod tests {
         assert!(ids.contains(&"grep"));
         assert!(ids.contains(&"glob"));
         assert!(ids.contains(&"shell.exec"));
+        assert!(ids.contains(&"git.diff"));
+        assert!(ids.contains(&"git.log"));
+        assert!(ids.contains(&"read_image"));
     }
 
     #[test]
@@ -1858,5 +2410,236 @@ mod tests {
         let t = tail_text(&long, 10);
         assert_eq!(t.chars().count(), 10);
         assert!(long.ends_with(&t));
+    }
+
+    // ---- git.diff / git.log / read_image -----------------------------
+
+    fn make_invocation(
+        tool: &str,
+        args: BTreeMap<String, serde_json::Value>,
+    ) -> ToolInvocation {
+        ToolInvocation {
+            tool_id: tool.to_string(),
+            args,
+            capability: tool.to_string(),
+            turn_id: 1,
+        }
+    }
+
+    fn git_init_tmp() -> Option<TempDir> {
+        // Skip when `git` is not installed (CI sandboxes without git).
+        which_in_path("git")?;
+        let tmp = TempDir::new().ok()?;
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(tmp.path())
+            .status()
+            .ok()?
+            .success();
+        if !ok {
+            return None;
+        }
+        // Per-repo identity — never `git config --global`.
+        for (k, v) in [
+            ("user.email", "test@example.com"),
+            ("user.name", "Test"),
+            ("commit.gpgsign", "false"),
+        ] {
+            let _ = std::process::Command::new("git")
+                .args(["config", k, v])
+                .current_dir(tmp.path())
+                .status();
+        }
+        Some(tmp)
+    }
+
+    fn git_commit_file(tmp: &Path, name: &str, body: &str, msg: &str) {
+        fs::write(tmp.join(name), body).expect("write");
+        assert!(std::process::Command::new("git")
+            .args(["add", name])
+            .current_dir(tmp)
+            .status()
+            .expect("git add")
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["commit", "-q", "-m", msg])
+            .current_dir(tmp)
+            .status()
+            .expect("git commit")
+            .success());
+    }
+
+    #[test]
+    fn is_safe_ref_accepts_typical_refs() {
+        assert!(is_safe_ref("main"));
+        assert!(is_safe_ref("origin/main"));
+        assert!(is_safe_ref("v1.2.3"));
+        assert!(is_safe_ref("feature/new-thing"));
+        assert!(is_safe_ref("abc123"));
+    }
+
+    #[test]
+    fn is_safe_ref_rejects_metachars_and_ranges() {
+        assert!(!is_safe_ref(""));
+        assert!(!is_safe_ref("-flag"));
+        assert!(!is_safe_ref("a..b"));
+        assert!(!is_safe_ref("HEAD;rm -rf /"));
+        assert!(!is_safe_ref("--all"));
+        assert!(!is_safe_ref(&"a".repeat(200)));
+    }
+
+    #[test]
+    fn git_log_returns_commit_rows() {
+        let Some(tmp) = git_init_tmp() else { return };
+        git_commit_file(tmp.path(), "a.txt", "one\n", "add a");
+        git_commit_file(tmp.path(), "b.txt", "two\n", "add b");
+        let dispatcher = GitLogToolDispatcher::new(tmp.path().to_path_buf());
+        let inv = make_invocation("git.log", BTreeMap::new());
+        match dispatcher.invoke(&inv) {
+            ToolResult::Ok { body, .. } => {
+                let commits = body
+                    .get("commits")
+                    .and_then(|v| v.as_array())
+                    .expect("commits array");
+                assert_eq!(commits.len(), 2);
+                assert_eq!(
+                    commits[0].get("subject").and_then(|v| v.as_str()),
+                    Some("add b"),
+                );
+                assert_eq!(
+                    commits[1].get("subject").and_then(|v| v.as_str()),
+                    Some("add a"),
+                );
+            }
+            ToolResult::Err { code, message, .. } => {
+                panic!("expected Ok, got Err({code}): {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn git_log_rejects_unsafe_since() {
+        let tmp = TempDir::new().expect("tmp");
+        let dispatcher = GitLogToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("since".to_string(), serde_json::json!("--all"));
+        let inv = make_invocation("git.log", args);
+        assert_err_code(dispatcher.invoke(&inv), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn git_log_rejects_path_traversal() {
+        let tmp = TempDir::new().expect("tmp");
+        let dispatcher = GitLogToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), serde_json::json!("../etc/passwd"));
+        let inv = make_invocation("git.log", args);
+        assert_err_code(dispatcher.invoke(&inv), E_DISPATCH_PATH_ESCAPE);
+    }
+
+    #[test]
+    fn git_diff_shows_unstaged_changes() {
+        let Some(tmp) = git_init_tmp() else { return };
+        git_commit_file(tmp.path(), "a.txt", "one\n", "add a");
+        fs::write(tmp.path().join("a.txt"), "one\ntwo\n").expect("dirty write");
+        let dispatcher = GitDiffToolDispatcher::new(tmp.path().to_path_buf());
+        let inv = make_invocation("git.diff", BTreeMap::new());
+        match dispatcher.invoke(&inv) {
+            ToolResult::Ok { body, .. } => {
+                let patch = body.get("patch").and_then(|v| v.as_str()).unwrap_or("");
+                assert!(patch.contains("a.txt"));
+                assert!(patch.contains("+two"));
+            }
+            ToolResult::Err { code, message, .. } => {
+                panic!("expected Ok, got Err({code}): {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn git_diff_rejects_unsafe_since() {
+        let tmp = TempDir::new().expect("tmp");
+        let dispatcher = GitDiffToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("since".to_string(), serde_json::json!("HEAD;rm -rf /"));
+        let inv = make_invocation("git.diff", args);
+        assert_err_code(dispatcher.invoke(&inv), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn read_image_returns_base64_and_sniffs_png() {
+        let tmp = TempDir::new().expect("tmp");
+        // Minimal PNG header. 8-byte signature, IHDR, IDAT skipped — we
+        // only assert on the MIME sniff path, not the round-trip.
+        let png_bytes: [u8; 16] = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R',
+        ];
+        fs::write(tmp.path().join("hi.png"), png_bytes).expect("write");
+        let dispatcher = ReadImageToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), serde_json::json!("hi.png"));
+        let inv = make_invocation("read_image", args);
+        match dispatcher.invoke(&inv) {
+            ToolResult::Ok { body, .. } => {
+                assert_eq!(body.get("mime").and_then(|v| v.as_str()), Some("image/png"));
+                let b64 = body
+                    .get("data_base64")
+                    .and_then(|v| v.as_str())
+                    .expect("data_base64");
+                // PNG signature in base64 is "iVBORw0KGgo".
+                assert!(b64.starts_with("iVBORw0KGgo"));
+            }
+            ToolResult::Err { code, message, .. } => {
+                panic!("expected Ok, got Err({code}): {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn read_image_rejects_oversize() {
+        let tmp = TempDir::new().expect("tmp");
+        let blob = vec![0u8; 2 * 1024 * 1024];
+        fs::write(tmp.path().join("big.bin"), &blob).expect("write");
+        let dispatcher = ReadImageToolDispatcher::new(tmp.path().to_path_buf());
+        // Pull the cap down so we exercise the size-cap path
+        // deterministically without writing megabytes.
+        let dispatcher = ReadImageToolDispatcher {
+            max_bytes: 1024,
+            ..dispatcher
+        };
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), serde_json::json!("big.bin"));
+        let inv = make_invocation("read_image", args);
+        assert_err_code(dispatcher.invoke(&inv), E_DISPATCH_SIZE_CAP);
+    }
+
+    #[test]
+    fn read_image_rejects_path_traversal() {
+        let tmp = TempDir::new().expect("tmp");
+        let dispatcher = ReadImageToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), serde_json::json!("../etc/passwd"));
+        let inv = make_invocation("read_image", args);
+        assert_err_code(dispatcher.invoke(&inv), E_DISPATCH_PATH_ESCAPE);
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn sniff_image_mime_falls_back_to_extension() {
+        let p = PathBuf::from("nope.svg");
+        assert_eq!(sniff_image_mime(&p, b"<svg></svg>"), Some("image/svg+xml"));
+        let p = PathBuf::from("unknown.bin");
+        assert_eq!(sniff_image_mime(&p, b"random"), None);
     }
 }

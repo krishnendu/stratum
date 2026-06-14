@@ -20,7 +20,7 @@
 # prebuilt's `stratum` symlink.
 
 class StratumLlamaCpp < Formula
-  desc "Stratum with provider-llama-cpp feature (real local LLM inference)"
+  desc "Stratum — your local model crew (with real local LLM inference via llama.cpp)"
   homepage "https://github.com/krishnendu/stratum"
   license any_of: ["Apache-2.0", "MIT"]
   version "0.2.1"  # MAINTAINER: bump on each release; sourced from the same tag as `stratum`

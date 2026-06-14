@@ -4,6 +4,9 @@ members = [
     "crates/stratum-types",
     "crates/stratum-testkit",
     "crates/stratum-runtime",
+    "crates/stratum-tui-api",
+    "crates/stratum-tui",
+    "crates/stratum-backend-local",
     "crates/stratum-cli",
     "crates/stratum-eval",
     "crates/xtask",
@@ -83,6 +86,16 @@ encoding_rs     = { version = "0.8" }
 # include `gz` compression which is what GitHub Releases serve.
 tar             = { version = "0.4", default-features = false }
 flate2          = { version = "1", default-features = false, features = ["rust_backend"] }
+# OS keyring backend for SecretStore. Default features cover
+# macOS (Security framework), Linux (Secret Service over dbus),
+# and Windows (Credential Manager). Used only when the
+# `provider-llama-cpp`-class CLI path opens a workspace; tests use
+# the in-memory backend.
+keyring         = "2"
+# Filesystem watcher for settings / agents / hooks hot-reload.
+# Off by default so per-PR CI doesn't pay the inotify / FSEvents
+# / ReadDirectoryChanges link surface; production CLI opts in.
+notify          = { version = "6", default-features = false, features = ["macos_kqueue"] }
 
 [profile.release]
 lto             = "thin"

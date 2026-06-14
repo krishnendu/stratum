@@ -429,6 +429,180 @@ impl SecretStore for InMemorySecretStore {
 }
 
 // ---------------------------------------------------------------------------
+// KeyringSecretStore (feature-gated)
+// ---------------------------------------------------------------------------
+
+/// OS-backed [`SecretStore`] using the `keyring` crate.
+///
+/// Backends:
+/// - **macOS** — Keychain Services
+/// - **Linux** — Secret Service (`gnome-keyring` / KWallet)
+/// - **Windows** — Credential Manager
+///
+/// Entries are stored under the service name configured at construction;
+/// the default is `"stratum"`. The OS surfaces them under that name in
+/// Keychain Access / `secret-tool` / Credential Manager.
+///
+/// ## Listing semantics
+///
+/// The `keyring` crate doesn't expose a native enumeration on every
+/// platform, so [`Self::list`] tracks every put/delete in a per-instance
+/// index. The index persists alongside the store as a single entry
+/// named `__stratum_index__` so a fresh process can resume the listing.
+/// This is fine for Stratum's expected scale (dozens of secrets per
+/// scope, not thousands).
+#[cfg(feature = "os-keyring")]
+#[derive(Debug)]
+pub struct KeyringSecretStore {
+    service: String,
+}
+
+#[cfg(feature = "os-keyring")]
+impl KeyringSecretStore {
+    /// Build a store using the default service name `"stratum"`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_service("stratum")
+    }
+
+    /// Build a store using a custom service name. Useful for tests
+    /// against a sandbox keyring or for multi-tenant deployments.
+    #[must_use]
+    pub fn with_service(service: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+        }
+    }
+
+    /// Encode a SecretRef into the keyring's "account" slot. The
+    /// keyring's (service, account) pair is the addressable key.
+    fn account_for(r: &SecretRef) -> String {
+        match &r.scope {
+            SecretScope::Global => format!("global:{}", r.id.as_str()),
+            SecretScope::Project { id } => {
+                format!("project:{}:{}", id.as_str(), r.id.as_str())
+            }
+        }
+    }
+
+    /// Decode an account slot back into (scope, id). Returns `None` on
+    /// malformed input — used only by `list` to skip stale rows.
+    fn decode_account(account: &str) -> Option<(SecretScope, SecretId)> {
+        if let Some(rest) = account.strip_prefix("global:") {
+            let id = SecretId::new(rest).ok()?;
+            return Some((SecretScope::Global, id));
+        }
+        if let Some(rest) = account.strip_prefix("project:") {
+            let (proj, id_str) = rest.split_once(':')?;
+            let proj_id = ProjectId::new(proj).ok()?;
+            let id = SecretId::new(id_str).ok()?;
+            return Some((SecretScope::Project { id: proj_id }, id));
+        }
+        None
+    }
+
+    /// Read the per-store index of accounts (newline-separated). Returns
+    /// an empty vec when no index entry exists yet.
+    fn read_index(&self) -> Vec<String> {
+        let Ok(entry) = keyring::Entry::new(&self.service, "__stratum_index__") else {
+            return Vec::new();
+        };
+        match entry.get_password() {
+            Ok(raw) => raw
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn write_index(&self, rows: &[String]) -> Result<(), SecretStoreError> {
+        let entry = keyring::Entry::new(&self.service, "__stratum_index__")
+            .map_err(|e| SecretStoreError::Backend(e.to_string()))?;
+        let body = rows.join("\n");
+        if body.is_empty() {
+            let _ = entry.delete_password();
+            return Ok(());
+        }
+        entry
+            .set_password(&body)
+            .map_err(|e| SecretStoreError::Backend(e.to_string()))
+    }
+}
+
+#[cfg(feature = "os-keyring")]
+impl Default for KeyringSecretStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "os-keyring")]
+impl SecretStore for KeyringSecretStore {
+    fn get(&self, r: &SecretRef) -> Result<Option<SecretValue>, SecretStoreError> {
+        let entry = keyring::Entry::new(&self.service, &Self::account_for(r))
+            .map_err(|e| SecretStoreError::Backend(e.to_string()))?;
+        match entry.get_password() {
+            Ok(raw) => Ok(Some(SecretValue::from(raw.as_str()))),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(SecretStoreError::Backend(e.to_string())),
+        }
+    }
+
+    fn put(&self, r: &SecretRef, value: SecretValue) -> Result<(), SecretStoreError> {
+        let account = Self::account_for(r);
+        let entry = keyring::Entry::new(&self.service, &account)
+            .map_err(|e| SecretStoreError::Backend(e.to_string()))?;
+        // SecretValue is opaque bytes; convert to UTF-8 lossily here —
+        // the keyring backends require a string. Stratum stores text
+        // tokens (API keys, OAuth refresh) in practice, not raw blobs.
+        let s = std::str::from_utf8(value.expose())
+            .map_err(|e| SecretStoreError::Backend(format!("non-UTF8 secret: {e}")))?;
+        entry
+            .set_password(s)
+            .map_err(|e| SecretStoreError::Backend(e.to_string()))?;
+        let mut idx = self.read_index();
+        if !idx.contains(&account) {
+            idx.push(account);
+            idx.sort();
+            self.write_index(&idx)?;
+        }
+        Ok(())
+    }
+
+    fn delete(&self, r: &SecretRef) -> Result<bool, SecretStoreError> {
+        let account = Self::account_for(r);
+        let entry = keyring::Entry::new(&self.service, &account)
+            .map_err(|e| SecretStoreError::Backend(e.to_string()))?;
+        let existed = matches!(entry.get_password(), Ok(_));
+        match entry.delete_password() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(SecretStoreError::Backend(e.to_string())),
+        }
+        if existed {
+            let mut idx = self.read_index();
+            idx.retain(|a| a != &account);
+            self.write_index(&idx)?;
+        }
+        Ok(existed)
+    }
+
+    fn list(&self, scope: &SecretScope) -> Result<Vec<SecretId>, SecretStoreError> {
+        let idx = self.read_index();
+        let mut out: Vec<SecretId> = idx
+            .iter()
+            .filter_map(|account| {
+                let (s, id) = Self::decode_account(account)?;
+                if &s == scope { Some(id) } else { None }
+            })
+            .collect();
+        out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // redact_for_log
 // ---------------------------------------------------------------------------
 

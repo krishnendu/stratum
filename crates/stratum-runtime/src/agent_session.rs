@@ -224,6 +224,7 @@ impl AgentSession {
             model: self.model.clone(),
             turn_id: TurnId(next),
             started_at,
+            history: Vec::new(),
         };
 
         let result = self.loop_.run_turn(ctx, &self.cancel);
