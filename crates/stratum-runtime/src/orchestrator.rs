@@ -68,9 +68,9 @@ pub struct Orchestrator {
 }
 
 impl Orchestrator {
-    /// Build an orchestrator wrapping an existing AgentLoop.
+    /// Build an orchestrator wrapping an existing `AgentLoop`.
     #[must_use]
-    pub fn new(loop_: Arc<AgentLoop>, config: OrchestratorConfig) -> Self {
+    pub const fn new(loop_: Arc<AgentLoop>, config: OrchestratorConfig) -> Self {
         Self { loop_, config }
     }
 
@@ -78,17 +78,9 @@ impl Orchestrator {
     /// `config.multi_role` is `false`, this is identical to
     /// `loop_.run_turn(ctx, cancel)` + a default-routed envelope so
     /// callers always get the same return shape.
-    pub fn run_turn(
-        &self,
-        ctx: TurnContext,
-        cancel: &CancelToken,
-    ) -> OrchestratedTurn {
-        let router = self
-            .config
-            .router
-            .as_deref()
-            .cloned()
-            .unwrap_or_default();
+    #[must_use]
+    pub fn run_turn(&self, ctx: TurnContext, cancel: &CancelToken) -> OrchestratedTurn {
+        let router = self.config.router.as_deref().cloned().unwrap_or_default();
         let intent = router.classify(&ctx.user_prompt);
 
         if !self.config.multi_role {
@@ -143,7 +135,7 @@ fn extract_draft_text(result: &TurnResult) -> String {
 /// Convenience: a config the CLI typically wants — multi-role on,
 /// using a reviewer if a second provider is available.
 #[must_use]
-pub fn cli_default_config(reviewer: Option<Arc<ReviewerPass>>) -> OrchestratorConfig {
+pub const fn cli_default_config(reviewer: Option<Arc<ReviewerPass>>) -> OrchestratorConfig {
     OrchestratorConfig {
         multi_role: true,
         reviewer,
@@ -152,7 +144,7 @@ pub fn cli_default_config(reviewer: Option<Arc<ReviewerPass>>) -> OrchestratorCo
 }
 
 /// Backward-compatible default config. Used by tests and the
-/// minimum-viable AgentLoop call path.
+/// minimum-viable `AgentLoop` call path.
 #[must_use]
 pub fn legacy_single_loop_config() -> OrchestratorConfig {
     OrchestratorConfig::default()
@@ -161,13 +153,13 @@ pub fn legacy_single_loop_config() -> OrchestratorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::Provider;
     use crate::agent_loop::{AgentLoopBuilder, AgentLoopConfig};
     use crate::event_log::{EventEmitter, MemoryEventSink};
     use crate::intent_router::IntentRouter;
     use crate::permission_prompt::{AllowAllResponder, PermissionStore, PromptIdGen};
     use crate::plan_mode::PlanMode;
     use crate::provider::EchoProvider;
+    use crate::provider::Provider;
     use crate::tool_invocation::RegistryDispatcher;
     use std::time::SystemTime;
     use stratum_types::ModelId;
@@ -207,7 +199,10 @@ mod tests {
         let orch = Orchestrator::new(build_echo_loop(), legacy_single_loop_config());
         let cancel = CancelToken::new();
         let out = orch.run_turn(ctx_with("hi there"), &cancel);
-        assert!(out.verdict.is_none(), "legacy path emits no reviewer verdict");
+        assert!(
+            out.verdict.is_none(),
+            "legacy path emits no reviewer verdict"
+        );
         // Result blocks come from the bare loop.
         assert!(!out.result.blocks.is_empty());
     }
@@ -261,13 +256,17 @@ mod tests {
             turn_id: crate::observability::TurnId(1),
             outcome: crate::conversation::TurnOutcome::Success,
             blocks: vec![
-                Block::Text { text: "hello".into() },
+                Block::Text {
+                    text: "hello".into(),
+                },
                 Block::ToolCall {
                     id: "x".into(),
                     tool: "fs.read".into(),
                     args: "{}".into(),
                 },
-                Block::Text { text: "world".into() },
+                Block::Text {
+                    text: "world".into(),
+                },
             ],
             transitions: Vec::new(),
             events_emitted: Vec::new(),

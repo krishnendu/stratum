@@ -27,7 +27,7 @@ pub enum SettingsTier {
 }
 
 impl SettingsTier {
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::Managed => "managed",
             Self::User => "user",
@@ -165,12 +165,7 @@ fn parse_doc(path: &Path, raw: &str) -> Option<SettingsDoc> {
     }
 }
 
-fn merge_into(
-    merged: &mut MergedSettings,
-    tier: SettingsTier,
-    source: PathBuf,
-    doc: SettingsDoc,
-) {
+fn merge_into(merged: &mut MergedSettings, tier: SettingsTier, source: PathBuf, doc: SettingsDoc) {
     // Permissions: union allow + ask; union deny (deny is highest authority).
     for r in &doc.permissions.allow {
         if !merged.permissions.allow.contains(r) {
@@ -300,16 +295,10 @@ mod tests {
     fn env_overrides_per_key_by_tier() {
         let tmp = TempDir::new().unwrap();
         let user_path = tmp.path().join("user.json");
-        write_json(
-            &user_path,
-            r#"{ "env": { "FOO": "user", "BAR": "user" } }"#,
-        );
+        write_json(&user_path, r#"{ "env": { "FOO": "user", "BAR": "user" } }"#);
         let project_root = tmp.path().join("project");
         let project_path = project_root.join(".stratum").join("settings.json");
-        write_json(
-            &project_path,
-            r#"{ "env": { "FOO": "project" } }"#,
-        );
+        write_json(&project_path, r#"{ "env": { "FOO": "project" } }"#);
         let m = load(&LoaderInputs {
             user: Some(user_path),
             project_root: Some(project_root),
@@ -370,7 +359,7 @@ mod tests {
     fn source_labels_list_paths() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("user.json");
-        write_json(&path, r#"{}"#);
+        write_json(&path, r"{}");
         let m = load(&LoaderInputs {
             user: Some(path),
             ..Default::default()

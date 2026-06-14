@@ -2424,6 +2424,10 @@ fn format_gb_one_decimal(mib: u32) -> String {
     format!("{whole}.{frac}")
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "subcommand dispatch fans out into many branches; splitting just shuffles state"
+)]
 fn chat_command(
     json: bool,
     args: &ChatArgs,
@@ -2491,24 +2495,37 @@ fn chat_command(
     #[cfg(feature = "provider-llama-cpp")]
     {
         let chat_count = ModelCatalog::load(&paths.state.join("models.json"))
-            .map(|c| {
-                c.filter_by_task(stratum_runtime::ModelTask::Chat).len()
-            })
+            .map(|c| c.filter_by_task(stratum_runtime::ModelTask::Chat).len())
             .unwrap_or(0);
         if chat_count == 0 && args.prompt.is_none() {
             let _ = writeln!(err, "stratum: no chat model in catalog.");
             let _ = writeln!(err, "");
-            let _ = writeln!(err, "  To install the recommended default (Gemma 4 E4B IT — official Google QAT,");
-            let _ = writeln!(err, "  ~4.8 GB, runs at ~80 tok/s on Apple Silicon Metal), run:");
+            let _ = writeln!(
+                err,
+                "  To install the recommended default (Gemma 4 E4B IT — official Google QAT,"
+            );
+            let _ = writeln!(
+                err,
+                "  ~4.8 GB, runs at ~80 tok/s on Apple Silicon Metal), run:"
+            );
             let _ = writeln!(err, "");
-            let _ = writeln!(err, "    stratum models add --slug gemma-4-e4b --family gemma \\\\");
+            let _ = writeln!(
+                err,
+                "    stratum models add --slug gemma-4-e4b --family gemma \\\\"
+            );
             let _ = writeln!(err, "      --display-name 'Gemma 4 E4B IT (QAT Q4_0)' \\\\");
-            let _ = writeln!(err, "      --tier high --task chat --size-mib 4916 --quantization q4_0 \\\\");
+            let _ = writeln!(
+                err,
+                "      --tier high --task chat --size-mib 4916 --quantization q4_0 \\\\"
+            );
             let _ = writeln!(err, "      --url 'https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B_q4_0-it.gguf' \\\\");
             let _ = writeln!(err, "      --sha256 e8b6a059ba86947a44ace84d6e5679795bc41862c25c30513142588f0e9dba1d \\\\");
             let _ = writeln!(err, "      --bytes 5154939136 --license gemma");
             let _ = writeln!(err, "");
-            let _ = writeln!(err, "  Then re-run `stratum chat`. (Falling back to EchoProvider for now.)");
+            let _ = writeln!(
+                err,
+                "  Then re-run `stratum chat`. (Falling back to EchoProvider for now.)"
+            );
             let _ = writeln!(err, "");
         }
     }
@@ -2546,7 +2563,10 @@ fn chat_command(
         if let Some(t) = resumed {
             state = state.with_resumed_transcript(t);
         }
-        return match crate::chat::run_with_state(state, stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok()) {
+        return match crate::chat::run_with_state(
+            state,
+            stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok(),
+        ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 let _ = writeln!(err, "{e}");
@@ -2563,7 +2583,10 @@ fn chat_command(
         let provider = EchoProvider::new("echo: ");
         let state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths))
             .with_resumed_transcript(t);
-        return match crate::chat::run_with_state(state, stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok()) {
+        return match crate::chat::run_with_state(
+            state,
+            stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok(),
+        ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 let _ = writeln!(err, "{e}");
@@ -2687,7 +2710,9 @@ impl CliProviderResolver {
             // GBNF stays config-level off; user can force on with
             // STRATUM_GBNF=1 for one run.
             enable_gbnf: false,
-            kv_cache_type: stratum_runtime::llama_provider::KvCacheKind::parse(&std::env::var("STRATUM_KV_CACHE").unwrap_or_default()),
+            kv_cache_type: stratum_runtime::llama_provider::KvCacheKind::parse(
+                &std::env::var("STRATUM_KV_CACHE").unwrap_or_default(),
+            ),
         };
         let provider = LlamaCppProvider::open(&cfg)
             .map_err(|e| ProviderResolveError::Backend(format!("open {slug}: {e}")))?;
@@ -2806,7 +2831,10 @@ fn chat_with_agents_dir(
         state.submit_with_prompt(prompt);
         return print_assistant(&state, out, err, &args.output_format);
     }
-    match crate::chat::run_with_state(state, stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok()) {
+    match crate::chat::run_with_state(
+        state,
+        stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok(),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "{e}");
@@ -3139,7 +3167,7 @@ fn chat_with_model(
 /// Returns the recommended slug for the host's tier + chat task, or None
 /// if the catalog is empty / unreadable. Used to make `stratum chat`
 /// default to real inference once `stratum models sync` has populated
-/// the catalog, instead of silently falling back to EchoProvider.
+/// the catalog, instead of silently falling back to `EchoProvider`.
 /// Build a shell-runner closure used by the `!cmd` TUI prefix.
 ///
 /// Wraps `ShellToolDispatcher` with a passthrough sandbox + workspace-root
@@ -3229,12 +3257,7 @@ fn auto_select_model(paths: &Paths, host_tier: Tier) -> Option<String> {
     // QAT GGUF, fast (MatFormer ~4B effective), follows tool-call rules
     // well. Coder-tuned models are listed lower so users can manually
     // /switch when they want more aggressive tool emission.
-    const PREFERRED: &[&str] = &[
-        "gemma-4-e4b",
-        "gemma-3-4b",
-        "qwen-coder-7b",
-        "qwen-7b",
-    ];
+    const PREFERRED: &[&str] = &["gemma-4-e4b", "gemma-3-4b", "qwen-coder-7b", "qwen-7b"];
     for pref in PREFERRED {
         if let Ok(slug) = pref.parse() {
             if catalog
@@ -3248,7 +3271,12 @@ fn auto_select_model(paths: &Paths, host_tier: Tier) -> Option<String> {
     // Fallback: walk from host tier DOWN, exact-tier match. Pick the
     // first entry at that tier when no preferred slug is installed.
     let walk: &[ModelTier] = match cli_tier {
-        ModelTier::Xl => &[ModelTier::Xl, ModelTier::High, ModelTier::Medium, ModelTier::Low],
+        ModelTier::Xl => &[
+            ModelTier::Xl,
+            ModelTier::High,
+            ModelTier::Medium,
+            ModelTier::Low,
+        ],
         ModelTier::High => &[ModelTier::High, ModelTier::Medium, ModelTier::Low],
         ModelTier::Medium => &[ModelTier::Medium, ModelTier::Low],
         ModelTier::Low => &[ModelTier::Low],
@@ -3292,12 +3320,12 @@ fn chat_with_model(
     // a shared `TuiPromptResponder` so the AgentLoop's requests render
     // through the same modal queue the event loop drains each tick.
     let prompter = std::sync::Arc::new(crate::chat::TuiPromptResponder::default());
-    let prompter_dyn: std::sync::Arc<dyn stratum_runtime::PromptResponder> = if args.prompt.is_some()
-    {
-        std::sync::Arc::new(stratum_runtime::AllowAllResponder)
-    } else {
-        prompter.clone()
-    };
+    let prompter_dyn: std::sync::Arc<dyn stratum_runtime::PromptResponder> =
+        if args.prompt.is_some() {
+            std::sync::Arc::new(stratum_runtime::AllowAllResponder)
+        } else {
+            prompter.clone()
+        };
 
     let loop_ = match build_llama_agent_loop(provider_arc, prompter_dyn.clone(), err) {
         Ok(l) => l,
@@ -3361,7 +3389,10 @@ fn chat_with_model(
     }
     // No --prompt: drop into the interactive TUI. The state already wraps
     // the llama-backed loop so input is routed through real inference.
-    match crate::chat::run_with_state(state, stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok()) {
+    match crate::chat::run_with_state(
+        state,
+        stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok(),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "{e}");
@@ -3482,7 +3513,9 @@ fn resolve_llama_provider(
         seed: 42,
         // GBNF default-off; STRATUM_GBNF=1 forces on for a single run.
         enable_gbnf: false,
-            kv_cache_type: stratum_runtime::llama_provider::KvCacheKind::parse(&std::env::var("STRATUM_KV_CACHE").unwrap_or_default()),
+        kv_cache_type: stratum_runtime::llama_provider::KvCacheKind::parse(
+            &std::env::var("STRATUM_KV_CACHE").unwrap_or_default(),
+        ),
     };
     // Build memory context once at provider open. Per plan/39 §10
     // hot-reload would re-run this every turn; v1 ships a load-once
@@ -3527,13 +3560,34 @@ fn default_tool_catalog() -> Vec<(String, String)> {
     // examples in the system prompt, not in this catalog.
     vec![
         ("fs.read".to_string(), "read a workspace file".to_string()),
-        ("fs.write".to_string(), "create or overwrite a workspace file".to_string()),
-        ("fs.edit".to_string(), "single-occurrence string replace in a workspace file".to_string()),
-        ("fs.tree".to_string(), "directory listing of the workspace (depth-capped)".to_string()),
-        ("grep".to_string(), "recursive regex search across the workspace".to_string()),
-        ("glob".to_string(), "find files matching a shell-style glob".to_string()),
-        ("shell.exec".to_string(), "run a read-only shell command (ls cat pwd head tail wc echo git)".to_string()),
-        ("subagent.run".to_string(), "delegate a side task to a built-in subagent".to_string()),
+        (
+            "fs.write".to_string(),
+            "create or overwrite a workspace file".to_string(),
+        ),
+        (
+            "fs.edit".to_string(),
+            "single-occurrence string replace in a workspace file".to_string(),
+        ),
+        (
+            "fs.tree".to_string(),
+            "directory listing of the workspace (depth-capped)".to_string(),
+        ),
+        (
+            "grep".to_string(),
+            "recursive regex search across the workspace".to_string(),
+        ),
+        (
+            "glob".to_string(),
+            "find files matching a shell-style glob".to_string(),
+        ),
+        (
+            "shell.exec".to_string(),
+            "run a read-only shell command (ls cat pwd head tail wc echo git)".to_string(),
+        ),
+        (
+            "subagent.run".to_string(),
+            "delegate a side task to a built-in subagent".to_string(),
+        ),
     ]
 }
 
@@ -3555,8 +3609,8 @@ fn build_llama_agent_loop(
     use stratum_runtime::sandbox_resolve::{BackendChoice, ResolvedNet, SandboxLaunchSpec};
     use stratum_runtime::tool_dispatchers::default_dispatchers;
     use stratum_runtime::{
-        AgentLoop, AgentLoopConfig, CapabilityMatrix, EventEmitter, EventSink,
-        IntentRouter, MemoryEventSink, PermissionStore, PlanMode, PromptIdGen,
+        AgentLoop, AgentLoopConfig, CapabilityMatrix, EventEmitter, EventSink, IntentRouter,
+        MemoryEventSink, PermissionStore, PlanMode, PromptIdGen,
     };
 
     let sink: Arc<dyn EventSink> = Arc::new(MemoryEventSink::new());
@@ -3578,9 +3632,7 @@ fn build_llama_agent_loop(
     let mut reg = default_dispatchers(cwd, spawn, spec);
     // Wire the subagent dispatcher so the parent loop can delegate
     // side-tasks to registered subagents via `subagent.run`.
-    let subagent_registry = Arc::new(
-        stratum_runtime::subagent::SubagentRegistry::with_builtins(),
-    );
+    let subagent_registry = Arc::new(stratum_runtime::subagent::SubagentRegistry::with_builtins());
     let subagent_dispatcher = stratum_runtime::tool_dispatchers::SubagentToolDispatcher::new(
         subagent_registry,
         provider.clone(),
@@ -3623,7 +3675,10 @@ fn needs_refetch(target: &Path, _expected_sha256: &str, expected_bytes: u64) -> 
 
 /// Print the most recent assistant turn text to `out`. Used by the
 /// non-interactive `--prompt` flow.
-#[allow(dead_code, reason = "wired in once headless /print mode lands (plan/43)")]
+#[allow(
+    dead_code,
+    reason = "wired in once headless /print mode lands (plan/43)"
+)]
 fn print_assistant_text(
     state: &crate::chat::ChatState,
     out: &mut dyn Write,
@@ -3766,31 +3821,28 @@ fn build_turn_envelope(state: &crate::chat::ChatState) -> TurnEnvelope {
         .iter()
         .map(|b| serde_json::to_value(b).unwrap_or(serde_json::Value::Null))
         .collect();
-    let outcome = if last_assistant_blocks.is_empty()
-        && state.last_assistant_failure_reason().is_some()
-    {
-        "failure".to_string()
-    } else if last_assistant_blocks.is_empty() {
-        "empty".to_string()
-    } else {
-        "success".to_string()
-    };
-    let metrics = match state.last_turn_metrics() {
-        Some(m) => serde_json::json!({
-            "prompt_tokens": m.prompt_tokens,
-            "completion_tokens": m.completion_tokens,
-            "total_blocks": m.total_blocks,
-            "started_at": m.started_at,
-            "completed_at": m.completed_at,
-        }),
-        None => serde_json::Value::Null,
-    };
+    let outcome =
+        if last_assistant_blocks.is_empty() && state.last_assistant_failure_reason().is_some() {
+            "failure".to_string()
+        } else if last_assistant_blocks.is_empty() {
+            "empty".to_string()
+        } else {
+            "success".to_string()
+        };
+    let metrics = state
+        .last_turn_metrics()
+        .map_or(serde_json::Value::Null, |m| {
+            serde_json::json!({
+                "prompt_tokens": m.prompt_tokens,
+                "completion_tokens": m.completion_tokens,
+                "total_blocks": m.total_blocks,
+                "started_at": m.started_at,
+                "completed_at": m.completed_at,
+            })
+        });
     TurnEnvelope {
         session_id: state.session_id().to_string(),
-        turn_id: state
-            .last_turn_id_value()
-            .map(|TurnId(n)| n)
-            .unwrap_or(0),
+        turn_id: state.last_turn_id_value().map_or(0, |TurnId(n)| n),
         model: state.active_model().unwrap_or_default(),
         blocks,
         metrics,
@@ -4953,7 +5005,9 @@ fn apply_upgrade_with_artifact(
     // `new_tmp` with the extracted payload. Lets release manifests
     // point at conventional `.tar.gz` archives while self-update still
     // ends up swapping in a raw executable.
-    let is_tarball = artifact.url.ends_with(".tar.gz") || artifact.url.ends_with(".tgz");
+    let is_tarball = std::path::Path::new(&artifact.url)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz") || ext.eq_ignore_ascii_case("tgz"));
     if is_tarball {
         if let Err(msg) = extract_first_file_from_targz(&new_tmp) {
             let _ = std::fs::remove_file(&new_tmp);

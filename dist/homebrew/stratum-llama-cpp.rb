@@ -23,10 +23,10 @@ class StratumLlamaCpp < Formula
   desc "Stratum — your local model crew (with real local LLM inference via llama.cpp)"
   homepage "https://github.com/krishnendu/stratum"
   license any_of: ["Apache-2.0", "MIT"]
-  version "0.2.1"  # MAINTAINER: bump on each release; sourced from the same tag as `stratum`
+  version "0.2.9"  # MAINTAINER: bump on each release; sourced from the same tag as `stratum`
 
-  url "https://github.com/krishnendu/stratum/archive/refs/tags/v0.2.1.tar.gz"
-  sha256 "cb5d60ef3a68e87b234ba9bf75a1616d019330aba078d9447abb8ae6db349467"
+  url "https://github.com/krishnendu/stratum/archive/refs/tags/v0.2.9.tar.gz"
+  sha256 "0fdeee794f9bcfb9997843f7a4aff5a5634aa0dbd5bdb2a4ff1c8a0aba01f8ef"
 
   conflicts_with "stratum",
     because: "both install a `stratum` binary; pick the prebuilt or the LLM-enabled build"
@@ -36,18 +36,19 @@ class StratumLlamaCpp < Formula
   depends_on "pkg-config" => :build
 
   def install
-    system "cargo", "build", "--release", "--features", "provider-llama-cpp", "--bin", "stratum"
+    # `--locked` pins to the committed Cargo.lock so the formula
+    # builds the exact dependency graph CI tested.
+    system "cargo", "build", "--release", "--locked",
+                   "--features", "provider-llama-cpp", "--bin", "stratum"
     bin.install "target/release/stratum"
     generate_completions_from_executable(bin/"stratum", "completions")
   end
 
   test do
-    # Sanity: same surface as the prebuilt formula — the feature
-    # only affects the provider path, not the doctor/echo surfaces.
-    assert_match "echo", shell_output("#{bin}/stratum --json doctor")
+    # Mirror the prebuilt formula's stable smoke surface.
+    output = shell_output("#{bin}/stratum --json doctor")
+    assert_match "schema_version", output
+    assert_match "stratum_version", output
     assert_match(/stratum \d+\.\d+\.\d+/, shell_output("#{bin}/stratum --version"))
-    # Smoke: --features should advertise via the binary's --version long form
-    # once the build-info wire-up lands. Until then this is a noop check.
-    assert_match "stratum", shell_output("#{bin}/stratum --version")
   end
 end

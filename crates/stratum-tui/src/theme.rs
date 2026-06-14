@@ -160,12 +160,8 @@ impl Theme {
     #[must_use]
     pub const fn vivid() -> Self {
         Self {
-            user_prefix: Style::new()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            ai_prefix: Style::new()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
+            user_prefix: Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ai_prefix: Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
             user_gutter: Style::new().fg(Color::Cyan),
             ai_gutter: Style::new().fg(Color::Magenta),
             tool: Style::new().fg(Color::Yellow).add_modifier(Modifier::DIM),
@@ -174,23 +170,13 @@ impl Theme {
             inline_code: Style::new()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::REVERSED),
-            header: Style::new()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            header: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             bullet: Style::new().fg(Color::Cyan),
-            quote: Style::new()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::DIM),
+            quote: Style::new().fg(Color::Gray).add_modifier(Modifier::DIM),
             dim: Style::new().add_modifier(Modifier::DIM),
-            keyword: Style::new()
-                .fg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-            string_lit: Style::new()
-                .fg(Color::Green)
-                .add_modifier(Modifier::ITALIC),
-            comment: Style::new()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::DIM),
+            keyword: Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            string_lit: Style::new().fg(Color::Green).add_modifier(Modifier::ITALIC),
+            comment: Style::new().fg(Color::Gray).add_modifier(Modifier::DIM),
         }
     }
 
@@ -206,7 +192,9 @@ impl Theme {
                 .add_modifier(Modifier::BOLD),
             user_gutter: Style::new().fg(Color::LightCyan),
             ai_gutter: Style::new().fg(Color::LightBlue),
-            tool: Style::new().fg(Color::LightYellow).add_modifier(Modifier::DIM),
+            tool: Style::new()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::DIM),
             bold: Style::new().add_modifier(Modifier::BOLD),
             italic: Style::new().add_modifier(Modifier::ITALIC),
             inline_code: Style::new()
@@ -216,9 +204,7 @@ impl Theme {
                 .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
             bullet: Style::new().fg(Color::LightBlue),
-            quote: Style::new()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
+            quote: Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
             dim: Style::new().add_modifier(Modifier::DIM),
             keyword: Style::new()
                 .fg(Color::LightMagenta)
@@ -226,9 +212,7 @@ impl Theme {
             string_lit: Style::new()
                 .fg(Color::LightGreen)
                 .add_modifier(Modifier::ITALIC),
-            comment: Style::new()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
+            comment: Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
         }
     }
 }
@@ -300,8 +284,8 @@ pub fn set_by_name(name: &str, themes_dir: Option<&Path>) -> Result<(), String> 
         return Err(format!("unknown theme: {name}"));
     };
     let path = dir.join(format!("{name}.json"));
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let bytes =
+        std::fs::read(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let parsed: ThemeFile = serde_json::from_slice(&bytes)
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
     let mut t = Theme::built_in_default();

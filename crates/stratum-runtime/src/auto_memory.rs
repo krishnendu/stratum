@@ -70,10 +70,7 @@ impl AutoMemoryStore {
     /// # Errors
     /// Returns `Err` when the directory cannot be created.
     pub fn open(config_root: &Path, repo_id: &str) -> std::io::Result<Self> {
-        let root = config_root
-            .join("projects")
-            .join(repo_id)
-            .join("memory");
+        let root = config_root.join("projects").join(repo_id).join("memory");
         std::fs::create_dir_all(&root)?;
         Ok(Self { root })
     }
@@ -89,13 +86,10 @@ impl AutoMemoryStore {
     /// human-edited file and should never error the runtime.
     #[must_use]
     pub fn load_index(&self) -> Vec<IndexEntry> {
-        let raw = match std::fs::read_to_string(self.index_path()) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
+        let Ok(raw) = std::fs::read_to_string(self.index_path()) else {
+            return Vec::new();
         };
-        raw.lines()
-            .filter_map(IndexEntry::parse)
-            .collect()
+        raw.lines().filter_map(IndexEntry::parse).collect()
     }
 
     /// Save the index, atomically (write to a tmp file + rename).
@@ -136,7 +130,9 @@ impl AutoMemoryStore {
             .iter_mut()
             .find(|e| e.name == memory.frontmatter.name)
         {
-            existing.description = memory.frontmatter.description.clone();
+            existing
+                .description
+                .clone_from(&memory.frontmatter.description);
         } else {
             entries.push(IndexEntry {
                 name: memory.frontmatter.name.clone(),
@@ -205,7 +201,8 @@ impl IndexEntry {
         // Expect: `- [Title](<name>.md) — description`
         let inner = line.strip_prefix("- [")?;
         let close_bracket = inner.find("](")?;
-        let _title = &inner[..close_bracket];
+        // We intentionally skip the human title; the slug after `](` is
+        // the canonical key used to dedupe entries.
         let after = &inner[close_bracket + 2..];
         let close_paren = after.find(')')?;
         let path = &after[..close_paren];
@@ -231,10 +228,9 @@ fn title_case(slug: &str) -> String {
     slug.split('_')
         .map(|w| {
             let mut chars = w.chars();
-            match chars.next() {
-                Some(c) => c.to_ascii_uppercase().to_string() + chars.as_str(),
-                None => String::new(),
-            }
+            chars.next().map_or_else(String::new, |c| {
+                c.to_ascii_uppercase().to_string() + chars.as_str()
+            })
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -308,9 +304,7 @@ pub fn repo_id_for(cwd: &Path) -> Option<String> {
     if let Some(url) = read_git_origin(cwd) {
         return Some(hash16(&url));
     }
-    cwd.canonicalize()
-        .ok()
-        .and_then(|p| p.to_str().map(|s| hash16(s)))
+    cwd.canonicalize().ok().and_then(|p| p.to_str().map(hash16))
 }
 
 fn read_git_origin(cwd: &Path) -> Option<String> {
@@ -350,10 +344,15 @@ fn read_git_origin(cwd: &Path) -> Option<String> {
 }
 
 fn hash16(s: &str) -> String {
+    use std::fmt::Write as _;
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
     let digest = hasher.finalize();
-    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    let mut out = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Per plan/40 §9. Reads `<project>/.stratum/config.toml` and the

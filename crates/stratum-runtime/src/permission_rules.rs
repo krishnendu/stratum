@@ -133,11 +133,7 @@ impl RuleSet {
     /// Build a rule set from three lists of rule strings (one per
     /// tier). Strings that fail to parse are silently dropped.
     #[must_use]
-    pub fn from_strings(
-        allow: &[String],
-        deny: &[String],
-        ask: &[String],
-    ) -> Self {
+    pub fn from_strings(allow: &[String], deny: &[String], ask: &[String]) -> Self {
         Self {
             allow: allow.iter().filter_map(|s| Rule::parse(s)).collect(),
             deny: deny.iter().filter_map(|s| Rule::parse(s)).collect(),
@@ -211,11 +207,12 @@ fn glob_inner(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
     }
 }
 
-/// Extract the canonical "args" sequence from a tool-call JSON args
-/// object. Order: `path`, `command`, `pattern`, `query`, `url`,
-/// then remaining string values alphabetically. Used by callers to
-/// build the `&[&str]` slice passed to [`Rule::matches`] without
-/// every caller re-inventing the convention.
+/// Extract the canonical "args" sequence from a tool-call JSON args object.
+///
+/// Order: `path`, `command`, `pattern`, `query`, `url`, then remaining
+/// string values alphabetically. Used by callers to build the `&[&str]`
+/// slice passed to [`Rule::matches`] without every caller re-inventing
+/// the convention.
 #[must_use]
 pub fn args_from_json(args_json: &str) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) else {
@@ -238,7 +235,7 @@ pub fn args_from_json(args_json: &str) -> Vec<String> {
         .map(String::as_str)
         .filter(|k| !consumed.contains(k))
         .collect();
-    remaining_keys.sort();
+    remaining_keys.sort_unstable();
     for k in remaining_keys {
         if let Some(s) = obj.get(k).and_then(|x| x.as_str()) {
             out.push(s.to_string());
@@ -317,19 +314,12 @@ mod tests {
             rs.evaluate("fs.write", &[".env.production"]),
             Decision::Deny
         );
-        assert_eq!(
-            rs.evaluate("fs.write", &["src/main.rs"]),
-            Decision::Allow
-        );
+        assert_eq!(rs.evaluate("fs.write", &["src/main.rs"]), Decision::Allow);
     }
 
     #[test]
     fn ask_only_fires_when_no_allow_or_deny() {
-        let rs = RuleSet::from_strings(
-            &[],
-            &[],
-            &["fs.edit(*)".to_string()],
-        );
+        let rs = RuleSet::from_strings(&[], &[], &["fs.edit(*)".to_string()]);
         assert_eq!(rs.evaluate("fs.edit", &["x.rs"]), Decision::Ask);
         assert_eq!(rs.evaluate("fs.read", &["x.rs"]), Decision::Unspecified);
     }

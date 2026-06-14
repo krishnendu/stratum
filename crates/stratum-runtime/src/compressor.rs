@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn compressor_is_clone_and_share_safe() {
         let c = Compressor::caveman();
-        let c2 = c.clone();
+        let c2 = c;
         let _: Arc<dyn CompressorBackend> = c2.backend.clone();
     }
 }

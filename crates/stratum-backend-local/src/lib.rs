@@ -8,7 +8,7 @@
 //! 1. **Prove the contract.** Wiring a real `AgentLoop` through the
 //!    trait flushes out any signature mismatch (cancellation tokens,
 //!    streaming chunk types, model swap semantics) before alternate
-//!    backends (Anthropic / OpenAI / remote daemon) are written
+//!    backends (Anthropic / `OpenAI` / remote daemon) are written
 //!    against it.
 //! 2. **Power Stratum's local-first default.** A future
 //!    `Box<dyn BackendApi>` migration of `chat.rs` (see
@@ -60,6 +60,18 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// Workspace-internal adapter crate. Same accommodation as stratum-tui:
+// pedantic / nursery lints fire on patterns that are idiomatic for a
+// thin translation layer between two existing types.
+#![allow(
+    clippy::needless_continue,
+    clippy::match_same_arms,
+    clippy::significant_drop_in_scrutinee,
+    clippy::significant_drop_tightening,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    reason = "workspace-internal adapter; idioms differ from main app code"
+)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -129,12 +141,7 @@ impl LocalBackend {
 }
 
 impl BackendApi for LocalBackend {
-    fn submit(
-        &self,
-        req: BackendRequest,
-        events: Sender<BackendEvent>,
-        cancel: CancellationToken,
-    ) {
+    fn submit(&self, req: BackendRequest, events: Sender<BackendEvent>, cancel: CancellationToken) {
         let loop_ = Arc::clone(&self.inner.loop_);
         let active = self
             .inner
@@ -203,7 +210,9 @@ impl BackendApi for LocalBackend {
                 },
                 TurnOutcome::ModelError { code, .. } => BackendEvent::Error(code),
                 TurnOutcome::ToolFailure { code, .. } => BackendEvent::Error(code),
-                TurnOutcome::BudgetExceeded { kind } => BackendEvent::Error(format!("budget exceeded: {kind}")),
+                TurnOutcome::BudgetExceeded { kind } => {
+                    BackendEvent::Error(format!("budget exceeded: {kind}"))
+                }
                 TurnOutcome::Success => BackendEvent::Done,
             };
             let _ = events.send(terminal);
@@ -290,7 +299,9 @@ fn forward_block(events: &Sender<BackendEvent>, block: &Block) -> Result<(), ()>
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use stratum_runtime::{AgentLoop, AgentLoopConfig, EchoProvider, EventEmitter, MemoryEventSink};
+    use stratum_runtime::{
+        AgentLoop, AgentLoopConfig, EchoProvider, EventEmitter, MemoryEventSink,
+    };
 
     fn echo_backend() -> LocalBackend {
         let provider: Arc<dyn stratum_runtime::Provider> = Arc::new(EchoProvider::new("echo: "));
@@ -432,8 +443,16 @@ mod tests {
         let b = LocalBackend::new(
             loop_,
             vec![
-                ModelInfo { slug: "a".into(), display: "A".into(), active: true },
-                ModelInfo { slug: "b".into(), display: "B".into(), active: false },
+                ModelInfo {
+                    slug: "a".into(),
+                    display: "A".into(),
+                    active: true,
+                },
+                ModelInfo {
+                    slug: "b".into(),
+                    display: "B".into(),
+                    active: false,
+                },
             ],
             "test".into(),
         );

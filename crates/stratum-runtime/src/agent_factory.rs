@@ -407,7 +407,7 @@ mod tests {
         }
     }
 
-    /// Builds a ToolCall block with `args: "{}"`. **Only safe for
+    /// Builds a `ToolCall` block with `args: "{}"`. **Only safe for
     /// tools that have no required args in `missing_required_args` —
     /// e.g. the synthetic `"echo"` used in dispatcher and budget
     /// tests.** Calling this with a tool that *does* have a required

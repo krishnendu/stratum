@@ -594,7 +594,11 @@ impl SecretStore for KeyringSecretStore {
             .iter()
             .filter_map(|account| {
                 let (s, id) = Self::decode_account(account)?;
-                if &s == scope { Some(id) } else { None }
+                if &s == scope {
+                    Some(id)
+                } else {
+                    None
+                }
             })
             .collect();
         out.sort_by(|a, b| a.as_str().cmp(b.as_str()));

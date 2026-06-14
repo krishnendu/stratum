@@ -36,6 +36,14 @@
 // the marker is here as a safety net should one be added later before
 // the catalog catches up.
 
+// Sandbox + git wrapper code uses short, conventional names (cmd, rel,
+// b0/b1/b2, git_bin) that overlap with siblings; the clippy pedantic
+// "similar_names" lint is more confusing than helpful here.
+#![allow(
+    clippy::similar_names,
+    reason = "intentional short conventional names: cmd, rel, b0..b2, git_bin"
+)]
+
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::thread;
@@ -941,10 +949,7 @@ impl ToolDispatcher for SubagentToolDispatcher {
             _ => return self.err(E_DISPATCH_MISSING_ARG, "subagent.run requires `task`"),
         };
         let Some(sub) = self.registry.get(&name) else {
-            return self.err(
-                E_DISPATCH_MISSING_ARG,
-                format!("unknown subagent: {name}"),
-            );
+            return self.err(E_DISPATCH_MISSING_ARG, format!("unknown subagent: {name}"));
         };
         let req = crate::provider::GenerateRequest {
             model: stratum_types::ModelId::from("subagent"),
@@ -962,13 +967,9 @@ impl ToolDispatcher for SubagentToolDispatcher {
                 stratum_types::Block::Text { text } => Some(text.clone()),
                 _ => None,
             })
-            .collect::<Vec<_>>()
-            .join("");
+            .collect::<String>();
         if text.is_empty() {
-            return self.err(
-                E_DISPATCH_READ_FAILED,
-                "subagent returned no text blocks",
-            );
+            return self.err(E_DISPATCH_READ_FAILED, "subagent returned no text blocks");
         }
         let body = serde_json::json!({
             "subagent": name,
@@ -1179,11 +1180,7 @@ impl ToolDispatcher for GitDiffToolDispatcher {
             }
         }
 
-        let mut args: Vec<String> = vec![
-            "--no-pager".into(),
-            "diff".into(),
-            "--no-color".into(),
-        ];
+        let mut args: Vec<String> = vec!["--no-pager".into(), "diff".into(), "--no-color".into()];
         if staged {
             args.push("--cached".into());
         }
@@ -1268,9 +1265,9 @@ impl GitLogToolDispatcher {
 impl ToolDispatcher for GitLogToolDispatcher {
     fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
         let max = match inv.args.get("max") {
-            Some(Value::Number(n)) => n
-                .as_u64()
-                .map_or(Self::DEFAULT_MAX_ENTRIES, |x| x.clamp(1, Self::HARD_MAX_ENTRIES)),
+            Some(Value::Number(n)) => n.as_u64().map_or(Self::DEFAULT_MAX_ENTRIES, |x| {
+                x.clamp(1, Self::HARD_MAX_ENTRIES)
+            }),
             _ => Self::DEFAULT_MAX_ENTRIES,
         };
         let since = match inv.args.get("since") {
@@ -1355,9 +1352,11 @@ impl ToolDispatcher for GitLogToolDispatcher {
     }
 }
 
-/// `ToolDispatcher` for `read_image`. Returns base64-encoded image bytes
-/// plus a sniffed MIME type. The agent loop forwards this through the
-/// multimodal provider path; this dispatcher only handles the read.
+/// `ToolDispatcher` for `read_image`.
+///
+/// Returns base64-encoded image bytes plus a sniffed MIME type. The
+/// agent loop forwards this through the multimodal provider path; this
+/// dispatcher only handles the read.
 #[derive(Debug, Clone)]
 pub struct ReadImageToolDispatcher {
     id: String,
@@ -1439,7 +1438,8 @@ impl ToolDispatcher for ReadImageToolDispatcher {
             Ok(b) => b,
             Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("read failed: {e}")),
         };
-        let mime = sniff_image_mime(&canonical_target, &bytes).unwrap_or("application/octet-stream");
+        let mime =
+            sniff_image_mime(&canonical_target, &bytes).unwrap_or("application/octet-stream");
         let raw_len = bytes.len() as u64;
         let encoded = base64_encode(&bytes);
         let body = serde_json::json!({
@@ -1592,7 +1592,10 @@ impl GitRunError {
         let (code, message) = match self {
             Self::Spawn(e) => (E_DISPATCH_SPAWN_FAILED, format!("git spawn failed: {e}")),
             Self::Timeout => (E_DISPATCH_TIMEOUT, "git timeout".to_string()),
-            Self::NonZero { status, stderr_tail } => (
+            Self::NonZero {
+                status,
+                stderr_tail,
+            } => (
                 E_DISPATCH_EXIT_NONZERO,
                 format!("git exit {status}: {stderr_tail}"),
             ),
@@ -1716,7 +1719,7 @@ fn sniff_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         return Some("image/webp");
     }
-    if bytes.starts_with(&[b'B', b'M']) {
+    if bytes.starts_with(b"BM") {
         return Some("image/bmp");
     }
     match path
@@ -1738,8 +1741,7 @@ fn sniff_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
 /// Standard alphabet base64 with `=` padding. Kept inline to avoid pulling
 /// the `base64` crate into the runtime dep graph for a single use site.
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHA: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut iter = bytes.chunks_exact(3);
     for chunk in &mut iter {
@@ -1749,7 +1751,7 @@ fn base64_encode(bytes: &[u8]) -> String {
         out.push(ALPHA[(b0 >> 2) as usize] as char);
         out.push(ALPHA[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
         out.push(ALPHA[(((b1 & 0b1111) << 2) | (b2 >> 6)) as usize] as char);
-        out.push(ALPHA[(b2 & 0b111111) as usize] as char);
+        out.push(ALPHA[(b2 & 0b11_1111) as usize] as char);
     }
     let rem = iter.remainder();
     match rem.len() {
@@ -2432,10 +2434,7 @@ mod tests {
 
     // ---- git.diff / git.log / read_image -----------------------------
 
-    fn make_invocation(
-        tool: &str,
-        args: BTreeMap<String, serde_json::Value>,
-    ) -> ToolInvocation {
+    fn make_invocation(tool: &str, args: BTreeMap<String, serde_json::Value>) -> ToolInvocation {
         ToolInvocation {
             tool_id: tool.to_string(),
             args,

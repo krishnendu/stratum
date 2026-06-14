@@ -130,11 +130,7 @@ impl RoleSwapController {
     /// be empty (no active model); in that case the recommended slug
     /// is returned with `should_swap = true`.
     #[must_use]
-    pub fn decide(
-        &self,
-        intent: &RoutedIntent,
-        current_slug: &str,
-    ) -> SwapDecision {
+    pub fn decide(&self, intent: &RoutedIntent, current_slug: &str) -> SwapDecision {
         let target = self.roster.slug_for(intent.suggested_role).to_string();
         // Confidence floor: only swap when we're at least 0.4 confident.
         // Low-confidence routes shouldn't churn the active model.

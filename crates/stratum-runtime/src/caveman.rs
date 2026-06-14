@@ -87,7 +87,10 @@ pub fn compress(input: &str) -> String {
         if c.is_whitespace() {
             // Boundary — consume the run and reset.
             while cursor < bytes.len()
-                && input[cursor..].chars().next().is_some_and(char::is_whitespace)
+                && input[cursor..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_whitespace)
             {
                 cursor += input[cursor..].chars().next().unwrap_or(' ').len_utf8();
             }
@@ -190,7 +193,9 @@ fn is_filler(word: &str) -> bool {
         return false;
     }
     // All-caps with hyphen or underscore → error code, preserve.
-    if word.chars().all(|c| c.is_ascii_uppercase() || c == '-' || c == '_' || c.is_ascii_digit())
+    if word
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c == '-' || c == '_' || c.is_ascii_digit())
         && word.len() >= 3
     {
         return false;

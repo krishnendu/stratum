@@ -1,13 +1,15 @@
 //! Runtime foundations.
 //!
-//! Phase 1 surface: the primitives every later subsystem (providers, agents,
-//! tools, TUI) leans on — filesystem path resolution, hardware probe, tier
-//! classifier, and the `installed.toml` first-run marker.
-//!
-//! See `plan/18-first-run-and-system-tiers.md` and `plan/28-finalization-v2.md`.
+//! Phase 1 surface. See `plan/18-first-run-and-system-tiers.md`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// 50+ `pub mod` declarations each carry a one-line doc; the lint
+// fires on spurious cross-decl spans we cannot rephrase further.
+#![allow(
+    clippy::too_long_first_doc_paragraph,
+    reason = "false positive on adjacent pub-mod doc lines"
+)]
 
 /// `AgentFactory` builder.
 ///
@@ -45,6 +47,9 @@ pub mod agents;
 /// [`claude_cli_judge`] subprocess; speaks the Anthropic Messages API
 /// over `ureq`.
 pub mod anthropic_api_judge;
+/// Auto-memory storage layer — per-repo MEMORY.md index + body files
+/// the agent maintains across sessions (plan/40).
+pub mod auto_memory;
 /// Per-turn budget tracker layered over an `AgentBudget` + `CancelToken`.
 pub mod budget;
 /// Session-level cumulative budget meter (totals + per-role breakdown + hard cap).
@@ -53,40 +58,17 @@ pub mod budget_meter;
 pub mod cancel;
 /// Hierarchical cancellation cascade with reasons + RAII deadlines.
 pub mod cancel_cascade;
-/// Deterministic Caveman compressor — heuristic prose → fragment
-/// for inter-agent messages and tool-result re-injection.
-pub mod caveman;
-/// Reviewer pass — score an assistant draft with a SECOND provider
-/// (anti-self-bias per plan/17).
-pub mod reviewer;
-/// `STRATUM.md` walk-up loader with `@file` imports (plan/39).
-pub mod memory_loader;
-/// Auto-memory storage layer — per-repo MEMORY.md index + body files
-/// the agent maintains across sessions (plan/40).
-pub mod auto_memory;
-/// Permission rule DSL — `fs.write(*.rs)`, `Bash(npm *)` (plan/30 §10.1).
-pub mod permission_rules;
-/// Four-tier settings loader (managed/user/project/local, plan/30 §10).
-pub mod settings_loader;
-/// `.stratumignore` matcher for fs.* + glob + grep (plan/30 §3.1).
-pub mod stratumignore;
-/// Hooks runtime — settings.json hooks dispatcher (plan/42).
-pub mod hooks;
-/// Filesystem hot-reload for settings / agents / hooks (plan/30 §10.3).
-pub mod hot_reload;
-/// Canonical multi-role orchestrator wrapping AgentLoop with router +
-/// reviewer + polish per plan/03 + plan/17.
-pub mod orchestrator;
-/// Context compressor trait — Caveman v1, LLMLingua-2 plug point.
-pub mod compressor;
-/// Role-based model swap controller (plan/02 §Roster).
-pub mod role_router;
 /// Candle-backed provider scaffold (Phase 2 v2 embeddings landing).
 pub mod candle_provider;
 /// Remote `ModelCatalog` sync over HTTPS — fetch + validate + atomic write.
 pub mod catalog_sync;
+/// Deterministic Caveman compressor — heuristic prose → fragment
+/// for inter-agent messages and tool-result re-injection.
+pub mod caveman;
 /// `claude -p` subprocess transport for the Stratum LLM-judge.
 pub mod claude_cli_judge;
+/// Context compressor trait — Caveman v1, LLMLingua-2 plug point.
+pub mod compressor;
 /// Per-turn conversation state machine driving the agentic loop.
 pub mod conversation;
 /// Opt-in crash-report bundle + log redaction (Phase 4 scaffold).
@@ -108,6 +90,10 @@ pub mod event_log;
 /// Refuses model loads when free RAM minus the would-be hot footprint falls
 /// below the configured margin.
 pub mod gate;
+/// Hooks runtime — settings.json hooks dispatcher (plan/42).
+pub mod hooks;
+/// Filesystem hot-reload for settings / agents / hooks (plan/30 §10.3).
+pub mod hot_reload;
 /// Fluent-style i18n catalog + lookup (Phase 1 scaffold).
 pub mod i18n;
 /// Prompt-injection defense primitives.
@@ -125,6 +111,8 @@ pub mod logging;
 pub mod mcp;
 /// Real JSON-RPC 2.0 client over an MCP stdio child (Phase 6 scaffold).
 pub mod mcp_jsonrpc;
+/// `STRATUM.md` walk-up loader with `@file` imports (plan/39).
+pub mod memory_loader;
 /// Curated model catalog: structured index of installer-resolvable models.
 pub mod model_catalog;
 /// Slug → local GGUF path resolver composing a [`model_catalog::ModelCatalog`]
@@ -133,12 +121,17 @@ pub mod model_catalog;
 pub mod model_resolver;
 /// Turn-level observability primitives: token meter, latency steps, tok/s.
 pub mod observability;
+/// Canonical multi-role orchestrator wrapping AgentLoop with router +
+/// reviewer + polish per plan/03 + plan/17.
+pub mod orchestrator;
 /// Panic hook + crash report file writer.
 pub mod panic;
 /// XDG-aware filesystem path resolution.
 pub mod paths;
 /// Interactive permission-prompt data shape + remembered-decision store.
 pub mod permission_prompt;
+/// Permission rule DSL — `fs.write(*.rs)`, `Bash(npm *)` (plan/30 §10.1).
+pub mod permission_rules;
 /// Plan-mode capability fence (read-only sandbox).
 pub mod plan_mode;
 /// Hardware probe: RAM, CPU features, GPU backend, OS.
@@ -169,10 +162,13 @@ pub mod rate_limit;
 pub mod registry;
 /// Deterministic retry-with-backoff helper for transient errors.
 pub mod retry;
+/// Reviewer pass — score an assistant draft with a SECOND provider
+/// (anti-self-bias per plan/17).
+pub mod reviewer;
+/// Role-based model swap controller (plan/02 §Roster).
+pub mod role_router;
 /// Sandbox backend detection.
 pub mod sandbox;
-/// Subagent primitive: TOML schema + loader + builtin seed.
-pub mod subagent;
 /// Sandbox profile bodies (bwrap-*, macos-*, passthrough).
 pub mod sandbox_profile;
 /// Sandbox-profile resolver — combine profile + caps + workspace → launch spec.
@@ -195,6 +191,12 @@ pub mod serve_middleware;
 pub mod serve_protocol;
 /// Synchronous `stratum serve` JSON-RPC dispatch server over Unix or TCP loopback.
 pub mod serve_server;
+/// Four-tier settings loader (managed/user/project/local, plan/30 §10).
+pub mod settings_loader;
+/// `.stratumignore` matcher for fs.* + glob + grep (plan/30 §3.1).
+pub mod stratumignore;
+/// Subagent primitive: TOML schema + loader + builtin seed.
+pub mod subagent;
 /// Default-on opt-out telemetry payload shape + allowlist guard.
 pub mod telemetry;
 /// Composite tier classifier (low / medium / high).

@@ -32,8 +32,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -54,7 +54,7 @@ use stratum_runtime::{
 };
 use stratum_types::{Block, ModelId, StratumResult};
 
-/// Backend seam — the single surface ChatState calls on its
+/// Backend seam — the single surface `ChatState` calls on its
 /// turn-runner. Implemented for [`AgentLoop`] by the blanket impl
 /// below so existing wiring (and every test) keeps compiling. Future
 /// non-AgentLoop backends (remote daemon, hosted provider, mock)
@@ -82,7 +82,7 @@ impl ChatBackend for AgentLoop {
         cancel: &CancelToken,
         chunk_tx: mpsc::Sender<Block>,
     ) -> TurnResult {
-        AgentLoop::run_turn_streaming(self, ctx, cancel, chunk_tx)
+        Self::run_turn_streaming(self, ctx, cancel, chunk_tx)
     }
 }
 
@@ -211,9 +211,7 @@ impl ShellExecutor {
 /// Type-erased model swap hook. Wraps a closure that rebuilds an
 /// [`AgentLoop`] against a new slug.
 #[derive(Clone)]
-pub struct ModelSwitcher(
-    Arc<dyn Fn(&str) -> Result<Arc<AgentLoop>, String> + Send + Sync>,
-);
+pub struct ModelSwitcher(Arc<dyn Fn(&str) -> Result<Arc<AgentLoop>, String> + Send + Sync>);
 
 impl std::fmt::Debug for ModelSwitcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -253,7 +251,7 @@ pub struct ChatState {
     /// selection at the cost of the scroll wheel.
     mouse_capture_on: bool,
     /// One-shot flag set by Ctrl+T so the event loop can flip the
-    /// terminal-side capture bit (render() has no stdout access).
+    /// terminal-side capture bit (`render()` has no stdout access).
     pending_mouse_toggle: bool,
     /// Reverse-search state. `Some` when the user pressed Ctrl+R; the
     /// inner string is the live filter. Esc / Ctrl+C cancels; Enter
@@ -261,7 +259,7 @@ pub struct ChatState {
     rsearch: Option<RSearchState>,
     /// Scroll offset for the chat pane in screen rows above the
     /// auto-tail position. `0` = follow latest; `N` = pinned `N` rows
-    /// above. PgUp / mouse wheel up increment, PgDn / wheel down
+    /// above. `PgUp` / mouse wheel up increment, `PgDn` / wheel down
     /// decrement (saturating at 0). Reset to 0 on submit so the user
     /// sees their freshly-sent message.
     chat_scroll: u16,
@@ -354,7 +352,7 @@ pub struct ChatState {
     /// browsing). Capped at [`Self::INPUT_HISTORY_CAP`].
     input_history: Vec<String>,
     /// On-disk path where `input_history` is persisted. `None` keeps
-    /// history in-memory only (used by tests + the EchoProvider path).
+    /// history in-memory only (used by tests + the `EchoProvider` path).
     history_path: Option<PathBuf>,
     theme_state_path: Option<PathBuf>,
     themes_dir: Option<PathBuf>,
@@ -624,11 +622,7 @@ impl ChatState {
                     if s.is_empty() {
                         continue;
                     }
-                    if self
-                        .input_history
-                        .last()
-                        .map_or(true, |last| last != &s)
-                    {
+                    if self.input_history.last() != Some(&s) {
                         self.input_history.push(s);
                     }
                 }
@@ -684,9 +678,7 @@ impl ChatState {
     /// empty string when no statusline is configured or the script
     /// has not produced output yet.
     fn statusline_snapshot(&self) -> Option<String> {
-        if self.statusline_cmd.is_none() {
-            return None;
-        }
+        self.statusline_cmd.as_ref()?;
         self.statusline_cache
             .lock()
             .ok()
@@ -782,7 +774,7 @@ impl ChatState {
     /// Session id stamped on this chat. Surfaced on exit so the user can
     /// reload via `stratum chat --resume <id>`.
     #[must_use]
-    pub fn session_id(&self) -> &stratum_runtime::SessionId {
+    pub const fn session_id(&self) -> &stratum_runtime::SessionId {
         &self.session_id
     }
 
@@ -848,7 +840,11 @@ impl ChatState {
                     at: now,
                     text: "[cancelled]".to_string(),
                 }),
-                Turn::Command { text, ok, message: _ } => turns.push(TranscriptTurn::Command {
+                Turn::Command {
+                    text,
+                    ok,
+                    message: _,
+                } => turns.push(TranscriptTurn::Command {
                     at: now,
                     text: text.clone(),
                     ok: *ok,
@@ -1095,7 +1091,8 @@ impl ChatState {
             KeyCode::Esc => {
                 if self.history_cursor.is_some() {
                     self.history_cursor = None;
-                    self.input.clear(); self.caret = 0;
+                    self.input.clear();
+                    self.caret = 0;
                 } else {
                     self.quit = true;
                 }
@@ -1210,7 +1207,7 @@ impl ChatState {
     #[must_use]
     pub fn exit_armed(&self) -> bool {
         self.exit_armed_at
-            .map_or(false, |t| t.elapsed() <= Self::EXIT_ARM_WINDOW)
+            .is_some_and(|t| t.elapsed() <= Self::EXIT_ARM_WINDOW)
     }
 
     /// Insert `c` at the caret, advance the caret past it.
@@ -1246,9 +1243,7 @@ impl ChatState {
     }
 
     fn kill_to_line_start(&mut self) {
-        let start = self.input[..self.caret]
-            .rfind('\n')
-            .map_or(0, |i| i + 1);
+        let start = self.input[..self.caret].rfind('\n').map_or(0, |i| i + 1);
         let end = self.caret.min(self.input.len());
         if start >= end {
             return;
@@ -1296,18 +1291,18 @@ impl ChatState {
     /// Alt+Y after a Ctrl+Y: replace the just-yanked text with the
     /// next-older kill-ring entry. No-op if there is no preceding yank.
     /// Scroll the chat pane up by `n` rows (toward older history).
-    pub fn scroll_up(&mut self, n: u16) {
+    pub const fn scroll_up(&mut self, n: u16) {
         self.chat_scroll = self.chat_scroll.saturating_add(n);
     }
 
     /// Scroll the chat pane down by `n` rows (toward the latest line).
-    pub fn scroll_down(&mut self, n: u16) {
+    pub const fn scroll_down(&mut self, n: u16) {
         self.chat_scroll = self.chat_scroll.saturating_sub(n);
     }
 
     /// Pin the chat pane to the latest line. Called by `submit()` so the
     /// freshly-pushed user turn is always visible.
-    fn scroll_to_bottom(&mut self) {
+    const fn scroll_to_bottom(&mut self) {
         self.chat_scroll = 0;
     }
 
@@ -1318,7 +1313,7 @@ impl ChatState {
     /// Consume any pending mouse-capture toggle. Returns the new
     /// desired state (`true` = capture on, `false` = capture off) the
     /// caller should flip the terminal to.
-    pub fn take_pending_mouse_toggle(&mut self) -> Option<bool> {
+    pub const fn take_pending_mouse_toggle(&mut self) -> Option<bool> {
         if self.pending_mouse_toggle {
             self.pending_mouse_toggle = false;
             Some(self.mouse_capture_on)
@@ -1330,7 +1325,7 @@ impl ChatState {
     /// True when mouse capture is currently disabled — used by the
     /// render path to surface a "select" hint in the status bar.
     #[must_use]
-    pub fn mouse_capture_off(&self) -> bool {
+    pub const fn mouse_capture_off(&self) -> bool {
         !self.mouse_capture_on
     }
 
@@ -1390,7 +1385,7 @@ impl ChatState {
             }
             let lcp = longest_common_prefix(&matches);
             if lcp.len() > needle.len() {
-                self.input = format!("/{}", lcp);
+                self.input = format!("/{lcp}");
                 self.caret = self.input.len();
             }
             return;
@@ -1429,7 +1424,7 @@ impl ChatState {
     /// Accessor used by the render path to draw the reverse-search
     /// modal when active.
     #[must_use]
-    pub fn rsearch_peek(&self) -> Option<&RSearchState> {
+    pub const fn rsearch_peek(&self) -> Option<&RSearchState> {
         self.rsearch.as_ref()
     }
 
@@ -1483,7 +1478,7 @@ impl ChatState {
                 let needle = state.needle.clone();
                 let cursor = state.cursor;
                 let matches = self.rsearch_matches(&needle);
-                if let Some(picked) = matches.get(cursor).map(|s| s.to_string()) {
+                if let Some(picked) = matches.get(cursor).map(|s| (*s).to_string()) {
                     self.input = picked;
                     self.caret = self.input.len();
                 }
@@ -1495,7 +1490,7 @@ impl ChatState {
 
     /// Handle a terminal mouse event. Wheel up/down scrolls the chat
     /// pane; other mouse events are ignored for now.
-    pub fn handle_mouse(&mut self, ev: MouseEvent) {
+    pub const fn handle_mouse(&mut self, ev: MouseEvent) {
         match ev.kind {
             MouseEventKind::ScrollUp => self.scroll_up(3),
             MouseEventKind::ScrollDown => self.scroll_down(3),
@@ -1580,9 +1575,7 @@ impl ChatState {
     /// Move caret to the start of the current line (after the last `\n`
     /// at-or-before caret).
     fn caret_to_line_start(&mut self) {
-        self.caret = self.input[..self.caret]
-            .rfind('\n')
-            .map_or(0, |i| i + 1);
+        self.caret = self.input[..self.caret].rfind('\n').map_or(0, |i| i + 1);
     }
 
     /// Move caret to the end of the current line (before the next `\n`).
@@ -1649,7 +1642,8 @@ impl ChatState {
             Some(i) => i - 1,
         };
         self.history_cursor = Some(next);
-        self.input = self.input_history[next].clone(); self.caret = self.input.len();
+        self.input = self.input_history[next].clone();
+        self.caret = self.input.len();
     }
 
     fn history_down(&mut self) {
@@ -1658,19 +1652,21 @@ impl ChatState {
         };
         if i + 1 >= self.input_history.len() {
             self.history_cursor = None;
-            self.input.clear(); self.caret = 0;
+            self.input.clear();
+            self.caret = 0;
             return;
         }
         let next = i + 1;
         self.history_cursor = Some(next);
-        self.input = self.input_history[next].clone(); self.caret = self.input.len();
+        self.input = self.input_history[next].clone();
+        self.caret = self.input.len();
     }
 
     fn record_input_history(&mut self, entry: &str) {
         if entry.is_empty() {
             return;
         }
-        if self.input_history.last().map_or(false, |last| last == entry) {
+        if self.input_history.last().is_some_and(|last| last == entry) {
             return;
         }
         self.input_history.push(entry.to_string());
@@ -1927,9 +1923,7 @@ impl ChatState {
                 message: "/switch unavailable in echo mode".to_string(),
             };
         };
-        if !self.available_models.is_empty()
-            && !self.available_models.iter().any(|s| s == slug)
-        {
+        if !self.available_models.is_empty() && !self.available_models.iter().any(|s| s == slug) {
             return PaletteOutcome::Rejected {
                 message: format!("unknown slug: {slug} (run /models to list available)"),
             };
@@ -2174,7 +2168,7 @@ impl ChatState {
     /// any time. Useful when the chat scrolls past the banner or the
     /// user wants a reminder.
     fn dispatch_welcome(&self) -> PaletteOutcome {
-        let rot = self.last_turn_id.map(|t| t.0).unwrap_or(0);
+        let rot = self.last_turn_id.map_or(0, |t| t.0);
         let tip = crate::brand::tip_for(rot);
         PaletteOutcome::Acknowledged {
             message: format!(
@@ -2273,7 +2267,7 @@ impl ChatState {
 
     /// `/compact` — compress old turns into a single summary turn so
     /// the context window stays usable on long sessions. Keeps the
-    /// most recent KEEP_RECENT turns verbatim; collapses everything
+    /// most recent `KEEP_RECENT` turns verbatim; collapses everything
     /// before them into one synthetic Assistant text block. Per
     /// plan/04 + plan/42 PreCompact/PostCompact.
     fn dispatch_compact(&mut self) -> PaletteOutcome {
@@ -2294,9 +2288,8 @@ impl ChatState {
         if let Some(llm_summary) = self.try_llm_summarize(split_at) {
             let recent: Vec<Turn> = self.transcript.split_off(split_at);
             self.transcript.clear();
-            self.transcript.push(Turn::Assistant(vec![Block::Text {
-                text: llm_summary,
-            }]));
+            self.transcript
+                .push(Turn::Assistant(vec![Block::Text { text: llm_summary }]));
             self.transcript.extend(recent);
             self.chat_scroll = 0;
             return PaletteOutcome::Acknowledged {
@@ -2307,10 +2300,7 @@ impl ChatState {
         }
         // Heuristic fallback below.
         let older = &self.transcript[..split_at];
-        let user_count = older
-            .iter()
-            .filter(|t| matches!(t, Turn::User(_)))
-            .count();
+        let user_count = older.iter().filter(|t| matches!(t, Turn::User(_))).count();
         let assistant_count = older
             .iter()
             .filter(|t| matches!(t, Turn::Assistant(_)))
@@ -2347,26 +2337,18 @@ impl ChatState {
             summary.push_str(line);
             summary.push('\n');
         }
-        if older
-            .iter()
-            .filter(|t| matches!(t, Turn::User(_)))
-            .count()
-            > topic_lines.len()
-        {
+        if older.iter().filter(|t| matches!(t, Turn::User(_))).count() > topic_lines.len() {
             summary.push_str("· (older topics dropped)\n");
         }
         // Replace older turns with a single synthetic Assistant turn.
         let recent: Vec<Turn> = self.transcript.split_off(split_at);
         self.transcript.clear();
-        self.transcript.push(Turn::Assistant(vec![Block::Text {
-            text: summary,
-        }]));
+        self.transcript
+            .push(Turn::Assistant(vec![Block::Text { text: summary }]));
         self.transcript.extend(recent);
         self.chat_scroll = 0;
         PaletteOutcome::Acknowledged {
-            message: format!(
-                "compacted {split_at} turn(s); kept the most recent {KEEP_RECENT}"
-            ),
+            message: format!("compacted {split_at} turn(s); kept the most recent {KEEP_RECENT}"),
         }
     }
 
@@ -2448,7 +2430,8 @@ impl ChatState {
         // Hunks were collected newest-first; restore chronological order.
         hunks.reverse();
         let body = format!("```diff\n{}\n```", hunks.join("\n"));
-        self.transcript.push(Turn::Assistant(vec![Block::Text { text: body }]));
+        self.transcript
+            .push(Turn::Assistant(vec![Block::Text { text: body }]));
         PaletteOutcome::Acknowledged {
             message: format!("rendered {n} diff hunk(s) above"),
         }
@@ -2474,7 +2457,10 @@ impl ChatState {
                     - `cargo build` / `cargo test`\n";
         match std::fs::write(&path, body) {
             Ok(()) => PaletteOutcome::Acknowledged {
-                message: format!("wrote {} (edit it with your project's conventions)", path.display()),
+                message: format!(
+                    "wrote {} (edit it with your project's conventions)",
+                    path.display()
+                ),
             },
             Err(e) => PaletteOutcome::Rejected {
                 message: format!("could not write STRATUM.md: {e}"),
@@ -2535,7 +2521,8 @@ impl ChatState {
     /// (and by tests) — it replaces the current input wholesale so callers
     /// don't have to drive a stream of `KeyCode::Char` events.
     pub fn submit_with_prompt(&mut self, prompt: &str) {
-        self.input.clear(); self.caret = 0;
+        self.input.clear();
+        self.caret = 0;
         self.input.push_str(prompt);
         self.submit();
         self.block_until_idle();
@@ -2560,13 +2547,13 @@ impl ChatState {
     /// Most recent turn metrics (prompt+completion tokens, ms, tok/s).
     /// `None` if no turn has settled. Surfaced for `--output-format json`.
     #[must_use]
-    pub fn last_turn_metrics(&self) -> Option<&TurnMetrics> {
+    pub const fn last_turn_metrics(&self) -> Option<&TurnMetrics> {
         self.last_metrics.as_ref()
     }
 
     /// Last turn id. Surfaced for `--output-format json`.
     #[must_use]
-    pub fn last_turn_id_value(&self) -> Option<TurnId> {
+    pub const fn last_turn_id_value(&self) -> Option<TurnId> {
         self.last_turn_id
     }
 
@@ -2768,7 +2755,8 @@ impl ChatState {
                 self.caret = 0;
                 return;
             }
-            let cmd = std::mem::take(&mut self.input); self.caret = 0;
+            let cmd = std::mem::take(&mut self.input);
+            self.caret = 0;
             self.record_input_history(&cmd);
             let _ = self.execute_palette_command(&cmd);
             return;
@@ -2776,7 +2764,8 @@ impl ChatState {
         // If a turn is already running, queue this prompt and return.
         // The event loop calls `drain_queue` when the turn finishes.
         if self.in_flight_since.is_some() {
-            let queued = std::mem::take(&mut self.input); self.caret = 0;
+            let queued = std::mem::take(&mut self.input);
+            self.caret = 0;
             self.pending_queue.push(queued);
             return;
         }
@@ -2786,7 +2775,8 @@ impl ChatState {
         if let Some(rest) = self.input.strip_prefix('!') {
             if let Some(exec) = self.shell_executor.clone() {
                 let cmd = rest.trim().to_string();
-                let raw = std::mem::take(&mut self.input); self.caret = 0;
+                let raw = std::mem::take(&mut self.input);
+                self.caret = 0;
                 self.record_input_history(&raw);
                 if cmd.is_empty() {
                     self.transcript.push(Turn::Command {
@@ -2808,7 +2798,8 @@ impl ChatState {
                 return;
             }
         }
-        let prompt = std::mem::take(&mut self.input); self.caret = 0;
+        let prompt = std::mem::take(&mut self.input);
+        self.caret = 0;
         self.record_input_history(&prompt);
         // Optimistic user-message display: push the user turn BEFORE the
         // provider runs so the next render shows it immediately. The
@@ -2952,7 +2943,10 @@ impl ChatState {
         //     genuinely have nothing to show — push as-is for parity with
         //     the existing E_NO_BLOCKS test fixtures.
         let has_renderable = result.blocks.iter().any(|b| {
-            matches!(b, Block::Text { .. } | Block::Usage { .. } | Block::Cancelled { .. })
+            matches!(
+                b,
+                Block::Text { .. } | Block::Usage { .. } | Block::Cancelled { .. }
+            )
         });
         let stream_was_just_json = looks_like_tool_call_json(self.streaming_text.trim());
         if !has_renderable
@@ -3167,7 +3161,7 @@ impl ChatState {
                 // First line has the "> " prompt eating 2 columns.
                 let lead = if i == 0 { 2 } else { 0 };
                 let chars = line.chars().count() + lead;
-                let wrapped = (chars + inner_w - 1) / inner_w;
+                let wrapped = chars.div_ceil(inner_w);
                 visual_rows = visual_rows.saturating_add(wrapped.max(1) as u16);
             }
             // 1 row for the input contents minimum + 2 for borders.
@@ -3292,10 +3286,8 @@ impl ChatState {
                     // or the partial streaming text the provider has
                     // emitted so far.
                     if idx == last_idx && self.in_flight_since.is_some() {
-                        let elapsed_ms = self
-                            .in_flight_since
-                            .map(|t| t.elapsed().as_millis())
-                            .unwrap_or(0);
+                        let elapsed_ms =
+                            self.in_flight_since.map_or(0, |t| t.elapsed().as_millis());
                         if self.streaming_text.is_empty() {
                             lines.push(Line::from(Span::raw("")));
                             lines.push(streaming_spinner_line(
@@ -3314,10 +3306,8 @@ impl ChatState {
                             ));
                         } else {
                             lines.push(Line::from(Span::raw("")));
-                            for ln in render_markdown_gutter(
-                                &self.streaming_text,
-                                theme.ai_gutter,
-                            ) {
+                            for ln in render_markdown_gutter(&self.streaming_text, theme.ai_gutter)
+                            {
                                 lines.push(ln);
                             }
                         }
@@ -3381,10 +3371,7 @@ impl ChatState {
             let body = theme.dim;
             lines.push(Line::from(Span::raw("")));
             for layer in crate::brand::ASCII_MARK {
-                lines.push(Line::from(Span::styled(
-                    format!("   {layer}"),
-                    mark_style,
-                )));
+                lines.push(Line::from(Span::styled(format!("   {layer}"), mark_style)));
             }
             lines.push(Line::from(Span::raw("")));
             lines.push(Line::from(vec![
@@ -3396,17 +3383,15 @@ impl ChatState {
             // Rotating tip — picks one based on `last_turn_id` so
             // the first launch always shows tip 0 and each new turn
             // would rotate. Falls back to 0 when no turn yet.
-            let rot = self
-                .last_turn_id
-                .map(|t| t.0)
-                .unwrap_or(0);
+            let rot = self.last_turn_id.map_or(0, |t| t.0);
             lines.push(Line::from(Span::styled(
                 format!("   tip · {}", crate::brand::tip_for(rot)),
                 body.add_modifier(Modifier::ITALIC),
             )));
             lines.push(Line::from(Span::raw("")));
             lines.push(Line::from(Span::styled(
-                "   Enter to send · / for commands · Ctrl+G editor · ? help · Ctrl+C twice exit".to_string(),
+                "   Enter to send · / for commands · Ctrl+G editor · ? help · Ctrl+C twice exit"
+                    .to_string(),
                 body,
             )));
         }
@@ -3498,7 +3483,10 @@ impl ChatState {
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("'{}': ", state.needle)),
-                Span::styled(pick.to_string(), Style::default().add_modifier(Modifier::REVERSED)),
+                Span::styled(
+                    pick.to_string(),
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ),
             ]));
             modal_lines.push(Line::from(Span::styled(
                 format!(
@@ -3793,9 +3781,7 @@ fn workspace_file_matches(needle: &str, limit: usize) -> Vec<String> {
             }
             let rel = path.strip_prefix(&canonical_root).unwrap_or(&path);
             let rel_str = rel.display().to_string();
-            if needle_lc.is_empty()
-                || rel_str.to_ascii_lowercase().contains(&needle_lc)
-            {
+            if needle_lc.is_empty() || rel_str.to_ascii_lowercase().contains(&needle_lc) {
                 out.push(rel_str);
             }
         }
@@ -3835,7 +3821,7 @@ fn render_fs_edit_diff(args: &str) -> Option<String> {
     let mut out = String::new();
     out.push_str(&format!("--- a/{path}\n"));
     out.push_str(&format!("+++ b/{path}\n"));
-    out.push_str(&format!("@@ fs.edit @@\n"));
+    out.push_str("@@ fs.edit @@\n");
     for line in old.lines().take(60) {
         out.push('-');
         out.push(' ');
@@ -3863,9 +3849,9 @@ fn render_fs_write_diff(args: &str) -> Option<String> {
     let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
     let content = v.get("content").and_then(|p| p.as_str()).unwrap_or("");
     let mut out = String::new();
-    out.push_str(&format!("--- /dev/null\n"));
+    out.push_str("--- /dev/null\n");
     out.push_str(&format!("+++ b/{path}\n"));
-    out.push_str(&format!("@@ fs.write @@\n"));
+    out.push_str("@@ fs.write @@\n");
     for line in content.lines().take(120) {
         out.push('+');
         out.push(' ');
@@ -3884,7 +3870,7 @@ fn render_fs_write_diff(args: &str) -> Option<String> {
 /// Cheap shape check: does the string look like a JSON tool call
 /// (`{"tool":"…","args":…}`)? Used to decide whether streamed text
 /// should be promoted into a synthesized `Block::Text` or skipped in
-/// favor of the dispatcher's structured ToolCall + ToolResult blocks.
+/// favor of the dispatcher's structured `ToolCall` + `ToolResult` blocks.
 /// Extract a short, user-meaningful summary from a tool-call's args
 /// JSON. Knows the conventional Stratum tool args ("path", "command",
 /// "query", "url"); falls back to a truncated raw view otherwise.
@@ -3909,9 +3895,8 @@ fn summarize_tool_args(tool: &str, args: &str) -> String {
                 let new_lines = v
                     .get("new_string")
                     .and_then(|x| x.as_str())
-                    .map(|x| x.lines().count())
-                    .unwrap_or(0);
-                s.push_str(&format!(" (-{} +{})", old, new_lines));
+                    .map_or(0, |x| x.lines().count());
+                s.push_str(&format!(" (-{old} +{new_lines})"));
             }
         }
         return s;
@@ -4008,11 +3993,7 @@ fn visual_row_count(lines: &[Line<'_>], inner_w: usize) -> usize {
     let mut total: usize = 0;
     for line in lines {
         let chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-        let rows = if chars == 0 {
-            1
-        } else {
-            chars.div_ceil(w)
-        };
+        let rows = if chars == 0 { 1 } else { chars.div_ceil(w) };
         total = total.saturating_add(rows);
     }
     total
@@ -4242,14 +4223,58 @@ fn highlight_code_line(line: &str, lang: &str, theme: crate::theme::Theme) -> Ve
             "async", "await", "True", "False", "None", "in", "is", "not", "and", "or",
         ],
         "js" | "ts" | "javascript" | "typescript" | "tsx" | "jsx" => &[
-            "function", "const", "let", "var", "if", "else", "for", "while", "return", "class",
-            "extends", "import", "export", "from", "as", "new", "this", "async", "await", "try",
-            "catch", "finally", "throw", "typeof", "instanceof", "in", "of",
+            "function",
+            "const",
+            "let",
+            "var",
+            "if",
+            "else",
+            "for",
+            "while",
+            "return",
+            "class",
+            "extends",
+            "import",
+            "export",
+            "from",
+            "as",
+            "new",
+            "this",
+            "async",
+            "await",
+            "try",
+            "catch",
+            "finally",
+            "throw",
+            "typeof",
+            "instanceof",
+            "in",
+            "of",
         ],
         "go" => &[
-            "func", "var", "const", "type", "struct", "interface", "package", "import", "if",
-            "else", "for", "return", "switch", "case", "default", "break", "continue", "go", "chan",
-            "select", "defer", "map", "range",
+            "func",
+            "var",
+            "const",
+            "type",
+            "struct",
+            "interface",
+            "package",
+            "import",
+            "if",
+            "else",
+            "for",
+            "return",
+            "switch",
+            "case",
+            "default",
+            "break",
+            "continue",
+            "go",
+            "chan",
+            "select",
+            "defer",
+            "map",
+            "range",
         ],
         _ => &[],
     };
@@ -4330,12 +4355,13 @@ fn highlight_code_line(line: &str, lang: &str, theme: crate::theme::Theme) -> Ve
 
 fn render_block(block: &Block) -> Vec<Line<'static>> {
     match block {
-        Block::Text { text } => {
-            render_markdown(
-                text,
-                Some(("ai:  ".to_string(), Style::default().add_modifier(Modifier::BOLD))),
-            )
-        }
+        Block::Text { text } => render_markdown(
+            text,
+            Some((
+                "ai:  ".to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+        ),
         Block::ToolCall { tool, args, .. } => {
             // Parse the tool-call args JSON and surface the
             // user-meaningful key (path / cmd / query) instead of the
@@ -4583,10 +4609,7 @@ fn run_external_editor<B: Backend>(
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".to_string());
 
-    let tmp = std::env::temp_dir().join(format!(
-        "stratum-edit-{}.txt",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("stratum-edit-{}.txt", std::process::id()));
     {
         let mut f = std::fs::File::create(&tmp).map_err(map_io_error)?;
         f.write_all(seed.as_bytes()).map_err(map_io_error)?;
@@ -4594,9 +4617,7 @@ fn run_external_editor<B: Backend>(
 
     // Suspend the TUI so the editor owns the terminal.
     restore_terminal();
-    let status = std::process::Command::new(&editor)
-        .arg(&tmp)
-        .status();
+    let status = std::process::Command::new(&editor).arg(&tmp).status();
 
     // Restore the TUI before propagating any error or returning.
     let mut stdout = io::stdout();
@@ -5328,7 +5349,7 @@ mod tests {
         assert!(s.transcript().is_empty());
     }
 
-    /// Non-AgentLoop ChatBackend impl proving the seam works for
+    /// Non-AgentLoop `ChatBackend` impl proving the seam works for
     /// future remote / hosted backends. Emits a fixed text block.
     #[derive(Debug)]
     struct FixedTextBackend(String);
@@ -5339,11 +5360,15 @@ mod tests {
             _cancel: &CancelToken,
             chunk_tx: mpsc::Sender<Block>,
         ) -> TurnResult {
-            let _ = chunk_tx.send(Block::Text { text: self.0.clone() });
+            let _ = chunk_tx.send(Block::Text {
+                text: self.0.clone(),
+            });
             TurnResult {
                 turn_id: ctx.turn_id,
                 outcome: TurnOutcome::Success,
-                blocks: vec![Block::Text { text: self.0.clone() }],
+                blocks: vec![Block::Text {
+                    text: self.0.clone(),
+                }],
                 transitions: Vec::new(),
                 events_emitted: Vec::new(),
             }
@@ -5783,7 +5808,10 @@ mod tests {
         assert_eq!(s.chat_scroll, 50);
         let _ = s.execute_palette_command("/clear");
         assert_eq!(s.chat_scroll, 0, "chat_scroll must reset on /clear");
-        assert!(s.streaming_text.is_empty(), "streaming_text must reset on /clear");
+        assert!(
+            s.streaming_text.is_empty(),
+            "streaming_text must reset on /clear"
+        );
     }
 
     #[test]
@@ -5825,8 +5853,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    #[allow(dead_code, reason = "diagnostic for the phantom-blank tool-result row; rerun with --ignored if it crops up again")]
+    #[ignore = "long-running; gated to manual runs"]
+    #[allow(
+        dead_code,
+        reason = "diagnostic for the phantom-blank tool-result row; rerun with --ignored if it crops up again"
+    )]
     fn dump_transcript_lines_for_eyeball() {
         let mut s = state();
         s.transcript.push(Turn::User("Read README.md".into()));
@@ -5870,7 +5901,8 @@ mod tests {
                                 first_text = false;
                                 let rendered = render_markdown(text, None);
                                 for ln in &rendered {
-                                    let txt: String = ln.spans.iter().map(|s| s.content.to_string()).collect();
+                                    let txt: String =
+                                        ln.spans.iter().map(|s| s.content.to_string()).collect();
                                     eprintln!("[{counted}] Text: {txt:?}");
                                     counted += 1;
                                 }
@@ -5878,8 +5910,12 @@ mod tests {
                             other => {
                                 let rendered = render_block(other);
                                 for ln in &rendered {
-                                    let txt: String = ln.spans.iter().map(|s| s.content.to_string()).collect();
-                                    eprintln!("[{counted}] {:?}: {txt:?}", std::mem::discriminant(other));
+                                    let txt: String =
+                                        ln.spans.iter().map(|s| s.content.to_string()).collect();
+                                    eprintln!(
+                                        "[{counted}] {:?}: {txt:?}",
+                                        std::mem::discriminant(other)
+                                    );
                                     counted += 1;
                                 }
                             }
@@ -5945,8 +5981,14 @@ mod tests {
             text.contains(crate::brand::TAGLINE),
             "tagline not visible:\n{text}"
         );
-        assert!(text.contains("tip"), "rotating tip line not visible:\n{text}");
-        assert!(text.contains("Enter to send"), "primary action hint not visible");
+        assert!(
+            text.contains("tip"),
+            "rotating tip line not visible:\n{text}"
+        );
+        assert!(
+            text.contains("Enter to send"),
+            "primary action hint not visible"
+        );
     }
 
     #[test]
@@ -5957,7 +5999,10 @@ mod tests {
         }
         s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
         let text = rendered_text(&s, 80, 20);
-        assert!(!text.contains("Type a message"), "hint should disappear after submit:\n{text}");
+        assert!(
+            !text.contains("Type a message"),
+            "hint should disappear after submit:\n{text}"
+        );
     }
 
     #[test]
@@ -5978,10 +6023,11 @@ mod tests {
     /// Eyeball render — run with `cargo test -- --nocapture
     /// eyeball_chat_render` to print a realistic conversation.
     #[test]
-    #[ignore]
+    #[ignore = "long-running; gated to manual runs"]
     fn eyeball_chat_render() {
         let mut s = state();
-        s.transcript.push(Turn::User("Show me a tiny rust hello-world".into()));
+        s.transcript
+            .push(Turn::User("Show me a tiny rust hello-world".into()));
         s.transcript.push(Turn::Assistant(vec![Block::Text {
             text: "Sure! Here you go:\n\n```rust\nfn main() {\n    println!(\"hello, world\");\n}\n```\n\n- Compile with `cargo run`.\n- It prints to stdout.".into(),
         }]));
@@ -6374,7 +6420,8 @@ mod tests {
         let prompter = TuiPromptResponder::new(Duration::from_secs(1));
         let p = PendingPrompt {
             id: PromptId(99),
-            request: PermissionRequest::ToolUse { args: String::new(),
+            request: PermissionRequest::ToolUse {
+                args: String::new(),
                 tool_id: "fs.write".into(),
             },
             issued_at: SystemTime::UNIX_EPOCH,
@@ -6443,7 +6490,8 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/x"),
         };
         assert!(describe_request(&file).contains("/tmp/x"));
-        let tool = PermissionRequest::ToolUse { args: String::new(),
+        let tool = PermissionRequest::ToolUse {
+            args: String::new(),
             tool_id: "fs.write".into(),
         };
         assert!(describe_request(&tool).contains("fs.write"));
@@ -6454,7 +6502,8 @@ mod tests {
         let mut s = state();
         let pending = PendingPrompt {
             id: PromptId(5),
-            request: PermissionRequest::ToolUse { args: String::new(),
+            request: PermissionRequest::ToolUse {
+                args: String::new(),
                 tool_id: "fs.write".into(),
             },
             issued_at: SystemTime::UNIX_EPOCH,
@@ -6472,7 +6521,8 @@ mod tests {
         let mut s = state();
         let pending = PendingPrompt {
             id: PromptId(6),
-            request: PermissionRequest::ToolUse { args: String::new(),
+            request: PermissionRequest::ToolUse {
+                args: String::new(),
                 tool_id: "fs.write".into(),
             },
             issued_at: SystemTime::UNIX_EPOCH,
@@ -6488,7 +6538,8 @@ mod tests {
         let s = state();
         let pending = PendingPrompt {
             id: PromptId(7),
-            request: PermissionRequest::ToolUse { args: String::new(),
+            request: PermissionRequest::ToolUse {
+                args: String::new(),
                 tool_id: "fs.write".into(),
             },
             issued_at: SystemTime::UNIX_EPOCH,

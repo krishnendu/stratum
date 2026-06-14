@@ -42,7 +42,7 @@ impl CandleProvider {
     /// smaller value if the model has a hard limit.
     ///
     /// # Errors
-    /// Returns `Err` when `n_ctx == 0` (matches the LlamaCppProvider
+    /// Returns `Err` when `n_ctx == 0` (matches the `LlamaCppProvider`
     /// contract).
     pub fn open(model_path: std::path::PathBuf, n_ctx: u32) -> Result<Self, String> {
         if n_ctx == 0 {
@@ -68,7 +68,7 @@ impl CandleProvider {
 }
 
 impl Provider for CandleProvider {
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "candle"
     }
 
@@ -85,8 +85,7 @@ impl Provider for CandleProvider {
         // is approved.
         vec![
             Block::Text {
-                text: "(candle provider scaffold — model load not yet implemented)"
-                    .to_string(),
+                text: "(candle provider scaffold — model load not yet implemented)".to_string(),
             },
             Block::Done,
         ]
@@ -140,11 +139,7 @@ mod tests {
             history: Vec::new(),
             sampler: crate::provider::SamplerParams::default(),
         };
-        let blocks = <CandleProvider as Provider>::generate(
-            &p,
-            &req,
-            &CancelToken::new(),
-        );
+        let blocks = <CandleProvider as Provider>::generate(&p, &req, &CancelToken::new());
         assert_eq!(blocks.len(), 2);
         assert!(matches!(blocks[0], Block::Text { .. }));
         assert!(matches!(blocks[1], Block::Done));
