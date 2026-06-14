@@ -79,6 +79,11 @@ pub const ALLOWLIST: &[&str] = &[
     "E_DISPATCH_EDIT_AMBIGUOUS",
     "E_DISPATCH_EDIT_NOT_FOUND",
     "E_DISPATCH_WRITE_FAILED",
+    "E_PLUGIN_BAD_OUTPUT",
+    "E_PLUGIN_TIMEOUT",
+    "E_PLUGIN_SPAWN_FAILED",
+    "E_PLUGIN_NO_MATCH",
+    "E_PLUGIN_INVOCATION_ENCODING",
 ];
 
 /// Outcome of a single `run()` invocation.

@@ -351,7 +351,12 @@ fn blocks_to_transcript_blocks(blocks: &[Block]) -> Vec<TranscriptBlock> {
             Block::ToolResult { .. }
             | Block::Usage { .. }
             | Block::Done
-            | Block::Cancelled { .. } => {
+            | Block::Cancelled { .. }
+            // Multi-modal blocks are not yet emitted by any provider;
+            // drop them from the transcript for now. TODO: persist as a
+            // transcript variant once we have a renderable shape.
+            | Block::Image { .. }
+            | Block::Audio { .. } => {
                 // intentionally not surfaced in the transcript
             }
         }

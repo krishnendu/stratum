@@ -4704,6 +4704,8 @@ fn render_block(out: &mut dyn Write, block: &Block) -> std::io::Result<()> {
         Block::Cancelled { reason } => writeln!(out, "(cancelled: {reason})"),
         Block::ToolCall { tool, .. } => writeln!(out, "(tool_call: {tool})"),
         Block::ToolResult { id, .. } => writeln!(out, "(tool_result: {id})"),
+        Block::Image { mime, .. } => writeln!(out, "(image: {mime})"),
+        Block::Audio { mime, .. } => writeln!(out, "(audio: {mime})"),
     }
 }
 

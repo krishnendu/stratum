@@ -1,0 +1,25 @@
+# Snippet: add to the `stratum` package's `Cargo.toml` (NOT the workspace root)
+# to enable `cargo generate-rpm`. Do NOT paste this file verbatim — it is documentation only.
+#
+# Once wired, run:  cargo generate-rpm --target x86_64-unknown-linux-gnu
+
+[package.metadata.generate-rpm]
+license = "Apache-2.0 OR MIT"
+summary = "Local-first LLM TUI"
+# `assets` is required even when using the default `target/release/<bin>` layout, because
+# cargo-generate-rpm needs explicit mode/owner metadata for each path it ships.
+assets = [
+    { source = "target/release/stratum", dest = "/usr/bin/stratum", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/stratum/README", mode = "644", doc = true },
+    { source = "docs/release-process.md", dest = "/usr/share/doc/stratum/release-process.md", mode = "644", doc = true },
+]
+# Auto-detect shared library deps from the compiled binary. Without this, RPM will not
+# pull in glibc / libgcc_s on minimal Fedora installs.
+auto-req = "auto"
+
+# Optional: per-target asset override for the cross-compiled aarch64 build.
+#
+# [package.metadata.generate-rpm.variants.aarch64]
+# assets = [
+#     { source = "target/aarch64-unknown-linux-gnu/release/stratum", dest = "/usr/bin/stratum", mode = "755" },
+# ]

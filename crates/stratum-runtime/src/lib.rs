@@ -39,6 +39,12 @@ pub mod agent_registry_loader;
 pub mod agent_session;
 /// User-agent loader.
 pub mod agents;
+/// `AnthropicApiJudge` — metered HTTP transport for the Stratum LLM-judge.
+///
+/// Opt-in alternative to the default subscription-backed
+/// [`claude_cli_judge`] subprocess; speaks the Anthropic Messages API
+/// over `ureq`.
+pub mod anthropic_api_judge;
 /// Per-turn budget tracker layered over an `AgentBudget` + `CancelToken`.
 pub mod budget;
 /// Session-level cumulative budget meter (totals + per-role breakdown + hard cap).
@@ -203,6 +209,8 @@ pub mod tool_dispatcher_mcp;
 pub mod tool_dispatchers;
 /// Tool invocation data shape + dispatcher trait (Phase 3 scaffold).
 pub mod tool_invocation;
+/// Third-party tool plugin SDK — manifest + filesystem registry + subprocess dispatcher.
+pub mod tool_plugin;
 /// Per-tool-call timeout policy + RAII timer guard.
 pub mod tool_timeout;
 /// Tool registry and capability matrix.
@@ -232,6 +240,7 @@ pub use agent_registry_loader::{
 };
 pub use agent_session::{AgentSession, SessionError};
 pub use agents::{AgentBudget, AgentDef, AgentLoader};
+pub use anthropic_api_judge::{synth_anthropic_body, AnthropicApiConfig, AnthropicApiJudge};
 pub use budget::{BudgetCheck, BudgetTracker};
 pub use budget_meter::{estimate_cost_micro_usd, BudgetMeter, BudgetMeterError, BudgetTotals};
 pub use cancel::CancelToken;
@@ -376,6 +385,10 @@ pub use tool_dispatchers::{
 pub use tool_invocation::{
     quick_dispatch, DenyDispatcher, DispatchError, EchoDispatcher, RegistryDispatcher,
     ToolDispatcher, ToolInvocation, ToolResult,
+};
+pub use tool_plugin::{
+    FileSystemPluginRegistry, ToolPlugin, ToolPluginDispatcher, ToolPluginLoadError,
+    ToolPluginManifest, ToolPluginRegistry, DEFAULT_PLUGIN_TIMEOUT_MS,
 };
 pub use tool_timeout::{
     record_outcome, run_with_timeout, ToolTimeoutError, ToolTimeoutGuard, ToolTimeoutPolicy,

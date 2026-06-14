@@ -276,6 +276,11 @@ fn forward_block(events: &Sender<BackendEvent>, block: &Block) -> Result<(), ()>
         Block::Cancelled { reason } => BackendEvent::Cancelled {
             reason: reason.clone(),
         },
+        // Multimodal payloads are not yet modelled by BackendEvent —
+        // surface a text placeholder so the TUI stream still gets a
+        // visible cue without smuggling binary bytes through the seam.
+        Block::Image { mime, .. } => BackendEvent::TextChunk(format!("[image: {mime}]")),
+        Block::Audio { mime, .. } => BackendEvent::TextChunk(format!("[audio: {mime}]")),
         Block::Done => BackendEvent::Done,
     };
     events.send(ev).map_err(|_| ())

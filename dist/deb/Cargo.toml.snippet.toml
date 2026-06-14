@@ -1,0 +1,29 @@
+# Snippet: add to the `stratum` package's `Cargo.toml` (NOT the workspace root)
+# to enable `cargo deb`. Do NOT paste this file verbatim — it is documentation only.
+#
+# Once wired, run:  cargo deb --target x86_64-unknown-linux-gnu
+
+[package.metadata.deb]
+maintainer = "Krishnendu Chatterjee <krishnenduchatterjee25@gmail.com>"
+copyright = "2026, Krishnendu Chatterjee <krishnenduchatterjee25@gmail.com>"
+license-file = ["LICENSE", "0"]
+extended-description = """
+Stratum is a local-first LLM TUI: chat, agents, evals, and self-update,
+running fully offline against on-device GGUF models via llama.cpp.
+"""
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/stratum", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/stratum/README", "644"],
+    ["docs/release-process.md", "usr/share/doc/stratum/release-process.md", "644"],
+]
+
+# Optional: per-target overrides. Useful when the binary lives at a non-default path
+# (e.g. cross-compiled via cargo-zigbuild).
+#
+# [package.metadata.deb.variants.aarch64]
+# assets = [
+#     ["target/aarch64-unknown-linux-gnu/release/stratum", "usr/bin/", "755"],
+# ]

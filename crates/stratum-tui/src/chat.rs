@@ -824,6 +824,18 @@ impl ChatState {
                                 kind: TranscriptBlockKind::Text,
                                 text: format!("[cancelled] {reason}"),
                             }),
+                            // Image / Audio are multimodal payloads — we
+                            // do not serialise binary bytes into the
+                            // text-only transcript schema yet; drop a
+                            // placeholder so the turn count stays right.
+                            Block::Image { mime, .. } => Some(TranscriptBlock {
+                                kind: TranscriptBlockKind::Text,
+                                text: format!("[image: {mime}]"),
+                            }),
+                            Block::Audio { mime, .. } => Some(TranscriptBlock {
+                                kind: TranscriptBlockKind::Text,
+                                text: format!("[audio: {mime}]"),
+                            }),
                             Block::Usage { .. } | Block::Done => None,
                         })
                         .collect();
@@ -4374,6 +4386,14 @@ fn render_block(block: &Block) -> Vec<Line<'static>> {
         Block::Cancelled { reason } => vec![Line::from(Span::styled(
             format!("(cancelled: {reason})"),
             Style::default().add_modifier(Modifier::ITALIC),
+        ))],
+        Block::Image { mime, .. } => vec![Line::from(Span::styled(
+            format!("(image: {mime})"),
+            Style::default().add_modifier(Modifier::DIM),
+        ))],
+        Block::Audio { mime, .. } => vec![Line::from(Span::styled(
+            format!("(audio: {mime})"),
+            Style::default().add_modifier(Modifier::DIM),
         ))],
         Block::Done => Vec::new(),
     }
