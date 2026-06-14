@@ -51,8 +51,12 @@ class Stratum < Formula
   end
 
   test do
-    # Sanity: echo provider runs without a real LLM dep.
-    assert_match "echo", shell_output("#{bin}/stratum --json doctor")
+    # `doctor --json` is the most stable smoke surface: a single
+    # subcommand, no provider or model state, prints a JSON document
+    # with documented top-level keys from `DoctorReport`.
+    output = shell_output("#{bin}/stratum --json doctor")
+    assert_match "schema_version", output
+    assert_match "stratum_version", output
     # Non-zero return on missing subcommand should be exit 64.
     output = shell_output("#{bin}/stratum bogus 2>&1", 64)
     assert_match "Usage", output
