@@ -407,6 +407,16 @@ mod tests {
         }
     }
 
+    /// Builds a ToolCall block with `args: "{}"`. **Only safe for
+    /// tools that have no required args in `missing_required_args` —
+    /// e.g. the synthetic `"echo"` used in dispatcher and budget
+    /// tests.** Calling this with a tool that *does* have a required
+    /// schema (e.g. `fs.read` needs `path`) will short-circuit through
+    /// the schema gate (`validate_tool_args = true` in production
+    /// factory) and surface `STRAT-E5006` instead of whatever
+    /// downstream gate the test was trying to exercise. For real
+    /// tools, use [`fs_read_call`] or build a `Block::ToolCall`
+    /// inline with the required args populated.
     fn tool_call(id: &str, tool: &str) -> Block {
         Block::ToolCall {
             id: id.into(),

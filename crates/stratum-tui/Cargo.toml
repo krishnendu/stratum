@@ -1,6 +1,6 @@
 [package]
 name         = "stratum-tui"
-description  = "Stratum TUI — palette, themes, brand assets. Backend-agnostic."
+description  = "Stratum TUI — palette, themes, brand assets, chat renderer. Workspace-internal."
 version      = { workspace = true }
 edition      = { workspace = true }
 rust-version = { workspace = true }
@@ -11,6 +11,11 @@ homepage     = { workspace = true }
 readme       = { workspace = true }
 keywords     = { workspace = true }
 categories   = { workspace = true }
+# Workspace-internal: chat.rs surfaces a broad pub API by design (the
+# CLI re-exports it via `pub use stratum_tui::chat::*`) and we do not
+# want to commit to a semver contract over that surface for third-party
+# consumers. The CLI binary is the only intended downstream.
+publish      = false
 
 [lints]
 workspace = true

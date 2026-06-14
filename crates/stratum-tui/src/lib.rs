@@ -5,6 +5,13 @@
 //! full chat renderer. The CLI binary depends on this crate; it
 //! does NOT depend on `stratum-runtime` directly.
 //!
+//! ## Workspace-internal — no semver
+//!
+//! `Cargo.toml` sets `publish = false`. The `chat` module re-exports a
+//! broad `pub` surface for the CLI's convenience (via `pub use
+//! stratum_tui::chat::*`); that surface is **not** a public API
+//! commitment. External consumers must not depend on it.
+//!
 //! ## Current scope (this landing)
 //!
 //! - `palette` — slash-command catalog + filter state

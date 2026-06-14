@@ -317,7 +317,6 @@ mod tests {
     #[test]
     fn end_to_end_settings_file_change_fires_event() {
         use std::io::Write;
-        use std::time::Instant;
 
         let tmp = tempfile::TempDir::new().expect("tmp");
         let settings = tmp.path().join("settings.json");
@@ -340,18 +339,14 @@ mod tests {
         writeln!(f, "{{\"a\":1}}").expect("write");
         drop(f);
 
-        // Poll up to 2 s for the event. The watcher is debounced at
-        // 250 ms by default so we expect to see the event well within.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut got = None;
-        while Instant::now() < deadline {
-            if let Ok(ev) = handle.events.try_recv() {
-                got = Some(ev);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        let ev = got.expect("expected ReloadEvent::Settings within 2s");
+        // Use `recv_timeout` instead of a busy-poll loop so the test is
+        // not sensitive to a sleep granularity / scheduling jitter on
+        // slow runners. The 250 ms debounce + a generous safety margin
+        // gives FSEvents / inotify enough headroom under contention.
+        let ev = handle
+            .events
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected ReloadEvent::Settings within 5s");
         match ev {
             ReloadEvent::Settings { path } => {
                 assert_eq!(path.file_name().unwrap(), settings.file_name().unwrap());

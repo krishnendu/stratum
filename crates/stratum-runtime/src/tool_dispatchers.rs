@@ -1413,7 +1413,10 @@ impl ToolDispatcher for ReadImageToolDispatcher {
                 )
             }
         };
-        let joined = self.root.join(&requested);
+        // Join against the *canonical* root, not the raw `self.root` —
+        // matters if `self.root` is itself a symlink that resolves
+        // elsewhere, so we evaluate the descent from a stable anchor.
+        let joined = canonical_root.join(&requested);
         let canonical_target = match joined.canonicalize() {
             Ok(p) => p,
             Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("path unreadable: {e}")),
@@ -1621,6 +1624,11 @@ fn run_git(
             "git not on PATH",
         )));
     };
+    // Neutralize hook-execution surfaces in ~/.gitconfig and
+    // /etc/gitconfig — `diff.external`, custom `core.pager`,
+    // credential helpers, etc. — even when HOME is honored. Without
+    // these, env_clear is not enough: git still reads the user's
+    // global config and would invoke any external command it names.
     let mut cmd = std::process::Command::new(&git_bin);
     cmd.args(args)
         .current_dir(cwd)
@@ -1628,6 +1636,8 @@ fn run_git(
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", std::env::var_os("HOME").unwrap_or_default())
         .env("GIT_PAGER", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("LANG", "C.UTF-8")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1671,10 +1681,18 @@ fn run_git(
 }
 
 /// Refs (sha, branch, tag) accept `[A-Za-z0-9._/-]` and must be 1..=80
-/// chars. Refuses leading `-` so it can't be parsed as a flag, and refuses
-/// `..` which `git` treats as a range and we cannot validate further.
+/// chars. Refuses leading `-` so it can't be parsed as a flag, refuses
+/// `..` which `git` treats as a range we cannot validate further, and
+/// refuses anything starting or ending with `/` so a value like `/` or
+/// `v1/` is not silently re-interpreted as a pathspec by git.
 fn is_safe_ref(s: &str) -> bool {
-    if s.is_empty() || s.len() > 80 || s.starts_with('-') || s.contains("..") {
+    if s.is_empty()
+        || s.len() > 80
+        || s.starts_with('-')
+        || s.starts_with('/')
+        || s.ends_with('/')
+        || s.contains("..")
+    {
         return false;
     }
     s.chars()
@@ -2486,6 +2504,12 @@ mod tests {
         assert!(!is_safe_ref("HEAD;rm -rf /"));
         assert!(!is_safe_ref("--all"));
         assert!(!is_safe_ref(&"a".repeat(200)));
+        // A leading or trailing slash trips git's pathspec heuristic
+        // on some platforms — refuse so the parser stays in revision
+        // mode unambiguously.
+        assert!(!is_safe_ref("/"));
+        assert!(!is_safe_ref("/main"));
+        assert!(!is_safe_ref("v1.0/"));
     }
 
     #[test]
