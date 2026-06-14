@@ -958,6 +958,7 @@ impl ToolDispatcher for SubagentToolDispatcher {
             system_override: Some(sub.prompt.clone()),
             history: Vec::new(),
             sampler: crate::provider::SamplerParams::default(),
+            attachments: Vec::new(),
         };
         let cancel = crate::cancel::CancelToken::new();
         let blocks = self.provider.generate(&req, &cancel);
@@ -1703,6 +1704,34 @@ fn is_safe_ref(s: &str) -> bool {
 }
 
 // ---- image helpers -------------------------------------------------------
+
+/// Sniff the MIME type of an image from its raw bytes (falling back to
+/// the file extension when the magic-byte prefix is ambiguous).
+///
+/// Returns `None` only when neither the byte prefix nor the extension is
+/// a recognised image format. Pulled out of [`ReadImageToolDispatcher`]
+/// so the TUI palette path (`/image <path>`) can reuse the exact same
+/// sniff logic without going through the full dispatcher invocation.
+//
+// `pub` so the chat module can construct a `Block::Image` from a user
+// path without re-deriving the magic-byte / extension table.
+#[must_use]
+pub fn sniff_image_mime_public(path: &Path, bytes: &[u8]) -> Option<&'static str> {
+    sniff_image_mime(path, bytes)
+}
+
+/// Encode bytes as standard-alphabet base64 with `=` padding.
+///
+/// Mirror of [`base64_encode`], exposed so callers outside this module
+/// (notably the chat TUI's `/image` palette command) can produce the
+/// same payload shape that [`ReadImageToolDispatcher`] writes into a
+/// `Block::Image`.
+//
+// `pub` for the same reason as `sniff_image_mime_public`.
+#[must_use]
+pub fn base64_encode_public(bytes: &[u8]) -> String {
+    base64_encode(bytes)
+}
 
 fn sniff_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
     // Magic-byte sniff first; fall back to extension if the bytes are

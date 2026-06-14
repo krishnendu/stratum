@@ -113,6 +113,8 @@ impl ReviewerPass {
                 top_p: Some(0.85),
                 repeat_penalty: None,
             },
+            // Reviewer judges text drafts only — no multimodal seam.
+            attachments: Vec::new(),
         };
         let blocks = self.provider.generate(&req, cancel);
         let text = blocks

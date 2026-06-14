@@ -2952,6 +2952,9 @@ fn chat_parallel_prompt(
         turn_id: TurnId(0),
         started_at: SystemTime::now(),
         history: Vec::new(),
+        // CLI `--parallel` entrypoint: text-only; multimodal stays on
+        // the chat surface.
+        attachments: Vec::new(),
     };
     let intent = IntentRouter::default().classify(prompt);
     let cancel = CancelToken::new();
@@ -4823,6 +4826,7 @@ fn echo(json: bool, prompt: &[String], max_blocks: u32, out: &mut dyn Write) -> 
         system_override: None,
         history: Vec::new(),
         sampler: stratum_runtime::SamplerParams::default(),
+        attachments: Vec::new(),
     };
     let cancel = CancelToken::new();
     let blocks = provider.generate(&request, &cancel);

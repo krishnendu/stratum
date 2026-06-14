@@ -72,6 +72,18 @@ pub struct GenerateRequest {
     /// every knob unset and the provider uses its own defaults.
     #[serde(default)]
     pub sampler: SamplerParams,
+    /// Multimodal attachments for THIS turn. Only `Block::Image` and
+    /// `Block::Audio` variants are meaningful here — other variants are
+    /// ignored by every provider. Text-only providers MUST tolerate a
+    /// populated `attachments` field (typically by ignoring it with a
+    /// debug log); the upcoming vision-head provider will consume the
+    /// list and feed bytes through `--mmproj`.
+    //
+    // TODO(plan/05): wire <vision-model> — the actual provider that
+    // turns these bytes into model input still has to land. Until
+    // then, every shipped provider drops attachments on the floor.
+    #[serde(default)]
+    pub attachments: Vec<Block>,
 }
 
 impl Eq for GenerateRequest {}
@@ -153,6 +165,18 @@ impl Provider for EchoProvider {
     /// The provider polls `cancel` between words and emits `Block::Cancelled`
     /// when the token fires.
     fn generate(&self, request: &GenerateRequest, cancel: &CancelToken) -> Vec<Block> {
+        // TODO(plan/05): wire <vision-model> — EchoProvider is text-only
+        // and the Phase-5 multimodal seam intentionally drops the bytes
+        // here rather than panicking. Log so tests/dev sessions can spot
+        // the seam being exercised even before a vision provider lands.
+        if !request.attachments.is_empty() {
+            tracing::debug!(
+                target: "stratum.provider.echo",
+                count = request.attachments.len(),
+                "EchoProvider received {} multimodal attachment(s); ignoring (no vision head)",
+                request.attachments.len()
+            );
+        }
         let mut out = Vec::new();
         let mut emitted = 0_u32;
         let mut prompt_tokens = 0_u32;
@@ -193,6 +217,7 @@ mod tests {
             system_override: None,
             history: Vec::new(),
             sampler: SamplerParams::default(),
+            attachments: Vec::new(),
         }
     }
 

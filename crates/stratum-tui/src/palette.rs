@@ -46,6 +46,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "exit", help: "Exit the TUI." },
     Command { name: "export", help: "Dump the chat transcript to a file. Usage: /export [path]." },
     Command { name: "help", help: "Show available commands." },
+    Command { name: "image", help: "Attach an image to the next turn. Usage: /image <path>." },
     Command { name: "init", help: "Scaffold STRATUM.md for the current workspace." },
     Command { name: "model", help: "Show active model, or alias for /switch <slug>." },
     Command { name: "models", help: "List available models from the catalog." },

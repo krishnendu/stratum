@@ -176,6 +176,10 @@ impl BackendApi for LocalBackend {
                 turn_id: stratum_runtime::TurnId(turn_seq),
                 history: Vec::new(),
                 started_at: SystemTime::now(),
+                // TODO(plan/05): wire <vision-model> — the wire-protocol
+                // request shape currently has no attachments field. When
+                // it does, decode and forward here.
+                attachments: Vec::new(),
             };
             let (chunk_tx, chunk_rx) = mpsc::channel::<Block>();
             let events_forward = events.clone();

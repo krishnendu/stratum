@@ -151,6 +151,15 @@ impl Default for AgentLoopConfig {
 // ---------------------------------------------------------------------------
 
 /// Inputs to a single [`AgentLoop::run_turn`].
+///
+/// Multimodal attachments (`Block::Image`, `Block::Audio`) staged for
+/// this turn are carried on [`TurnContext::attachments`]. The agent loop
+/// forwards them verbatim to the provider via
+/// [`crate::provider::GenerateRequest::attachments`] — non-vision
+/// providers ignore the field. This is the seam Phase 5 (`plan/05`)
+/// reserves for the upcoming Gemma 4 E4B vision head; today's text-only
+/// providers (`EchoProvider`, `LlamaCppProvider`) drop the field with a
+/// log line.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnContext {
     /// Raw user prompt.
@@ -169,6 +178,17 @@ pub struct TurnContext {
     /// caller before insertion here.
     #[serde(default)]
     pub history: Vec<crate::provider::ChatHistoryTurn>,
+    /// Multimodal attachments staged for this turn — `Block::Image`
+    /// and `Block::Audio` only. The agent loop forwards these to the
+    /// provider through `GenerateRequest::attachments`; text-only
+    /// providers ignore them. Empty for a plain-text turn.
+    //
+    // TODO(plan/05): wire <vision-model> — consume these on the
+    // Gemma 4 E4B vision-head path (llama.cpp `--mmproj`) so the
+    // model actually sees the bytes instead of dropping them on
+    // the floor.
+    #[serde(default)]
+    pub attachments: Vec<Block>,
 }
 
 /// Output of [`AgentLoop::run_turn`].
@@ -553,6 +573,11 @@ impl AgentLoop {
         // 5. Build the request + run the provider on a worker thread so
         //    the deadline can be enforced. The provider polls `cancel`
         //    between tokens; we cancel the child token on deadline.
+        //
+        // `attachments` is forwarded verbatim — the multimodal seam
+        // (`plan/05`) terminates inside the provider, not here. Today's
+        // shipped providers ignore the field; the Phase-5 vision-head
+        // provider will consume it.
         let req = GenerateRequest {
             model: ctx.model.clone(),
             prompt: ctx.user_prompt.clone(),
@@ -560,6 +585,7 @@ impl AgentLoop {
             system_override: None,
             history: ctx.history.clone(),
             sampler: crate::provider::SamplerParams::default(),
+            attachments: ctx.attachments.clone(),
         };
         let child_cancel = cancel.child();
 
@@ -1068,6 +1094,10 @@ impl AgentLoop {
                 turn_id: ctx.turn_id,
                 started_at: ctx.started_at,
                 history: ctx.history.clone(),
+                // Attachments belong to the user's NEXT explicit turn,
+                // not to a tool-driven continuation in the middle of an
+                // agentic step. Drop them on the recursive hop.
+                attachments: Vec::new(),
             };
             let sub = self.run_turn_inner(next_ctx, cancel, chunk_tx, step.saturating_add(1));
             // Merge the inner step's blocks + events into ours and adopt
@@ -1447,6 +1477,7 @@ mod tests {
             turn_id: TurnId(1),
             started_at: t0(),
             history: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -2241,6 +2272,7 @@ mod tests {
                 system_override: None,
                 history: Vec::new(),
                 sampler: crate::provider::SamplerParams::default(),
+                attachments: Vec::new(),
             },
             &CancelToken::new(),
         );
@@ -2253,6 +2285,7 @@ mod tests {
                 system_override: None,
                 history: Vec::new(),
                 sampler: crate::provider::SamplerParams::default(),
+                attachments: Vec::new(),
             },
             &CancelToken::new(),
         );
@@ -2275,6 +2308,7 @@ mod tests {
                 system_override: None,
                 history: Vec::new(),
                 sampler: crate::provider::SamplerParams::default(),
+                attachments: Vec::new(),
             },
             &cancel,
         );
@@ -2291,6 +2325,7 @@ mod tests {
                 system_override: None,
                 history: Vec::new(),
                 sampler: crate::provider::SamplerParams::default(),
+                attachments: Vec::new(),
             },
             &CancelToken::new(),
         );

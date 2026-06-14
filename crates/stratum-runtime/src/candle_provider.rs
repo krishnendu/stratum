@@ -138,6 +138,7 @@ mod tests {
             system_override: None,
             history: Vec::new(),
             sampler: crate::provider::SamplerParams::default(),
+            attachments: Vec::new(),
         };
         let blocks = <CandleProvider as Provider>::generate(&p, &req, &CancelToken::new());
         assert_eq!(blocks.len(), 2);
