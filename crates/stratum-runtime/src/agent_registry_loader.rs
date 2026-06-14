@@ -951,6 +951,7 @@ sandbox = "passthrough"
             model: ModelId::from("echo"),
             turn_id: TurnId(1),
             started_at: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            history: Vec::new(),
         }
     }
 

@@ -1,0 +1,5 @@
+{"name":"fidelity-path-preserved","model_output":"the user is asking about the file src/main.rs in the workspace","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"src/main.rs"}}
+{"name":"fidelity-error-code-preserved","model_output":"the error STRAT-E5005 means no dispatcher matched the tool name","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"STRAT-E5005"}}
+{"name":"fidelity-json-literal-preserved","model_output":"the config came back as {\"key\":\"value\"} which is valid","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"{\"key\":\"value\"}"}}
+{"name":"fidelity-numeric-preserved","model_output":"found 42 occurrences across 8 files","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"42"}}
+{"name":"fidelity-code-block-preserved","model_output":"here is the function:\n```rust\nfn add(a: i32, b: i32) -> i32 { a + b }\n```","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"```rust"}}

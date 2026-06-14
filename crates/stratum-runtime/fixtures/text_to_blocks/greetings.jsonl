@@ -1,0 +1,5 @@
+{"name":"plain-greeting","model_output":"Hello! How can I help?","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"Hello"}}
+{"name":"greeting-with-name","model_output":"Hi there! What can I do for you today?","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"Hi"}}
+{"name":"capability-question","model_output":"I can list files, search code, read/edit/write files, and run a few shell commands.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"list files"}}
+{"name":"identity-question","model_output":"I'm Stratum, a friendly local coding assistant.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"Stratum"}}
+{"name":"polite-decline","model_output":"I can't run that command — it isn't on my read-only allowlist.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"allowlist"}}

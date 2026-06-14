@@ -352,7 +352,7 @@ struct ServeArgs {
     model: Option<String>,
     /// Logical context window passed to the llama.cpp provider, in
     /// tokens. Only used together with `--model`.
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 8192)]
     ctx: u32,
     /// Emit a single JSON object on startup describing the bound
     /// address. Without this flag, a prose line is printed instead.
@@ -462,7 +462,7 @@ struct ChatArgs {
     #[arg(long, value_name = "SLUG")]
     model: Option<String>,
     /// Logical context window passed to the llama.cpp provider, in tokens.
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 8192)]
     ctx: u32,
     /// Maximum number of blocks the provider is allowed to emit per turn.
     #[arg(long = "max-blocks", default_value_t = 1)]
@@ -472,6 +472,12 @@ struct ChatArgs {
     /// open the interactive TUI.
     #[arg(long, value_name = "STR")]
     prompt: Option<String>,
+    /// Output format for `--prompt` mode. `text` (default) streams the
+    /// assistant reply as plain text. `json` emits one structured
+    /// object with blocks + metrics. `stream-json` emits one JSON
+    /// object per block as NDJSON. Per plan/43.
+    #[arg(long = "output-format", value_name = "FMT", default_value = "text")]
+    output_format: String,
     /// Append structured runtime events to this JSONL file (one record per
     /// line; persists across runs).
     #[arg(long = "events-jsonl", value_name = "PATH")]
@@ -484,7 +490,13 @@ struct ChatArgs {
     /// via [`crate::chat::ChatState::with_resumed_transcript`] and (for the
     /// non-interactive `--prompt` path) echoed to stdout in order before the
     /// new turn's response is printed.
-    #[arg(long, value_name = "SESSION_ID")]
+    #[arg(
+        long,
+        value_name = "SESSION_ID",
+        num_args = 0..=1,
+        default_missing_value = "",
+        require_equals = false
+    )]
     resume: Option<String>,
     /// Load custom agent role definitions from `<PATH>/*.toml` and route the
     /// chat through an [`stratum_runtime::AgentHandoff`] keyed off the
@@ -2424,8 +2436,24 @@ fn chat_command(
 
     // Resolve `--resume` up front so a bad / missing / malformed transcript
     // fails before we spin up any provider or write to disk.
+    // `--resume` with no value short-circuits to `sessions list` so the user
+    // can pick an id without remembering it.
     let resumed = match args.resume.as_deref() {
         None => None,
+        Some("") => {
+            // `--resume` with no value: list saved sessions if any,
+            // otherwise fall through to a fresh empty chat. Matches
+            // Claude Code's UX where the user can repeat `--resume`
+            // before they have history.
+            let has_any = open_transcript_store(paths, err)
+                .ok()
+                .and_then(|s| s.list().ok())
+                .is_some_and(|ids| !ids.is_empty());
+            if has_any {
+                return sessions_list(json, paths, out, err);
+            }
+            None
+        }
         Some(raw) => match load_resumed_transcript(raw, paths, err) {
             Ok(t) => Some(t),
             Err(code) => return code,
@@ -2439,16 +2467,59 @@ fn chat_command(
         return chat_with_agents_dir(&dir, args, paths, tier, resumed, json, out, err);
     }
 
-    // Model-resolution flow only runs when --model is set. Without the
-    // `provider-llama-cpp` feature, the only legal mode is EchoProvider —
-    // surface a clear STRAT-E1001 error instead of silently downgrading.
+    // Model-resolution flow.
+    //
+    // 1. Explicit `--model X` wins.
+    // 2. Otherwise, if the `provider-llama-cpp` feature is built in AND the
+    //    catalog has any chat model for this tier, auto-select the smallest
+    //    recommended slug. This makes `stratum chat --prompt hi` use real
+    //    inference by default after `stratum models sync` runs, instead of
+    //    silently downgrading to EchoProvider.
+    // 3. Without the feature or with an empty catalog, fall through to the
+    //    EchoProvider path below.
     if let Some(slug) = args.model.as_deref() {
         return chat_with_model(slug, args, paths, tier, resumed, out, err);
+    }
+    #[cfg(feature = "provider-llama-cpp")]
+    if let Some(slug) = auto_select_model(paths, tier) {
+        return chat_with_model(&slug, args, paths, tier, resumed, out, err);
+    }
+    // First-run UX: provider-llama-cpp built in but catalog empty.
+    // Print a helpful one-shot install command pointing at Gemma 4 E4B
+    // (the documented default) so the user can get a real chat session
+    // running without reading the docs.
+    #[cfg(feature = "provider-llama-cpp")]
+    {
+        let chat_count = ModelCatalog::load(&paths.state.join("models.json"))
+            .map(|c| {
+                c.filter_by_task(stratum_runtime::ModelTask::Chat).len()
+            })
+            .unwrap_or(0);
+        if chat_count == 0 && args.prompt.is_none() {
+            let _ = writeln!(err, "stratum: no chat model in catalog.");
+            let _ = writeln!(err, "");
+            let _ = writeln!(err, "  To install the recommended default (Gemma 4 E4B IT — official Google QAT,");
+            let _ = writeln!(err, "  ~4.8 GB, runs at ~80 tok/s on Apple Silicon Metal), run:");
+            let _ = writeln!(err, "");
+            let _ = writeln!(err, "    stratum models add --slug gemma-4-e4b --family gemma \\\\");
+            let _ = writeln!(err, "      --display-name 'Gemma 4 E4B IT (QAT Q4_0)' \\\\");
+            let _ = writeln!(err, "      --tier high --task chat --size-mib 4916 --quantization q4_0 \\\\");
+            let _ = writeln!(err, "      --url 'https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B_q4_0-it.gguf' \\\\");
+            let _ = writeln!(err, "      --sha256 e8b6a059ba86947a44ace84d6e5679795bc41862c25c30513142588f0e9dba1d \\\\");
+            let _ = writeln!(err, "      --bytes 5154939136 --license gemma");
+            let _ = writeln!(err, "");
+            let _ = writeln!(err, "  Then re-run `stratum chat`. (Falling back to EchoProvider for now.)");
+            let _ = writeln!(err, "");
+        }
     }
 
     // No --model: keep EchoProvider behavior. `--prompt` still works for
     // the scripted path; otherwise fall through to the interactive TUI.
     if let Some(prompt) = args.prompt.as_deref() {
+        if prompt.trim().is_empty() {
+            let _ = writeln!(err, "stratum: --prompt was empty; nothing to send");
+            return ExitCode::from(2);
+        }
         let provider = EchoProvider::new("echo: ");
         let mut state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths));
         if let Some(path) = args.events_jsonl.as_deref() {
@@ -2462,7 +2533,7 @@ fn chat_command(
             state = state.with_resumed_transcript(t);
         }
         state.submit_with_prompt(prompt);
-        return print_assistant_text(&state, out, err);
+        return print_assistant(&state, out, err, &args.output_format);
     }
 
     if let Some(path) = args.events_jsonl.as_deref() {
@@ -2475,7 +2546,7 @@ fn chat_command(
         if let Some(t) = resumed {
             state = state.with_resumed_transcript(t);
         }
-        return match crate::chat::run_with_state(state) {
+        return match crate::chat::run_with_state(state, stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 let _ = writeln!(err, "{e}");
@@ -2492,7 +2563,7 @@ fn chat_command(
         let provider = EchoProvider::new("echo: ");
         let state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths))
             .with_resumed_transcript(t);
-        return match crate::chat::run_with_state(state) {
+        return match crate::chat::run_with_state(state, stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 let _ = writeln!(err, "{e}");
@@ -2611,8 +2682,12 @@ impl CliProviderResolver {
             model_path: target,
             n_ctx: self.n_ctx,
             n_threads: None,
-            n_gpu_layers: 0,
+            n_gpu_layers: 999, // offload all layers when Metal/CUDA available (auto-disabled on CPU-only builds)
             seed: 42,
+            // GBNF stays config-level off; user can force on with
+            // STRATUM_GBNF=1 for one run.
+            enable_gbnf: false,
+            kv_cache_type: stratum_runtime::llama_provider::KvCacheKind::parse(&std::env::var("STRATUM_KV_CACHE").unwrap_or_default()),
         };
         let provider = LlamaCppProvider::open(&cfg)
             .map_err(|e| ProviderResolveError::Backend(format!("open {slug}: {e}")))?;
@@ -2724,10 +2799,14 @@ fn chat_with_agents_dir(
         state = state.with_resumed_transcript(t);
     }
     if let Some(prompt) = args.prompt.as_deref() {
+        if prompt.trim().is_empty() {
+            let _ = writeln!(err, "stratum: --prompt was empty; nothing to send");
+            return ExitCode::from(2);
+        }
         state.submit_with_prompt(prompt);
-        return print_assistant_text(&state, out, err);
+        return print_assistant(&state, out, err, &args.output_format);
     }
-    match crate::chat::run_with_state(state) {
+    match crate::chat::run_with_state(state, stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "{e}");
@@ -2800,6 +2879,7 @@ fn chat_parallel_prompt(
         model: ModelId::from("echo"),
         turn_id: TurnId(0),
         started_at: SystemTime::now(),
+        history: Vec::new(),
     };
     let intent = IntentRouter::default().classify(prompt);
     let cancel = CancelToken::new();
@@ -3054,6 +3134,134 @@ fn chat_with_model(
     ExitCode::from(1)
 }
 
+/// Auto-select a chat model from the catalog when `--model` is omitted.
+///
+/// Returns the recommended slug for the host's tier + chat task, or None
+/// if the catalog is empty / unreadable. Used to make `stratum chat`
+/// default to real inference once `stratum models sync` has populated
+/// the catalog, instead of silently falling back to EchoProvider.
+/// Build a shell-runner closure used by the `!cmd` TUI prefix.
+///
+/// Wraps `ShellToolDispatcher` with a passthrough sandbox + workspace-root
+/// cwd. Splits the user line on whitespace into `command` + `args`, calls
+/// the dispatcher, and renders the JSON body as plain text for the TUI.
+fn build_shell_runner() -> impl Fn(&str) -> Result<String, String> + Send + Sync + 'static {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use stratum_runtime::sandbox::{SandboxBackend, SandboxSpawn};
+    use stratum_runtime::sandbox_resolve::{BackendChoice, ResolvedNet, SandboxLaunchSpec};
+    use stratum_runtime::tool_dispatchers::ShellToolDispatcher;
+    use stratum_runtime::tool_invocation::{ToolDispatcher, ToolInvocation, ToolResult};
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let spec = SandboxLaunchSpec {
+        mounts: Vec::new(),
+        net: ResolvedNet::Loopback,
+        env: BTreeMap::new(),
+        allowed_caps: BTreeSet::new(),
+        denied_caps: BTreeSet::new(),
+        working_dir: cwd,
+        cpu_quota_pct: None,
+        memory_limit_mib: None,
+        backend: BackendChoice::Passthrough,
+    };
+    let spawn = SandboxSpawn::new(SandboxBackend::Passthrough);
+    let dispatcher = ShellToolDispatcher::new(spawn, spec);
+
+    move |line: &str| {
+        let parts: Vec<String> = line.split_whitespace().map(String::from).collect();
+        let Some(command) = parts.first().cloned() else {
+            return Err("empty command".to_string());
+        };
+        let args: Vec<serde_json::Value> = parts
+            .iter()
+            .skip(1)
+            .map(|a| serde_json::Value::String(a.clone()))
+            .collect();
+        let mut args_obj = std::collections::BTreeMap::new();
+        args_obj.insert("command".to_string(), serde_json::Value::String(command));
+        args_obj.insert("args".to_string(), serde_json::Value::Array(args));
+        let inv = ToolInvocation {
+            tool_id: "shell.exec".to_string(),
+            args: args_obj,
+            capability: "shell.exec".to_string(),
+            turn_id: 0,
+        };
+        match dispatcher.invoke(&inv) {
+            ToolResult::Ok { body, .. } => Ok(body
+                .get("stdout")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()),
+            ToolResult::Err { code, message, .. } => Err(format!("{code}: {message}")),
+        }
+    }
+}
+
+#[cfg(feature = "provider-llama-cpp")]
+fn catalog_slugs(paths: &Paths) -> Vec<String> {
+    let catalog_path = paths.state.join("models.json");
+    let Ok(catalog) = ModelCatalog::load(&catalog_path) else {
+        return Vec::new();
+    };
+    catalog
+        .filter_by_task(ModelTask::Chat)
+        .into_iter()
+        .map(|e| e.slug.as_ref().to_owned())
+        .collect()
+}
+
+#[cfg(feature = "provider-llama-cpp")]
+fn auto_select_model(paths: &Paths, host_tier: Tier) -> Option<String> {
+    let catalog_path = paths.state.join("models.json");
+    let catalog = ModelCatalog::load(&catalog_path).ok()?;
+    let cli_tier = match host_tier {
+        Tier::Low => ModelTier::Low,
+        Tier::Medium => ModelTier::Medium,
+        Tier::High => ModelTier::High,
+    };
+    // Hard preference list. Gemma 4 E4B wins by default: official Google
+    // QAT GGUF, fast (MatFormer ~4B effective), follows tool-call rules
+    // well. Coder-tuned models are listed lower so users can manually
+    // /switch when they want more aggressive tool emission.
+    const PREFERRED: &[&str] = &[
+        "gemma-4-e4b",
+        "gemma-3-4b",
+        "qwen-coder-7b",
+        "qwen-7b",
+    ];
+    for pref in PREFERRED {
+        if let Ok(slug) = pref.parse() {
+            if catalog
+                .get(&slug)
+                .is_some_and(|e| e.task.contains(&ModelTask::Chat))
+            {
+                return Some((*pref).to_owned());
+            }
+        }
+    }
+    // Fallback: walk from host tier DOWN, exact-tier match. Pick the
+    // first entry at that tier when no preferred slug is installed.
+    let walk: &[ModelTier] = match cli_tier {
+        ModelTier::Xl => &[ModelTier::Xl, ModelTier::High, ModelTier::Medium, ModelTier::Low],
+        ModelTier::High => &[ModelTier::High, ModelTier::Medium, ModelTier::Low],
+        ModelTier::Medium => &[ModelTier::Medium, ModelTier::Low],
+        ModelTier::Low => &[ModelTier::Low],
+    };
+    for tier in walk {
+        let entries: Vec<&_> = catalog
+            .filter_by_tier(*tier)
+            .into_iter()
+            .filter(|e| e.task.contains(&ModelTask::Chat))
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        return Some(entries[0].slug.as_ref().to_owned());
+    }
+    None
+}
+
 #[cfg(feature = "provider-llama-cpp")]
 fn chat_with_model(
     slug: &str,
@@ -3074,27 +3282,81 @@ fn chat_with_model(
     };
     let provider_arc: Arc<dyn ProviderTrait> = Arc::new(provider);
 
-    let loop_ = match build_llama_agent_loop(provider_arc, err) {
+    // Non-interactive `--prompt` mode cannot render a permission modal,
+    // so use the auto-allow responder there. Interactive TUI mode uses
+    // a shared `TuiPromptResponder` so the AgentLoop's requests render
+    // through the same modal queue the event loop drains each tick.
+    let prompter = std::sync::Arc::new(crate::chat::TuiPromptResponder::default());
+    let prompter_dyn: std::sync::Arc<dyn stratum_runtime::PromptResponder> = if args.prompt.is_some()
+    {
+        std::sync::Arc::new(stratum_runtime::AllowAllResponder)
+    } else {
+        prompter.clone()
+    };
+
+    let loop_ = match build_llama_agent_loop(provider_arc, prompter_dyn.clone(), err) {
         Ok(l) => l,
         Err(code) => return code,
     };
     let _ = args.max_blocks; // honored by provider request path; reserved for Phase 3 wiring.
 
-    let mut state = crate::chat::ChatState::with_agent_loop(loop_);
+    let switcher_paths = paths.clone();
+    let switcher_ctx = args.ctx;
+    let switcher_prompter = prompter_dyn.clone();
+    let switcher = crate::chat::ModelSwitcher::new(move |new_slug: &str| {
+        let provider = {
+            let mut sink = Vec::<u8>::new();
+            resolve_llama_provider(new_slug, switcher_ctx, &switcher_paths, &mut sink).map_err(
+                |_| {
+                    String::from_utf8(sink)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string()
+                },
+            )
+        }?;
+        let provider_arc: Arc<dyn ProviderTrait> = Arc::new(provider);
+        let mut sink = Vec::<u8>::new();
+        build_llama_agent_loop(provider_arc, switcher_prompter.clone(), &mut sink).map_err(|_| {
+            String::from_utf8(sink)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
+    });
+
+    let shell_executor = crate::chat::ShellExecutor::new(build_shell_runner());
+
+    let mut state = crate::chat::ChatState::with_agent_loop(loop_)
+        .with_permission_prompter(prompter)
+        .with_active_model(slug)
+        .with_available_models(catalog_slugs(paths))
+        .with_model_switcher(switcher)
+        .with_shell_executor(shell_executor)
+        .with_history_path(paths.state.join("input_history.jsonl"))
+        .with_theme_paths(
+            paths.state.join("theme.txt"),
+            crate::theme::themes_dir_for(&paths.config),
+        )
+        .with_statusline(std::env::var("STRATUM_STATUSLINE").unwrap_or_default());
     if let Some(prompt) = args.prompt.as_deref() {
+        if prompt.trim().is_empty() {
+            let _ = writeln!(err, "stratum: --prompt was empty; nothing to send");
+            return ExitCode::from(2);
+        }
         if let Some(t) = resumed {
             print_resumed_transcript(&t, out);
             state = state.with_resumed_transcript(t);
         }
         state.submit_with_prompt(prompt);
-        return print_assistant_text(&state, out, err);
+        return print_assistant(&state, out, err, &args.output_format);
     }
     if let Some(t) = resumed {
         state = state.with_resumed_transcript(t);
     }
     // No --prompt: drop into the interactive TUI. The state already wraps
     // the llama-backed loop so input is routed through real inference.
-    match crate::chat::run_with_state(state) {
+    match crate::chat::run_with_state(state, stratum_runtime::TranscriptStore::open(paths.state.join("sessions")).ok()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "{e}");
@@ -3107,6 +3369,27 @@ fn chat_with_model(
 /// disk (downloading + SHA-verifying when needed), and open a
 /// [`LlamaCppProvider`]. Every failure mode emits a STRAT-E1001 diag
 /// to `err` and returns exit code 1.
+/// CLI default context window; matches `#[arg(default_value_t = …)]`.
+/// Used by the per-slug recommended_n_ctx_for_slug fallback to tell
+/// "user kept the default" apart from "user set 8192 deliberately"
+/// — only the former triggers the slug-specific override.
+#[cfg(feature = "provider-llama-cpp")]
+const DEFAULT_N_CTX: u32 = 8192;
+
+/// Recommended `n_ctx` per known model slug. Returns the user override
+/// unchanged when the slug isn't recognised. Smaller models pay less
+/// KV-cache pressure with 4096; 7B+ benefits from the full 8192.
+#[cfg(feature = "provider-llama-cpp")]
+fn recommended_n_ctx_for_slug(slug: &str, fallback: u32) -> u32 {
+    match slug {
+        "qwen3-0.6b" | "deepseek-r1-1.5b" => 4096,
+        "gemma-4-e2b" | "gemma-4-e4b" => 8192,
+        "deepseek-r1-7b" | "qwen-coder-7b" => 6144,
+        "deepseek-coder-v2-lite" => 6144,
+        _ => fallback,
+    }
+}
+
 #[cfg(feature = "provider-llama-cpp")]
 fn resolve_llama_provider(
     slug: &str,
@@ -3178,17 +3461,74 @@ fn resolve_llama_provider(
             })?;
     }
 
+    // If the user kept the default n_ctx, apply a per-model recommended
+    // value: small models (0.6B / 1.5B) work better with 4K so KV
+    // pressure stays low; 7B+ get the full 8K.
+    let effective_ctx = if n_ctx == DEFAULT_N_CTX {
+        recommended_n_ctx_for_slug(slug, n_ctx)
+    } else {
+        n_ctx
+    };
     let cfg = LlamaCppProviderConfig {
         model_path: target,
-        n_ctx,
+        n_ctx: effective_ctx,
         n_threads: None,
-        n_gpu_layers: 0,
+        n_gpu_layers: 999, // offload all layers when Metal/CUDA available (auto-disabled on CPU-only builds)
         seed: 42,
+        // GBNF default-off; STRATUM_GBNF=1 forces on for a single run.
+        enable_gbnf: false,
+            kv_cache_type: stratum_runtime::llama_provider::KvCacheKind::parse(&std::env::var("STRATUM_KV_CACHE").unwrap_or_default()),
     };
-    LlamaCppProvider::open(&cfg).map_err(|e| {
-        let _ = writeln!(err, "STRAT-E1001 provider open failed: {e}");
-        ExitCode::from(1)
-    })
+    // Build memory context once at provider open. Per plan/39 §10
+    // hot-reload would re-run this every turn; v1 ships a load-once
+    // semantic (`/memory reload` is a follow-up).
+    let memory_text = build_memory_context(paths);
+    LlamaCppProvider::open(&cfg)
+        .map(|p| {
+            p.with_tools(default_tool_catalog())
+                .with_memory_context(memory_text)
+        })
+        .map_err(|e| {
+            let _ = writeln!(err, "STRAT-E1001 provider open failed: {e}");
+            ExitCode::from(1)
+        })
+}
+
+/// Tool catalog surfaced to the LLM in its system prompt. Mirrors the
+/// ids registered by [`default_dispatchers`] so the model knows what
+/// verbs to emit when it wants to call a tool.
+#[cfg(feature = "provider-llama-cpp")]
+/// Build the workspace memory context: `STRATUM.md` hierarchy +
+/// auto-memory index, ready to splice into the provider's system
+/// prompt. Cheap — runs once at provider open.
+#[cfg(feature = "provider-llama-cpp")]
+fn build_memory_context(paths: &Paths) -> String {
+    use stratum_runtime::memory_loader::{self, LoaderConfig};
+    let cwd = std::env::current_dir().ok();
+    let user_path = paths.config.join("STRATUM.md");
+    let cfg = LoaderConfig {
+        managed_path: None,
+        user_path: Some(user_path),
+        cwd,
+    };
+    memory_loader::concat(&memory_loader::load(&cfg))
+}
+
+fn default_tool_catalog() -> Vec<(String, String)> {
+    // Keep descriptions ONE short line, no JSON examples. Otherwise the
+    // model dumps the example payloads back as plain text when a user
+    // asks "what tools do you have". Args/shapes belong in the few-shot
+    // examples in the system prompt, not in this catalog.
+    vec![
+        ("fs.read".to_string(), "read a workspace file".to_string()),
+        ("fs.write".to_string(), "create or overwrite a workspace file".to_string()),
+        ("fs.edit".to_string(), "single-occurrence string replace in a workspace file".to_string()),
+        ("fs.tree".to_string(), "directory listing of the workspace (depth-capped)".to_string()),
+        ("grep".to_string(), "recursive regex search across the workspace".to_string()),
+        ("glob".to_string(), "find files matching a shell-style glob".to_string()),
+        ("shell.exec".to_string(), "run a read-only shell command (ls cat pwd head tail wc echo git)".to_string()),
+        ("subagent.run".to_string(), "delegate a side task to a built-in subagent".to_string()),
+    ]
 }
 
 /// Build the `AgentLoop` wrapping `provider` with the documented
@@ -3198,27 +3538,65 @@ fn resolve_llama_provider(
 #[cfg(feature = "provider-llama-cpp")]
 fn build_llama_agent_loop(
     provider: std::sync::Arc<dyn stratum_runtime::Provider>,
+    responder: std::sync::Arc<dyn stratum_runtime::PromptResponder>,
     err: &mut dyn Write,
 ) -> Result<std::sync::Arc<stratum_runtime::AgentLoop>, ExitCode> {
     use std::sync::Arc;
 
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use stratum_runtime::sandbox::{SandboxBackend, SandboxSpawn};
+    use stratum_runtime::sandbox_resolve::{BackendChoice, ResolvedNet, SandboxLaunchSpec};
+    use stratum_runtime::tool_dispatchers::default_dispatchers;
     use stratum_runtime::{
-        AgentLoop, AgentLoopConfig, AllowAllResponder, CapabilityMatrix, EventEmitter, EventSink,
+        AgentLoop, AgentLoopConfig, CapabilityMatrix, EventEmitter, EventSink,
         IntentRouter, MemoryEventSink, PermissionStore, PlanMode, PromptIdGen,
     };
 
     let sink: Arc<dyn EventSink> = Arc::new(MemoryEventSink::new());
     let events = Arc::new(EventEmitter::new(sink));
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let spec = SandboxLaunchSpec {
+        mounts: Vec::new(),
+        net: ResolvedNet::Loopback,
+        env: BTreeMap::new(),
+        allowed_caps: BTreeSet::new(),
+        denied_caps: BTreeSet::new(),
+        working_dir: cwd.clone(),
+        cpu_quota_pct: None,
+        memory_limit_mib: None,
+        backend: BackendChoice::Passthrough,
+    };
+    let spawn = SandboxSpawn::new(SandboxBackend::Passthrough);
+    let mut reg = default_dispatchers(cwd, spawn, spec);
+    // Wire the subagent dispatcher so the parent loop can delegate
+    // side-tasks to registered subagents via `subagent.run`.
+    let subagent_registry = Arc::new(
+        stratum_runtime::subagent::SubagentRegistry::with_builtins(),
+    );
+    let subagent_dispatcher = stratum_runtime::tool_dispatchers::SubagentToolDispatcher::new(
+        subagent_registry,
+        provider.clone(),
+    );
+    let _ = reg.register(Box::new(subagent_dispatcher));
+    let dispatcher = Arc::new(reg);
+
     AgentLoop::builder()
         .with_provider(provider)
         .with_router(IntentRouter::default())
         .with_permission_store(Arc::new(PermissionStore::new()))
         .with_prompt_gen(Arc::new(PromptIdGen::new()))
-        .with_responder(Arc::new(AllowAllResponder))
+        .with_responder(responder)
         .with_events(events)
         .with_capability_matrix(Arc::new(CapabilityMatrix::new()))
         .with_plan_mode(Arc::new(PlanMode::new()))
-        .with_config(AgentLoopConfig::default())
+        .with_dispatcher(dispatcher)
+        .with_config(AgentLoopConfig {
+            max_agentic_steps: 5,
+            validate_tool_args: true,
+            ..AgentLoopConfig::default()
+        })
         .build()
         .map(Arc::new)
         .map_err(|e| {
@@ -3244,14 +3622,172 @@ fn print_assistant_text(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    print_assistant(state, out, err, "text")
+}
+
+/// Dispatch the print path by output format. Per plan/43 §3.
+fn print_assistant(
+    state: &crate::chat::ChatState,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    format: &str,
+) -> ExitCode {
+    match format {
+        "json" => print_assistant_json(state, out, err),
+        "stream-json" => print_assistant_stream_json(state, out, err),
+        // Anything else falls through to text (the safe default).
+        _ => print_assistant_text_inner(state, out, err),
+    }
+}
+
+fn print_assistant_text_inner(
+    state: &crate::chat::ChatState,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     if let Some(text) = state.last_assistant_text() {
         if writeln!(out, "{text}").is_err() {
             return ExitCode::from(74);
         }
         ExitCode::SUCCESS
+    } else if let Some(msg) = state.last_command_message() {
+        if writeln!(out, "{msg}").is_err() {
+            return ExitCode::from(74);
+        }
+        ExitCode::SUCCESS
+    } else if let Some(summary) = state.last_assistant_tool_summary() {
+        if writeln!(out, "{summary}").is_err() {
+            return ExitCode::from(74);
+        }
+        ExitCode::SUCCESS
+    } else if let Some(reason) = state.last_assistant_failure_reason() {
+        let _ = writeln!(err, "STRAT-E1001 provider failed: {reason}");
+        ExitCode::from(1)
     } else {
         let _ = writeln!(err, "STRAT-E1001 provider returned no text blocks");
         ExitCode::from(1)
+    }
+}
+
+/// JSON output: one object with the full last turn's shape. Per
+/// plan/43 §3.1.
+fn print_assistant_json(
+    state: &crate::chat::ChatState,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let env = build_turn_envelope(state);
+    let rendered = match serde_json::to_string_pretty(&env) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = writeln!(err, "STRAT-E1001 serialization failed: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if writeln!(out, "{rendered}").is_err() {
+        return ExitCode::from(74);
+    }
+    if matches!(env.outcome.as_str(), "failure") {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// NDJSON output: one JSON object per block, plus a trailing summary
+/// object with `done: true`. Per plan/43 §3.2.
+fn print_assistant_stream_json(
+    state: &crate::chat::ChatState,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let env = build_turn_envelope(state);
+    for block in &env.blocks {
+        let rendered = match serde_json::to_string(block) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 serialization failed: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        if writeln!(out, "{rendered}").is_err() {
+            return ExitCode::from(74);
+        }
+    }
+    let footer = serde_json::json!({
+        "done": true,
+        "session_id": env.session_id,
+        "turn_id": env.turn_id,
+        "model": env.model,
+        "metrics": env.metrics,
+        "outcome": env.outcome,
+    });
+    if writeln!(out, "{footer}").is_err() {
+        return ExitCode::from(74);
+    }
+    if matches!(env.outcome.as_str(), "failure") {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// One non-interactive turn's JSON envelope. Used by both the
+/// pretty-JSON output and the stream-json footer.
+#[derive(serde::Serialize)]
+struct TurnEnvelope {
+    session_id: String,
+    turn_id: u64,
+    model: String,
+    blocks: Vec<serde_json::Value>,
+    metrics: serde_json::Value,
+    outcome: String,
+}
+
+fn build_turn_envelope(state: &crate::chat::ChatState) -> TurnEnvelope {
+    use stratum_runtime::TurnId;
+    let last_assistant_blocks = state
+        .transcript()
+        .iter()
+        .rev()
+        .find_map(|t| match t {
+            crate::chat::Turn::Assistant(b) => Some(b.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let blocks: Vec<serde_json::Value> = last_assistant_blocks
+        .iter()
+        .map(|b| serde_json::to_value(b).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let outcome = if last_assistant_blocks.is_empty()
+        && state.last_assistant_failure_reason().is_some()
+    {
+        "failure".to_string()
+    } else if last_assistant_blocks.is_empty() {
+        "empty".to_string()
+    } else {
+        "success".to_string()
+    };
+    let metrics = match state.last_turn_metrics() {
+        Some(m) => serde_json::json!({
+            "prompt_tokens": m.prompt_tokens,
+            "completion_tokens": m.completion_tokens,
+            "total_blocks": m.total_blocks,
+            "started_at": m.started_at,
+            "completed_at": m.completed_at,
+        }),
+        None => serde_json::Value::Null,
+    };
+    TurnEnvelope {
+        session_id: state.session_id().to_string(),
+        turn_id: state
+            .last_turn_id_value()
+            .map(|TurnId(n)| n)
+            .unwrap_or(0),
+        model: state.active_model().unwrap_or_default(),
+        blocks,
+        metrics,
+        outcome,
     }
 }
 
@@ -4131,6 +4667,9 @@ fn echo(json: bool, prompt: &[String], max_blocks: u32, out: &mut dyn Write) -> 
         model: ModelId::from("echo"),
         prompt: prompt.join(" "),
         max_blocks,
+        system_override: None,
+        history: Vec::new(),
+        sampler: stratum_runtime::SamplerParams::default(),
     };
     let cancel = CancelToken::new();
     let blocks = provider.generate(&request, &cancel);
@@ -4402,6 +4941,19 @@ fn apply_upgrade_with_artifact(
         );
     }
 
+    // If the downloaded artifact looks like a gzipped tarball (`.tar.gz`
+    // or `.tgz`), extract the first regular file inside and replace
+    // `new_tmp` with the extracted payload. Lets release manifests
+    // point at conventional `.tar.gz` archives while self-update still
+    // ends up swapping in a raw executable.
+    let is_tarball = artifact.url.ends_with(".tar.gz") || artifact.url.ends_with(".tgz");
+    if is_tarball {
+        if let Err(msg) = extract_first_file_from_targz(&new_tmp) {
+            let _ = std::fs::remove_file(&new_tmp);
+            let _ = writeln!(err, "STRAT-E1001 tarball extract failed: {msg}");
+            return ExitCode::from(1);
+        }
+    }
     if let Err(msg) = make_executable(&new_tmp) {
         let _ = std::fs::remove_file(&new_tmp);
         let _ = writeln!(err, "STRAT-E1001 {msg}");
@@ -4460,6 +5012,34 @@ fn sibling_with_suffix(base: &Path, suffix: &str) -> PathBuf {
 /// the number of bytes written. The transport is `ureq` HTTPS for production
 /// URLs; HTTP is permitted only when `allow_insecure` is `true` AND the
 /// process is allowed to use insecure flags (see [`insecure_flags_allowed`]).
+/// Replace `path` (a downloaded `.tar.gz`) with the contents of the
+/// first regular file inside the archive. Used by `self-update --apply`
+/// so manifests can ship `.tar.gz` URLs without breaking the assumption
+/// that the artifact is a raw executable.
+fn extract_first_file_from_targz(path: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    let entries = archive.entries().map_err(|e| format!("entries: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("entry: {e}"))?;
+        let header = entry.header().clone();
+        if header.entry_type().is_file() {
+            // Replace the original tarball with the extracted file
+            // contents (atomic enough — caller still validates via
+            // make_executable + atomic_swap after we return).
+            let tmp = path.with_extension("extract.tmp");
+            let mut out = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
+            std::io::copy(&mut entry, &mut out).map_err(|e| format!("copy: {e}"))?;
+            out.sync_all().map_err(|e| format!("sync: {e}"))?;
+            drop(out);
+            std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
+            return Ok(());
+        }
+    }
+    Err("no regular file inside tarball".to_string())
+}
+
 fn download_and_verify(
     url: &str,
     dest: &Path,
@@ -5006,7 +5586,10 @@ fn events_tail(
 /// Filesystem location of the transcript directory under the configured
 /// state root. Mirrors what the future chat persistence layer writes to.
 fn transcripts_dir(paths: &Paths) -> PathBuf {
-    paths.state.join("transcripts")
+    // Aligned with `chat::open_session_store` which writes there. Prior
+    // `transcripts/` value was a save/load mismatch — `--resume <id>`
+    // could not find files the chat layer had just written.
+    paths.state.join("sessions")
 }
 
 /// Open the on-disk [`TranscriptStore`] rooted at `<state>/transcripts/`,

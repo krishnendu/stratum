@@ -4,13 +4,16 @@ members = [
     "crates/stratum-types",
     "crates/stratum-testkit",
     "crates/stratum-runtime",
+    "crates/stratum-tui-api",
+    "crates/stratum-tui",
+    "crates/stratum-backend-local",
     "crates/stratum-cli",
     "crates/stratum-eval",
     "crates/xtask",
 ]
 
 [workspace.package]
-version       = "0.2.1"
+version       = "0.2.7"
 edition       = "2021"
 rust-version  = "1.90"
 authors       = ["Krishnendu <krishnenduchatterjee25@gmail.com>"]
@@ -79,6 +82,20 @@ llama-cpp-2     = { version = "0.1", default-features = false }
 # Used to UTF-8-decode per-token byte pieces returned from llama.cpp.
 # Only pulled in alongside `llama-cpp-2` via the `provider-llama-cpp` feature.
 encoding_rs     = { version = "0.8" }
+# Tarball extraction for `self-update --apply`. Default features only
+# include `gz` compression which is what GitHub Releases serve.
+tar             = { version = "0.4", default-features = false }
+flate2          = { version = "1", default-features = false, features = ["rust_backend"] }
+# OS keyring backend for SecretStore. Default features cover
+# macOS (Security framework), Linux (Secret Service over dbus),
+# and Windows (Credential Manager). Used only when the
+# `provider-llama-cpp`-class CLI path opens a workspace; tests use
+# the in-memory backend.
+keyring         = "2"
+# Filesystem watcher for settings / agents / hooks hot-reload.
+# Off by default so per-PR CI doesn't pay the inotify / FSEvents
+# / ReadDirectoryChanges link surface; production CLI opts in.
+notify          = { version = "6", default-features = false, features = ["macos_kqueue"] }
 
 [profile.release]
 lto             = "thin"

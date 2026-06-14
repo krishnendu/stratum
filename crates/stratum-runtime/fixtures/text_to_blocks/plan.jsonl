@@ -1,0 +1,4 @@
+{"name":"plan-outline","model_output":"Plan:\n1. Read the existing handler\n2. Add the new field to the struct\n3. Migrate callers\n4. Update tests","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"Plan"}}
+{"name":"plan-then-tool","model_output":"Plan: read the README first, then list the files.\n{\"tool\":\"fs.read\",\"args\":{\"path\":\"README.md\"}}","expect":{"contains_tool_call":"fs.read","contains_text_substr":"Plan"}}
+{"name":"plan-no-tools-needed","model_output":"For this refactor you don't need any new code — just rename the variable in three places.","expect":{"min_blocks":1,"max_blocks":1,"forbids_tool_call":true}}
+{"name":"plan-with-rationale","model_output":"I'd start by reading the failing test (1) to understand what it expects (2), then trace through the code path (3).","expect":{"min_blocks":1,"max_blocks":1}}

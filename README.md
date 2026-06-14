@@ -1,6 +1,10 @@
+<p align="left">
+  <img src="assets/brand/stratum-mark.svg" alt="Stratum" width="72" />
+</p>
+
 # Stratum
 
-> Local-LLM agentic TUI agent for laptop-class hardware.
+> **your local model crew** · local-first chat with an LLM agent
 
 [![CI](https://github.com/krishnendu/stratum/actions/workflows/ci.yml/badge.svg)](https://github.com/krishnendu/stratum/actions/workflows/ci.yml)
 [![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)

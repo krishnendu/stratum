@@ -17,8 +17,37 @@ use stratum_types::{Block, Capability, ModelId};
 
 use crate::cancel::CancelToken;
 
-/// Generation request handed to a provider.
+/// One prior chat turn handed to the provider so models can resolve
+/// references like "the file we just listed" or "that function".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatHistoryTurn {
+    /// `"user"` or `"assistant"` — anything else is dropped by
+    /// providers before being sent to the chat template.
+    pub role: String,
+    /// Plain-text content. Tool-call JSON, sentinels, etc. should be
+    /// stripped before insertion so the chat template doesn't re-emit
+    /// them as model output.
+    pub content: String,
+}
+
+/// Per-request sampler knobs. All fields are optional — `None` keeps
+/// the provider's default. Used by the Polisher / Reviewer / etc.
+/// roles to lean creative for prose vs. deterministic for tool calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SamplerParams {
+    /// Softmax temperature. Lower = more deterministic. Provider
+    /// default is 0.6.
+    pub temperature: Option<f32>,
+    /// Nucleus-sampling probability mass. Provider default is 0.95.
+    pub top_p: Option<f32>,
+    /// Repeat-penalty (1.0 = none). Provider default is 1.1.
+    pub repeat_penalty: Option<f32>,
+}
+
+impl Eq for SamplerParams {}
+
+/// Generation request handed to a provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerateRequest {
     /// Which model to use; concrete providers may ignore this.
     pub model: ModelId,
@@ -26,7 +55,26 @@ pub struct GenerateRequest {
     pub prompt: String,
     /// Maximum number of `Block`s to emit (excluding `Done`/`Cancelled`).
     pub max_blocks: u32,
+    /// Optional system-message override. When `Some`, the provider uses
+    /// this string as the system prompt for this request instead of its
+    /// default. Subagent dispatch (per `plan/37`) sets this so the
+    /// subagent runs with its own role + tool restrictions while sharing
+    /// the parent's `Provider` instance.
+    #[serde(default)]
+    pub system_override: Option<String>,
+    /// Prior user/assistant turns in chronological order. The model
+    /// gets multi-turn context so it can answer follow-ups instead of
+    /// hallucinating. Empty for the first turn of a session. Providers
+    /// that don't support history may ignore this.
+    #[serde(default)]
+    pub history: Vec<ChatHistoryTurn>,
+    /// Per-request sampler overrides. `Default::default()` leaves
+    /// every knob unset and the provider uses its own defaults.
+    #[serde(default)]
+    pub sampler: SamplerParams,
 }
+
+impl Eq for GenerateRequest {}
 
 /// Trait every concrete provider implements.
 ///
@@ -46,6 +94,24 @@ pub trait Provider: std::fmt::Debug + Send + Sync + 'static {
     /// Run a synchronous generation. The provider polls `cancel` between
     /// tokens and emits `Block::Cancelled` if it fires before completion.
     fn generate(&self, request: &GenerateRequest, cancel: &CancelToken) -> Vec<Block>;
+
+    /// Streaming variant. Implementations that can emit blocks
+    /// incrementally (e.g. token-by-token text) should override this to
+    /// call `on_chunk` for each emitted block. The default impl wraps
+    /// `generate`: it produces no real streaming, but UI callers always
+    /// see the same final result regardless of provider support.
+    fn generate_streaming(
+        &self,
+        request: &GenerateRequest,
+        cancel: &CancelToken,
+        on_chunk: &dyn Fn(&Block),
+    ) -> Vec<Block> {
+        let blocks = self.generate(request, cancel);
+        for b in &blocks {
+            on_chunk(b);
+        }
+        blocks
+    }
 }
 
 /// Deterministic echo provider for end-to-end loop tests.
@@ -124,6 +190,9 @@ mod tests {
             model: ModelId::from("echo"),
             prompt: prompt.to_string(),
             max_blocks,
+            system_override: None,
+            history: Vec::new(),
+            sampler: SamplerParams::default(),
         }
     }
 

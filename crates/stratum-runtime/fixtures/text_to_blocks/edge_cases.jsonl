@@ -1,0 +1,8 @@
+{"name":"prose-with-tool-word","model_output":"The `tool` field in the {config} controls X.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"tool"}}
+{"name":"prose-with-curly-braces","model_output":"Use the syntax: {name} in your template.","expect":{"forbids_tool_call":true}}
+{"name":"sentinel-trailing","model_output":"Hello!<|im_end|>","strip_sentinels_first":true,"expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"Hello!","forbids_text_substr":["<|im_end|>"]}}
+{"name":"think-block-stripped","model_output":"<think>let me think</think>The answer is 42.","strip_sentinels_first":true,"expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"answer is 42","forbids_text_substr":["<think>"]}}
+{"name":"empty-tool-tag","model_output":"<tool_call></tool_call>","expect":{"forbids_tool_call":true}}
+{"name":"tool-missing-args","model_output":"{\"tool\":\"glob\"}","expect":{"forbids_tool_call":true}}
+{"name":"json-object-no-tool-key","model_output":"data: {\"key\":\"value\"} attached","expect":{"forbids_tool_call":true}}
+{"name":"escaped-quote-in-path","model_output":"{\"tool\":\"fs.read\",\"args\":{\"path\":\"a\\\"b.rs\"}}","expect":{"contains_tool_call":"fs.read"}}

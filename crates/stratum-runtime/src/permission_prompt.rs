@@ -73,6 +73,11 @@ pub enum PermissionRequest {
     ToolUse {
         /// Tool identifier from the tool registry.
         tool_id: String,
+        /// JSON-encoded arguments the model wants to pass. Surfaced in
+        /// the permission modal so the user sees exactly what will run.
+        /// Empty string when the call was issued with no args.
+        #[serde(default)]
+        args: String,
     },
 }
 
@@ -452,7 +457,7 @@ mod tests {
     }
 
     fn sample_tool() -> PermissionRequest {
-        PermissionRequest::ToolUse {
+        PermissionRequest::ToolUse { args: String::new(),
             tool_id: "shell.exec".into(),
         }
     }

@@ -22,6 +22,14 @@ default = []
 # is exercised by the `provider-llama-cpp` workflow (nightly cron, release
 # tag, manual dispatch) — not per-PR CI.
 provider-llama-cpp = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# OS keyring backend for SecretStore. Off by default so per-PR CI doesn't
+# build dbus/SecretService on Linux runners that lack the system libs.
+# Production CLI builds opt in; tests rely on the in-memory backend.
+os-keyring = ["dep:keyring"]
+# Filesystem watcher for settings / agents / hooks hot-reload. Off by
+# default; per-PR CI uses the no-op stub so it doesn't link inotify /
+# FSEvents / ReadDirectoryChanges.
+fs-watch = ["dep:notify"]
 
 [dependencies]
 stratum-types      = { path = "../stratum-types" }
@@ -40,6 +48,9 @@ ureq               = { workspace = true }
 rand               = { workspace = true }
 zeroize            = { workspace = true }
 regex              = { workspace = true }
+keyring            = { workspace = true, optional = true }
+notify             = { workspace = true, optional = true }
+thiserror          = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

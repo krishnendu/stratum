@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 160" role="img" aria-label="Stratum">
+  <title>Stratum wordmark</title>
+  <g fill="#1E5E5E">
+    <rect x="16"  y="32"  width="120" height="18" rx="4" />
+    <rect x="26"  y="58"  width="100" height="18" rx="4" />
+    <rect x="36"  y="84"  width="80"  height="18" rx="4" />
+    <rect x="46"  y="110" width="60"  height="18" rx="4" />
+  </g>
+  <text x="170" y="106" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+        font-size="84" font-weight="700" fill="#1E5E5E" letter-spacing="2">stratum</text>
+</svg>

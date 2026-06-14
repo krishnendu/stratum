@@ -485,6 +485,7 @@ impl AgentHandoff {
                 model: current_ctx.model.clone(),
                 turn_id: next_turn_id,
                 started_at: current_ctx.started_at,
+                history: current_ctx.history.clone(),
             };
         }
     }
@@ -802,6 +803,7 @@ mod tests {
             model: ModelId::from("echo"),
             turn_id: TurnId(1),
             started_at: t0(),
+            history: Vec::new(),
         }
     }
 

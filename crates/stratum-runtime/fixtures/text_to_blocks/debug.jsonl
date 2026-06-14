@@ -1,0 +1,5 @@
+{"name":"debug-null-pointer","model_output":"That panic looks like a null-pointer dereference. Check whether `cfg` is `Some` before unwrapping.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"unwrap"}}
+{"name":"debug-borrow-error","model_output":"The borrow checker is complaining because `vec` is borrowed mutably inside the loop. Clone it before the loop or refactor.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"borrow"}}
+{"name":"debug-stack-overflow","model_output":"Your recursive function never hits a base case for `n == 0`. Add the base case or rewrite as an iterative loop.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"base case"}}
+{"name":"debug-via-tool","model_output":"Let me check the test output:\n{\"tool\":\"fs.read\",\"args\":{\"path\":\"target/test-stderr.log\"}}","expect":{"min_blocks":2,"contains_tool_call":"fs.read"}}
+{"name":"debug-deadlock","model_output":"Two threads are each holding a lock the other needs. Acquire both in the same order everywhere.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"order"}}

@@ -9,7 +9,7 @@
 //! `stratum doctor` and the orchestrator can pick a profile at runtime.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
@@ -297,6 +297,9 @@ fn spawn_bwrap_with(
 fn spawn_program(prog: &str, argv: &[String]) -> Result<std::process::Child, SandboxSpawnError> {
     Command::new(prog)
         .args(argv)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
         .spawn()
         .map_err(SandboxSpawnError::Spawn)
 }
@@ -435,6 +438,14 @@ fn spawn_passthrough(
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
+    // Pipe stdout / stderr so the dispatcher can capture them. Without
+    // this the child inherits the parent's TTY and writes directly to
+    // the screen — fatal under the TUI alternate-screen / raw-mode
+    // session because the bytes bypass ratatui's render buffer and
+    // corrupt the layout.
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.stdin(Stdio::null());
     cmd.spawn().map_err(SandboxSpawnError::Spawn)
 }
 

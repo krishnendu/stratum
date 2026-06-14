@@ -268,6 +268,7 @@ impl EvalRunner {
             model: self.model.clone(),
             turn_id: TurnId(0),
             started_at: SystemTime::now(),
+            history: Vec::new(),
         };
         let cancel = CancelToken::new();
         let started = Instant::now();

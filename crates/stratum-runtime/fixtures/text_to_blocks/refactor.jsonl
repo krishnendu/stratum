@@ -1,0 +1,4 @@
+{"name":"refactor-extract-helper","model_output":"I'll extract the parsing logic into a helper:\n{\"tool\":\"fs.edit\",\"args\":{\"path\":\"src/parser.rs\",\"old_string\":\"let raw = ...\",\"new_string\":\"let raw = parse_input(input);\"}}","expect":{"contains_tool_call":"fs.edit"}}
+{"name":"refactor-rename","model_output":"Renaming `do_thing` to `process_request` across the workspace:\n{\"tool\":\"grep\",\"args\":{\"pattern\":\"do_thing\"}}","expect":{"contains_tool_call":"grep"}}
+{"name":"refactor-explain-only","model_output":"To split this function, extract lines 20-40 into a `validate` helper, then call it from the original location.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"extract"}}
+{"name":"refactor-multi-step","model_output":"First scan for callers:\n{\"tool\":\"grep\",\"args\":{\"pattern\":\"old_fn\"}}\nThen I'll rename them one file at a time.","expect":{"min_blocks":2,"contains_tool_call":"grep"}}

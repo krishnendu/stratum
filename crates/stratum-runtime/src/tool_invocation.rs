@@ -208,6 +208,16 @@ impl RegistryDispatcher {
     pub fn ids(&self) -> Vec<&str> {
         self.dispatchers.iter().map(|d| d.id()).collect()
     }
+
+    /// True when at least one registered dispatcher supports `tool_id`.
+    /// Used by the agent loop to reject hallucinated tool names BEFORE
+    /// the permission flow runs, so the user doesn't see a fake
+    /// "asking for permission to run X" prompt for a nonexistent
+    /// tool.
+    #[must_use]
+    pub fn supports(&self, tool_id: &str) -> bool {
+        self.dispatchers.iter().any(|d| d.supports(tool_id))
+    }
 }
 
 /// Errors returned by [`RegistryDispatcher`].

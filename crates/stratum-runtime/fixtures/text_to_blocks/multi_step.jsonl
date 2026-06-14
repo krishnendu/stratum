@@ -1,0 +1,5 @@
+{"name":"narration-then-tool","model_output":"Let me check the README:\n{\"tool\":\"fs.read\",\"args\":{\"path\":\"README.md\"}}","expect":{"min_blocks":2,"contains_tool_call":"fs.read","contains_text_substr":"Let me check"}}
+{"name":"two-tool-calls","model_output":"{\"tool\":\"fs.read\",\"args\":{\"path\":\"a\"}}\n{\"tool\":\"fs.read\",\"args\":{\"path\":\"b\"}}","expect":{"min_blocks":2,"max_blocks":2}}
+{"name":"narration-tool-then-narration","model_output":"First, list:\n{\"tool\":\"glob\",\"args\":{\"pattern\":\"*.rs\"}}\nNow I'll check.","expect":{"min_blocks":3,"max_blocks":3,"contains_tool_call":"glob"}}
+{"name":"chat-mode-explanation","model_output":"That code declares a function `main` that prints to stdout.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"function"}}
+{"name":"summary-after-tool","model_output":"Found 3 Rust files: src/main.rs, src/lib.rs, src/util.rs.","expect":{"min_blocks":1,"max_blocks":1,"contains_text_substr":"Rust files"}}

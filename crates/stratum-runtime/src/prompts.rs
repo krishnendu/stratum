@@ -22,6 +22,14 @@ pub const CAVEMAN_REWRITER: &str = include_str!("../prompts/caveman_rewriter.md"
 /// Takes caveman agent output and rewrites it back into user-facing English.
 pub const POLISHER: &str = include_str!("../prompts/polisher.md");
 
+/// System prompt for the reviewer agent.
+///
+/// Scores an assistant draft against a fixed checklist and returns a
+/// JSON `{"verdict":"clean|fix","issues":[…],"severity":"low|medium|high"}`.
+/// Run as a separate pass against a second provider so the model
+/// isn't grading itself (plan/17 §Critic — anti-self-bias).
+pub const REVIEWER: &str = include_str!("../prompts/reviewer.md");
+
 /// Identifies which embedded system prompt to load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PromptRole {
@@ -29,6 +37,8 @@ pub enum PromptRole {
     CavemanRewriter,
     /// The polisher that expands caveman output back to English.
     Polisher,
+    /// The reviewer that scores assistant drafts against a checklist.
+    Reviewer,
 }
 
 /// Look up the embedded system prompt for a given role.
@@ -39,6 +49,7 @@ pub const fn system_prompt(role: PromptRole) -> &'static str {
     match role {
         PromptRole::CavemanRewriter => CAVEMAN_REWRITER,
         PromptRole::Polisher => POLISHER,
+        PromptRole::Reviewer => REVIEWER,
     }
 }
 

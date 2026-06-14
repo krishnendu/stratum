@@ -1,0 +1,12 @@
+root        ::= "{" ws "\"tool\"" ws ":" ws tool-id ws "," ws "\"args\"" ws ":" ws object ws "}"
+tool-id     ::= "\"" tool-name "\""
+tool-name   ::= "fs.read" | "fs.write" | "fs.edit" | "grep" | "glob" | "shell.exec" | "subagent.run"
+value       ::= object | array | string | number | "true" | "false" | "null"
+object      ::= "{" ws ( member ( ws "," ws member )* )? ws "}"
+member      ::= string ws ":" ws value
+array       ::= "[" ws ( value ( ws "," ws value )* )? ws "]"
+string      ::= "\"" char* "\""
+char        ::= [^"\\] | "\\" ( ["\\/bfnrt] | "u" hex hex hex hex )
+hex         ::= [0-9a-fA-F]
+number      ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [-+]? [0-9]+ )?
+ws          ::= [ \t\n]*

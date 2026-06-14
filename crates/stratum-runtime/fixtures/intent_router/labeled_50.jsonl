@@ -1,0 +1,50 @@
+{"prompt":"hi","expected":"chat"}
+{"prompt":"hello there","expected":"chat"}
+{"prompt":"what can you do","expected":"chat"}
+{"prompt":"what's your name","expected":"chat"}
+{"prompt":"how are you today","expected":"chat"}
+{"prompt":"explain how pointers work","expected":"chat"}
+{"prompt":"tell me about ownership in rust","expected":"chat"}
+{"prompt":"what is a closure","expected":"chat"}
+{"prompt":"who is the author of rust","expected":"chat"}
+{"prompt":"summarize the previous conversation","expected":"memory_recall"}
+{"prompt":"recall what we discussed about the API","expected":"memory_recall"}
+{"prompt":"what did i ask earlier","expected":"memory_recall"}
+{"prompt":"remember the bug we fixed yesterday","expected":"memory_recall"}
+{"prompt":"write a function in rust that reads a file","expected":"code"}
+{"prompt":"write a python script that prints hello","expected":"code"}
+{"prompt":"refactor this function to use Result","expected":"code"}
+{"prompt":"fix the compile error in main.rs","expected":"code"}
+{"prompt":"debug why my code panics","expected":"code"}
+{"prompt":"add a test for the parse function","expected":"code"}
+{"prompt":"convert this loop to an iterator","expected":"code"}
+{"prompt":"implement Display for MyStruct","expected":"code"}
+{"prompt":"why does this rust code not compile","expected":"code"}
+{"prompt":"find all rust files in this project","expected":"file_search"}
+{"prompt":"search for the function parse_args","expected":"file_search"}
+{"prompt":"grep for TODO comments","expected":"file_search"}
+{"prompt":"find files containing 'panic'","expected":"file_search"}
+{"prompt":"list all markdown files","expected":"file_search"}
+{"prompt":"locate the config file","expected":"file_search"}
+{"prompt":"where is the cargo.toml","expected":"file_search"}
+{"prompt":"show me the readme","expected":"file_search"}
+{"prompt":"run cargo test","expected":"shell"}
+{"prompt":"run the test suite","expected":"shell"}
+{"prompt":"run ls in this directory","expected":"shell"}
+{"prompt":"exec git status","expected":"shell"}
+{"prompt":"execute the build script","expected":"shell"}
+{"prompt":"run npm install","expected":"shell"}
+{"prompt":"shell command to count files","expected":"shell"}
+{"prompt":"@fs.read README.md","expected":"tool_use"}
+{"prompt":"@grep TODO","expected":"tool_use"}
+{"prompt":"@glob **/*.rs","expected":"tool_use"}
+{"prompt":"/tool fs.write hello.txt","expected":"tool_use"}
+{"prompt":"@shell.exec ls","expected":"tool_use"}
+{"prompt":"/cancel","expected":"cancel"}
+{"prompt":"cancel","expected":"cancel"}
+{"prompt":"stop the current turn","expected":"cancel"}
+{"prompt":"abort","expected":"cancel"}
+{"prompt":"halt the agent","expected":"cancel"}
+{"prompt":"what is the meaning of life","expected":"chat"}
+{"prompt":"what year is it","expected":"chat"}
+{"prompt":"good morning","expected":"chat"}

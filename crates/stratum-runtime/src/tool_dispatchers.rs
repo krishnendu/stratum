@@ -63,12 +63,28 @@ const E_DISPATCH_SIZE_CAP: &str = "E_DISPATCH_SIZE_CAP";
 const E_DISPATCH_READ_FAILED: &str = "E_DISPATCH_READ_FAILED";
 /// Local sentinel: shell.exec failed to spawn under the chosen backend.
 const E_DISPATCH_SPAWN_FAILED: &str = "E_DISPATCH_SPAWN_FAILED";
+/// Local sentinel: fs.write failed at the filesystem layer.
+const E_DISPATCH_WRITE_FAILED: &str = "E_DISPATCH_WRITE_FAILED";
+/// Local sentinel: fs.edit could not find the `old_string` to replace.
+const E_DISPATCH_EDIT_NOT_FOUND: &str = "E_DISPATCH_EDIT_NOT_FOUND";
+/// Local sentinel: fs.edit `old_string` appeared more than once.
+const E_DISPATCH_EDIT_AMBIGUOUS: &str = "E_DISPATCH_EDIT_AMBIGUOUS";
+/// Local sentinel: grep / glob pattern was invalid.
+const E_DISPATCH_BAD_PATTERN: &str = "E_DISPATCH_BAD_PATTERN";
 
 /// Default allowlist of read-only binaries that `ShellToolDispatcher` will exec.
 ///
 /// Paranoid scaffold: every additional binary must be reviewed against the
 /// threat model in `plan/31-tool-sandbox-and-secrets.md`.
-pub const SHELL_DEFAULT_ALLOWLIST: &[&str] = &["echo", "ls", "cat", "pwd", "wc", "head", "tail"];
+pub const SHELL_DEFAULT_ALLOWLIST: &[&str] = &[
+    "echo", "ls", "cat", "pwd", "wc", "head", "tail",
+    // Read-only git operations. The shell dispatcher runs under a
+    // passthrough sandbox today, so any git subcommand that *modifies*
+    // history (commit / push / reset / rebase) is still implicitly
+    // denied by the model's reluctance to call it — and explicitly
+    // gateable via `with_allowlist` for hardened deployments.
+    "git",
+];
 
 /// `ToolDispatcher` for `shell.exec` calls. Composes a `SandboxSpawn`
 /// with a base `SandboxLaunchSpec` and a per-call wall-clock timeout.
@@ -399,9 +415,1057 @@ impl ToolDispatcher for FsReadToolDispatcher {
     }
 }
 
-/// Build the default dispatcher registry used by the agent loop:
-/// `FsReadToolDispatcher` anchored at `workspace_root`, plus a
-/// `ShellToolDispatcher` driving `sandbox` against `base_spec`.
+/// Write a file inside the workspace root.
+#[derive(Debug, Clone)]
+pub struct FsWriteToolDispatcher {
+    id: String,
+    root: PathBuf,
+    max_bytes: u64,
+}
+
+impl FsWriteToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "fs.write";
+    /// Default cap on a single write payload: 4 MiB.
+    pub const DEFAULT_MAX_BYTES: u64 = 4 << 20;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for FsWriteToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let requested = match inv.args.get("path") {
+            Some(Value::String(s)) if !s.is_empty() => PathBuf::from(s),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "fs.write requires `path`"),
+        };
+        let content = match inv.args.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "fs.write requires `content`"),
+        };
+        if requested.is_absolute()
+            || requested
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+        let bytes_len = content.len() as u64;
+        if bytes_len > self.max_bytes {
+            return self.err(
+                E_DISPATCH_SIZE_CAP,
+                format!("content exceeds {} byte cap", self.max_bytes),
+            );
+        }
+        let canonical_root = match self.root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return self.err(
+                    E_DISPATCH_WRITE_FAILED,
+                    format!("workspace root unreadable: {e}"),
+                )
+            }
+        };
+        let target = canonical_root.join(&requested);
+        if !target.starts_with(&canonical_root) {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+        if let Some(parent) = target.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return self.err(E_DISPATCH_WRITE_FAILED, format!("mkdir failed: {e}"));
+            }
+        }
+        if let Err(e) = std::fs::write(&target, content.as_bytes()) {
+            return self.err(E_DISPATCH_WRITE_FAILED, format!("write failed: {e}"));
+        }
+        let body = serde_json::json!({
+            "path": target.display().to_string(),
+            "bytes": bytes_len,
+        });
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes: bytes_len,
+        }
+    }
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Single-occurrence string replace inside a workspace file.
+#[derive(Debug, Clone)]
+pub struct FsEditToolDispatcher {
+    id: String,
+    root: PathBuf,
+    max_bytes: u64,
+}
+
+impl FsEditToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "fs.edit";
+    /// Default cap on the post-edit file size: 4 MiB.
+    pub const DEFAULT_MAX_BYTES: u64 = 4 << 20;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for FsEditToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let requested = match inv.args.get("path") {
+            Some(Value::String(s)) if !s.is_empty() => PathBuf::from(s),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "fs.edit requires `path`"),
+        };
+        let old_s = match inv.args.get("old_string") {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "fs.edit requires `old_string`"),
+        };
+        let new_s = match inv.args.get("new_string") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "fs.edit requires `new_string`"),
+        };
+        if requested.is_absolute()
+            || requested
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+        let canonical_root = match self.root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return self.err(
+                    E_DISPATCH_READ_FAILED,
+                    format!("workspace root unreadable: {e}"),
+                )
+            }
+        };
+        let target = match canonical_root.join(&requested).canonicalize() {
+            Ok(p) => p,
+            Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("path unreadable: {e}")),
+        };
+        if !target.starts_with(&canonical_root) {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+        let original = match std::fs::read_to_string(&target) {
+            Ok(s) => s,
+            Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("read failed: {e}")),
+        };
+        let count = original.matches(&old_s).count();
+        if count == 0 {
+            return self.err(E_DISPATCH_EDIT_NOT_FOUND, "old_string not found in file");
+        }
+        if count > 1 {
+            return self.err(
+                E_DISPATCH_EDIT_AMBIGUOUS,
+                format!("old_string appears {count} times; widen the snippet"),
+            );
+        }
+        let updated = original.replacen(&old_s, &new_s, 1);
+        let bytes_len = updated.len() as u64;
+        if bytes_len > self.max_bytes {
+            return self.err(
+                E_DISPATCH_SIZE_CAP,
+                format!("result exceeds {} byte cap", self.max_bytes),
+            );
+        }
+        if let Err(e) = std::fs::write(&target, updated.as_bytes()) {
+            return self.err(E_DISPATCH_WRITE_FAILED, format!("write failed: {e}"));
+        }
+        let body = serde_json::json!({
+            "path": target.display().to_string(),
+            "bytes": bytes_len,
+        });
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes: bytes_len,
+        }
+    }
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Recursive regex search across the workspace root.
+#[derive(Debug, Clone)]
+pub struct GrepToolDispatcher {
+    id: String,
+    root: PathBuf,
+    max_matches: usize,
+}
+
+impl GrepToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "grep";
+    /// Default cap on returned matches.
+    pub const DEFAULT_MAX_MATCHES: usize = 200;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            max_matches: Self::DEFAULT_MAX_MATCHES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for GrepToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let pattern = match inv.args.get("pattern") {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "grep requires `pattern`"),
+        };
+        let re = match regex::Regex::new(&pattern) {
+            Ok(r) => r,
+            Err(e) => return self.err(E_DISPATCH_BAD_PATTERN, format!("regex: {e}")),
+        };
+        let canonical_root = match self.root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return self.err(
+                    E_DISPATCH_READ_FAILED,
+                    format!("workspace root unreadable: {e}"),
+                )
+            }
+        };
+        let mut matches: Vec<serde_json::Value> = Vec::new();
+        let mut total_bytes: u64 = 0;
+        let mut stack = vec![canonical_root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with('.') || name == "target" || name == "node_modules" {
+                        continue;
+                    }
+                }
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (i, line) in content.lines().enumerate() {
+                    if re.is_match(line) {
+                        let rel = path.strip_prefix(&canonical_root).unwrap_or(&path);
+                        let entry = serde_json::json!({
+                            "path": rel.display().to_string(),
+                            "line": i + 1,
+                            "text": line,
+                        });
+                        total_bytes += line.len() as u64;
+                        matches.push(entry);
+                        if matches.len() >= self.max_matches {
+                            break;
+                        }
+                    }
+                }
+                if matches.len() >= self.max_matches {
+                    break;
+                }
+            }
+            if matches.len() >= self.max_matches {
+                break;
+            }
+        }
+        let body = serde_json::json!({
+            "pattern": pattern,
+            "matches": matches,
+        });
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes: total_bytes,
+        }
+    }
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Filename glob matching across the workspace root.
+#[derive(Debug, Clone)]
+pub struct GlobToolDispatcher {
+    id: String,
+    root: PathBuf,
+    max_results: usize,
+}
+
+impl GlobToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "glob";
+    /// Default cap on returned paths.
+    pub const DEFAULT_MAX_RESULTS: usize = 500;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            max_results: Self::DEFAULT_MAX_RESULTS,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Translate a shell-style glob into an anchored regex.
+fn glob_to_regex(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len() + 4);
+    out.push('^');
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
+                    }
+                    out.push_str(".*");
+                } else {
+                    out.push_str("[^/]*");
+                }
+            }
+            '?' => out.push_str("[^/]"),
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '{' | '}' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('$');
+    out
+}
+
+impl ToolDispatcher for GlobToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let pattern = match inv.args.get("pattern") {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "glob requires `pattern`"),
+        };
+        let re_str = glob_to_regex(&pattern);
+        let re = match regex::Regex::new(&re_str) {
+            Ok(r) => r,
+            Err(e) => return self.err(E_DISPATCH_BAD_PATTERN, format!("regex: {e}")),
+        };
+        let canonical_root = match self.root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return self.err(
+                    E_DISPATCH_READ_FAILED,
+                    format!("workspace root unreadable: {e}"),
+                )
+            }
+        };
+        let mut results: Vec<String> = Vec::new();
+        let mut stack = vec![canonical_root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with('.') || name == "target" || name == "node_modules" {
+                        continue;
+                    }
+                }
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+                let rel = path.strip_prefix(&canonical_root).unwrap_or(&path);
+                let rel_str = rel.display().to_string();
+                if re.is_match(&rel_str) {
+                    results.push(rel_str);
+                    if results.len() >= self.max_results {
+                        break;
+                    }
+                }
+            }
+            if results.len() >= self.max_results {
+                break;
+            }
+        }
+        let total_bytes: u64 = results.iter().map(|s| s.len() as u64).sum();
+        let body = serde_json::json!({
+            "pattern": pattern,
+            "matches": results,
+        });
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes: total_bytes,
+        }
+    }
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Dispatcher that delegates a single side-task to a registered
+/// subagent. Args: `{"name":"<subagent>","task":"<prompt>"}`.
+///
+/// The dispatcher runs the subagent's prompt body as a system override on
+/// the parent's `Provider` (single-shot, no nested tool dispatch — see
+/// `plan/37` §2.3 "no nesting" rule). Returns the model's text reply as
+/// the tool result.
+pub struct SubagentToolDispatcher {
+    id: String,
+    registry: std::sync::Arc<crate::subagent::SubagentRegistry>,
+    provider: std::sync::Arc<dyn crate::provider::Provider>,
+    max_blocks: u32,
+}
+
+impl std::fmt::Debug for SubagentToolDispatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubagentToolDispatcher")
+            .field("id", &self.id)
+            .field("registry_len", &self.registry.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SubagentToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "subagent.run";
+    /// Default cap on subagent block emission.
+    pub const DEFAULT_MAX_BLOCKS: u32 = 16;
+
+    /// Build a new subagent dispatcher backed by `registry` and `provider`.
+    #[must_use]
+    pub fn new(
+        registry: std::sync::Arc<crate::subagent::SubagentRegistry>,
+        provider: std::sync::Arc<dyn crate::provider::Provider>,
+    ) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            registry,
+            provider,
+            max_blocks: Self::DEFAULT_MAX_BLOCKS,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for SubagentToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let name = match inv.args.get("name") {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "subagent.run requires `name`"),
+        };
+        let task = match inv.args.get("task") {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "subagent.run requires `task`"),
+        };
+        let Some(sub) = self.registry.get(&name) else {
+            return self.err(
+                E_DISPATCH_MISSING_ARG,
+                format!("unknown subagent: {name}"),
+            );
+        };
+        let req = crate::provider::GenerateRequest {
+            model: stratum_types::ModelId::from("subagent"),
+            prompt: task,
+            max_blocks: self.max_blocks,
+            system_override: Some(sub.prompt.clone()),
+            history: Vec::new(),
+            sampler: crate::provider::SamplerParams::default(),
+        };
+        let cancel = crate::cancel::CancelToken::new();
+        let blocks = self.provider.generate(&req, &cancel);
+        let text: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                stratum_types::Block::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        if text.is_empty() {
+            return self.err(
+                E_DISPATCH_READ_FAILED,
+                "subagent returned no text blocks",
+            );
+        }
+        let body = serde_json::json!({
+            "subagent": name,
+            "answer": text,
+        });
+        let bytes = text.len() as u64;
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes,
+        }
+    }
+
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Directory-tree listing of the workspace. Cheaper than `glob` for
+/// "show me the layout" queries; depth-capped to keep output bounded.
+#[derive(Debug, Clone)]
+pub struct FsTreeToolDispatcher {
+    id: String,
+    root: PathBuf,
+    /// Maximum tree depth from the workspace root. 0 = root listing only.
+    max_depth: u32,
+    /// Maximum number of entries returned across the entire walk.
+    max_entries: usize,
+}
+
+impl FsTreeToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "fs.tree";
+    /// Default recursion depth.
+    pub const DEFAULT_DEPTH: u32 = 4;
+    /// Default ceiling on returned entries.
+    pub const DEFAULT_MAX_ENTRIES: usize = 1_000;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            max_depth: Self::DEFAULT_DEPTH,
+            max_entries: Self::DEFAULT_MAX_ENTRIES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for FsTreeToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let depth = match inv.args.get("depth") {
+            Some(Value::Number(n)) => n.as_u64().map_or(self.max_depth, |x| x.min(16) as u32),
+            _ => self.max_depth,
+        };
+        let canonical_root = match self.root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return self.err(
+                    E_DISPATCH_READ_FAILED,
+                    format!("workspace root unreadable: {e}"),
+                )
+            }
+        };
+        let mut entries: Vec<String> = Vec::new();
+        let mut stack: Vec<(PathBuf, u32)> = vec![(canonical_root.clone(), 0)];
+        let mut total_bytes: u64 = 0;
+        while let Some((dir, level)) = stack.pop() {
+            if level > depth {
+                continue;
+            }
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                if entries.len() >= self.max_entries {
+                    break;
+                }
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with('.') || name == "target" || name == "node_modules" {
+                        continue;
+                    }
+                }
+                let rel = path.strip_prefix(&canonical_root).unwrap_or(&path);
+                let kind = entry.file_type().ok().map_or(' ', |ft| {
+                    if ft.is_dir() {
+                        '/'
+                    } else if ft.is_symlink() {
+                        '@'
+                    } else {
+                        ' '
+                    }
+                });
+                let line = format!("{}{}", rel.display(), kind);
+                total_bytes += line.len() as u64;
+                entries.push(line);
+                if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                    stack.push((path, level + 1));
+                }
+            }
+            if entries.len() >= self.max_entries {
+                break;
+            }
+        }
+        entries.sort();
+        let body = serde_json::json!({
+            "depth": depth,
+            "entries": entries,
+        });
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes: total_bytes,
+        }
+    }
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// `ToolDispatcher` for `git.diff`. Runs a read-only `git diff` rooted at
+/// the workspace and returns the patch text.
+///
+/// # Arguments
+///
+/// - `path` (optional, string) — restrict the diff to a single file. Path
+///   policy: must be relative, no `..`, canonicalized result must stay
+///   inside the workspace root.
+/// - `staged` (optional, bool) — true selects `--cached` (the staged
+///   diff). Default false (working-tree diff).
+/// - `since` (optional, string) — a ref to diff against (e.g. `main` or
+///   a commit sha). Validated against `[A-Za-z0-9_./-]{1,80}` to refuse
+///   shell metachars and unbounded input.
+#[derive(Debug, Clone)]
+pub struct GitDiffToolDispatcher {
+    id: String,
+    root: PathBuf,
+    timeout: Duration,
+    max_bytes: u64,
+}
+
+impl GitDiffToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "git.diff";
+    /// Default per-call wall-clock timeout: 30 seconds.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Default cap on returned patch size: 2 MiB.
+    pub const DEFAULT_MAX_BYTES: u64 = 2 << 20;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            timeout: Self::DEFAULT_TIMEOUT,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for GitDiffToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let staged = matches!(inv.args.get("staged"), Some(Value::Bool(true)));
+        let since = match inv.args.get("since") {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            None | Some(Value::Null) => None,
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "git.diff `since` must be string"),
+        };
+        if let Some(ref s) = since {
+            if !is_safe_ref(s) {
+                return self.err(E_DISPATCH_MISSING_ARG, "git.diff `since` has unsafe chars");
+            }
+        }
+        let path_arg = match inv.args.get("path") {
+            Some(Value::String(s)) if !s.is_empty() => Some(PathBuf::from(s)),
+            None | Some(Value::Null) => None,
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "git.diff `path` must be string"),
+        };
+        if let Some(ref p) = path_arg {
+            if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
+                return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+            }
+        }
+
+        let mut args: Vec<String> = vec![
+            "--no-pager".into(),
+            "diff".into(),
+            "--no-color".into(),
+        ];
+        if staged {
+            args.push("--cached".into());
+        }
+        if let Some(s) = since {
+            args.push(s);
+        }
+        if let Some(p) = path_arg {
+            args.push("--".into());
+            args.push(p.display().to_string());
+        }
+
+        run_git(&self.root, &args, self.timeout, self.max_bytes).map_or_else(
+            |e| e.into_tool_result(&self.id),
+            |out| ToolResult::Ok {
+                tool_id: self.id.clone(),
+                body: serde_json::json!({
+                    "patch": String::from_utf8_lossy(&out.stdout).into_owned(),
+                    "truncated": out.truncated,
+                }),
+                bytes: out.stdout.len() as u64,
+            },
+        )
+    }
+
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// `ToolDispatcher` for `git.log`. Returns recent commits in a stable
+/// tab-separated shape.
+///
+/// # Arguments
+///
+/// - `path` (optional) — restrict the log to a single file
+/// - `max` (optional, number) — entries to return; default 20, max 200
+/// - `since` (optional, ref-shaped string) — show commits since `<ref>`
+#[derive(Debug, Clone)]
+pub struct GitLogToolDispatcher {
+    id: String,
+    root: PathBuf,
+    timeout: Duration,
+    max_bytes: u64,
+}
+
+impl GitLogToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "git.log";
+    /// Default per-call wall-clock timeout: 15 seconds.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+    /// Default cap on returned text: 256 KiB.
+    pub const DEFAULT_MAX_BYTES: u64 = 256 << 10;
+    /// Default number of commits returned.
+    pub const DEFAULT_MAX_ENTRIES: u64 = 20;
+    /// Hard cap on the per-call `max` argument.
+    pub const HARD_MAX_ENTRIES: u64 = 200;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            timeout: Self::DEFAULT_TIMEOUT,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for GitLogToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let max = match inv.args.get("max") {
+            Some(Value::Number(n)) => n
+                .as_u64()
+                .map_or(Self::DEFAULT_MAX_ENTRIES, |x| x.clamp(1, Self::HARD_MAX_ENTRIES)),
+            _ => Self::DEFAULT_MAX_ENTRIES,
+        };
+        let since = match inv.args.get("since") {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            None | Some(Value::Null) => None,
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "git.log `since` must be string"),
+        };
+        if let Some(ref s) = since {
+            if !is_safe_ref(s) {
+                return self.err(E_DISPATCH_MISSING_ARG, "git.log `since` has unsafe chars");
+            }
+        }
+        let path_arg = match inv.args.get("path") {
+            Some(Value::String(s)) if !s.is_empty() => Some(PathBuf::from(s)),
+            None | Some(Value::Null) => None,
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "git.log `path` must be string"),
+        };
+        if let Some(ref p) = path_arg {
+            if p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
+                return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+            }
+        }
+
+        let max_arg = format!("-n{max}");
+        let mut args: Vec<String> = vec![
+            "--no-pager".into(),
+            "log".into(),
+            "--no-color".into(),
+            "--date=iso-strict".into(),
+            // %x09 = TAB. Stable, machine-parseable shape:
+            //   <short-hash>\t<iso-date>\t<author>\t<subject>
+            "--pretty=format:%h%x09%ad%x09%an%x09%s".into(),
+            max_arg,
+        ];
+        if let Some(s) = since {
+            args.push(s);
+        }
+        if let Some(p) = path_arg {
+            args.push("--".into());
+            args.push(p.display().to_string());
+        }
+
+        run_git(&self.root, &args, self.timeout, self.max_bytes).map_or_else(
+            |e| e.into_tool_result(&self.id),
+            |out| {
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                let commits: Vec<serde_json::Value> = text
+                    .lines()
+                    .filter_map(|line| {
+                        let mut parts = line.splitn(4, '\t');
+                        let hash = parts.next()?;
+                        let date = parts.next()?;
+                        let author = parts.next()?;
+                        let subject = parts.next()?;
+                        Some(serde_json::json!({
+                            "hash": hash,
+                            "date": date,
+                            "author": author,
+                            "subject": subject,
+                        }))
+                    })
+                    .collect();
+                let bytes = out.stdout.len() as u64;
+                ToolResult::Ok {
+                    tool_id: self.id.clone(),
+                    body: serde_json::json!({
+                        "commits": commits,
+                        "truncated": out.truncated,
+                    }),
+                    bytes,
+                }
+            },
+        )
+    }
+
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// `ToolDispatcher` for `read_image`. Returns base64-encoded image bytes
+/// plus a sniffed MIME type. The agent loop forwards this through the
+/// multimodal provider path; this dispatcher only handles the read.
+#[derive(Debug, Clone)]
+pub struct ReadImageToolDispatcher {
+    id: String,
+    root: PathBuf,
+    max_bytes: u64,
+}
+
+impl ReadImageToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "read_image";
+    /// Default cap on a single image read: 5 MiB.
+    pub const DEFAULT_MAX_BYTES: u64 = 5 << 20;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for ReadImageToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let requested = match inv.args.get("path") {
+            Some(Value::String(s)) if !s.is_empty() => PathBuf::from(s),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "read_image requires `path`"),
+        };
+        if requested.is_absolute()
+            || requested
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+
+        let canonical_root = match self.root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return self.err(
+                    E_DISPATCH_READ_FAILED,
+                    format!("workspace root unreadable: {e}"),
+                )
+            }
+        };
+        // Join against the *canonical* root, not the raw `self.root` —
+        // matters if `self.root` is itself a symlink that resolves
+        // elsewhere, so we evaluate the descent from a stable anchor.
+        let joined = canonical_root.join(&requested);
+        let canonical_target = match joined.canonicalize() {
+            Ok(p) => p,
+            Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("path unreadable: {e}")),
+        };
+        if !canonical_target.starts_with(&canonical_root) {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+
+        let metadata = match std::fs::metadata(&canonical_target) {
+            Ok(m) => m,
+            Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("stat failed: {e}")),
+        };
+        if metadata.len() > self.max_bytes {
+            return self.err(
+                E_DISPATCH_SIZE_CAP,
+                format!("image exceeds {} byte cap", self.max_bytes),
+            );
+        }
+        let bytes = match std::fs::read(&canonical_target) {
+            Ok(b) => b,
+            Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("read failed: {e}")),
+        };
+        let mime = sniff_image_mime(&canonical_target, &bytes).unwrap_or("application/octet-stream");
+        let raw_len = bytes.len() as u64;
+        let encoded = base64_encode(&bytes);
+        let body = serde_json::json!({
+            "path": canonical_target.display().to_string(),
+            "mime": mime,
+            "data_base64": encoded,
+        });
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes: raw_len,
+        }
+    }
+
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Build the default dispatcher registry used by the agent loop.
+/// Includes: `fs.read`, `fs.write`, `fs.edit`, `fs.tree`, `grep`,
+/// `glob`, `shell.exec`, `git.diff`, `git.log`, `read_image`.
 #[must_use]
 pub fn default_dispatchers(
     workspace_root: PathBuf,
@@ -409,19 +1473,26 @@ pub fn default_dispatchers(
     base_spec: SandboxLaunchSpec,
 ) -> RegistryDispatcher {
     let mut reg = RegistryDispatcher::new();
-    // Register order is observable via `ids()`; fs.read first matches
-    // the doctor/event-log ordering used elsewhere.
-    let fs = FsReadToolDispatcher::new(workspace_root);
+    let fs_read = FsReadToolDispatcher::new(workspace_root.clone());
+    let fs_write = FsWriteToolDispatcher::new(workspace_root.clone());
+    let fs_edit = FsEditToolDispatcher::new(workspace_root.clone());
+    let fs_tree = FsTreeToolDispatcher::new(workspace_root.clone());
+    let grep = GrepToolDispatcher::new(workspace_root.clone());
+    let glob = GlobToolDispatcher::new(workspace_root.clone());
     let shell = ShellToolDispatcher::new(sandbox, base_spec);
-    // Both ids are guaranteed unique; suppress the error path with a
-    // fall-through that still returns an empty registry on the
-    // exceedingly-unlikely duplicate-id failure mode.
-    if reg.register(Box::new(fs)).is_err() {
-        return reg;
-    }
-    if reg.register(Box::new(shell)).is_err() {
-        return reg;
-    }
+    let git_diff = GitDiffToolDispatcher::new(workspace_root.clone());
+    let git_log = GitLogToolDispatcher::new(workspace_root.clone());
+    let read_image = ReadImageToolDispatcher::new(workspace_root);
+    let _ = reg.register(Box::new(fs_read));
+    let _ = reg.register(Box::new(fs_write));
+    let _ = reg.register(Box::new(fs_edit));
+    let _ = reg.register(Box::new(fs_tree));
+    let _ = reg.register(Box::new(grep));
+    let _ = reg.register(Box::new(glob));
+    let _ = reg.register(Box::new(shell));
+    let _ = reg.register(Box::new(git_diff));
+    let _ = reg.register(Box::new(git_log));
+    let _ = reg.register(Box::new(read_image));
     reg
 }
 
@@ -499,6 +1570,208 @@ fn tail_text(s: &str, max_chars: usize) -> String {
     }
     let start = s.chars().count().saturating_sub(max_chars);
     s.chars().skip(start).collect()
+}
+
+// ---- git helper ----------------------------------------------------------
+
+/// Captured outcome of a successful `run_git` invocation.
+struct GitOutput {
+    stdout: Vec<u8>,
+    truncated: bool,
+}
+
+enum GitRunError {
+    Spawn(std::io::Error),
+    Timeout,
+    NonZero { status: i32, stderr_tail: String },
+    Wait(std::io::Error),
+}
+
+impl GitRunError {
+    fn into_tool_result(self, tool_id: &str) -> ToolResult {
+        let (code, message) = match self {
+            Self::Spawn(e) => (E_DISPATCH_SPAWN_FAILED, format!("git spawn failed: {e}")),
+            Self::Timeout => (E_DISPATCH_TIMEOUT, "git timeout".to_string()),
+            Self::NonZero { status, stderr_tail } => (
+                E_DISPATCH_EXIT_NONZERO,
+                format!("git exit {status}: {stderr_tail}"),
+            ),
+            Self::Wait(e) => (E_DISPATCH_SPAWN_FAILED, format!("git wait failed: {e}")),
+        };
+        ToolResult::Err {
+            tool_id: tool_id.to_string(),
+            code: code.to_string(),
+            message,
+        }
+    }
+}
+
+/// Run `git <args>` rooted at `cwd` with a wall-clock `timeout`. Truncates
+/// captured stdout at `max_bytes` and reports it via [`GitOutput::truncated`].
+///
+/// Environment is reset to a minimal allowlist so the child's behavior is
+/// reproducible and does not leak the caller's shell aliases. `GIT_PAGER`
+/// is forced empty in case the caller forgot `--no-pager`.
+fn run_git(
+    cwd: &Path,
+    args: &[String],
+    timeout: Duration,
+    max_bytes: u64,
+) -> Result<GitOutput, GitRunError> {
+    let Some(git_bin) = which_in_path("git") else {
+        return Err(GitRunError::Spawn(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "git not on PATH",
+        )));
+    };
+    // Neutralize hook-execution surfaces in ~/.gitconfig and
+    // /etc/gitconfig — `diff.external`, custom `core.pager`,
+    // credential helpers, etc. — even when HOME is honored. Without
+    // these, env_clear is not enough: git still reads the user's
+    // global config and would invoke any external command it names.
+    let mut cmd = std::process::Command::new(&git_bin);
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+        .env("GIT_PAGER", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("LANG", "C.UTF-8")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(GitRunError::Spawn)?;
+    match wait_with_timeout(&mut child, timeout) {
+        WaitOutcome::Exited {
+            status,
+            stdout,
+            stderr,
+        } => {
+            if status == 0 {
+                let truncated = (stdout.len() as u64) > max_bytes;
+                let capped = if truncated {
+                    stdout
+                        .into_iter()
+                        .take(usize::try_from(max_bytes).unwrap_or(usize::MAX))
+                        .collect()
+                } else {
+                    stdout
+                };
+                Ok(GitOutput {
+                    stdout: capped,
+                    truncated,
+                })
+            } else {
+                let tail = String::from_utf8_lossy(&stderr).into_owned();
+                Err(GitRunError::NonZero {
+                    status,
+                    stderr_tail: tail_text(&tail, 256),
+                })
+            }
+        }
+        WaitOutcome::Timeout => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(GitRunError::Timeout)
+        }
+        WaitOutcome::WaitFailed(e) => Err(GitRunError::Wait(e)),
+    }
+}
+
+/// Refs (sha, branch, tag) accept `[A-Za-z0-9._/-]` and must be 1..=80
+/// chars. Refuses leading `-` so it can't be parsed as a flag, refuses
+/// `..` which `git` treats as a range we cannot validate further, and
+/// refuses anything starting or ending with `/` so a value like `/` or
+/// `v1/` is not silently re-interpreted as a pathspec by git.
+fn is_safe_ref(s: &str) -> bool {
+    if s.is_empty()
+        || s.len() > 80
+        || s.starts_with('-')
+        || s.starts_with('/')
+        || s.ends_with('/')
+        || s.contains("..")
+    {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+}
+
+// ---- image helpers -------------------------------------------------------
+
+fn sniff_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
+    // Magic-byte sniff first; fall back to extension if the bytes are
+    // ambiguous. Order matters — JPEG has multiple framings.
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(&[b'B', b'M']) {
+        return Some("image/bmp");
+    }
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        Some("bmp") => Some("image/bmp"),
+        Some("svg") => Some("image/svg+xml"),
+        _ => None,
+    }
+}
+
+/// Standard alphabet base64 with `=` padding. Kept inline to avoid pulling
+/// the `base64` crate into the runtime dep graph for a single use site.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHA: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut iter = bytes.chunks_exact(3);
+    for chunk in &mut iter {
+        let b0 = chunk[0];
+        let b1 = chunk[1];
+        let b2 = chunk[2];
+        out.push(ALPHA[(b0 >> 2) as usize] as char);
+        out.push(ALPHA[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(ALPHA[(((b1 & 0b1111) << 2) | (b2 >> 6)) as usize] as char);
+        out.push(ALPHA[(b2 & 0b111111) as usize] as char);
+    }
+    let rem = iter.remainder();
+    match rem.len() {
+        0 => {}
+        1 => {
+            let b0 = rem[0];
+            out.push(ALPHA[(b0 >> 2) as usize] as char);
+            out.push(ALPHA[((b0 & 0b11) << 4) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let b0 = rem[0];
+            let b1 = rem[1];
+            out.push(ALPHA[(b0 >> 2) as usize] as char);
+            out.push(ALPHA[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+            out.push(ALPHA[((b1 & 0b1111) << 2) as usize] as char);
+            out.push('=');
+        }
+        _ => unreachable!(),
+    }
+    out
 }
 
 #[cfg(test)]
@@ -979,7 +2252,7 @@ mod tests {
     // ---- default_dispatchers registry integration ---------------------
 
     #[test]
-    fn default_dispatchers_registers_two() {
+    fn default_dispatchers_registers_all() {
         let tmp = TempDir::new().expect("tmp");
         let reg = default_dispatchers(
             tmp.path().to_path_buf(),
@@ -987,9 +2260,17 @@ mod tests {
             passthrough_spec_in(tmp.path()),
         );
         let ids = reg.ids();
-        assert_eq!(ids.len(), 2);
+        assert_eq!(ids.len(), 10);
         assert!(ids.contains(&"fs.read"));
+        assert!(ids.contains(&"fs.write"));
+        assert!(ids.contains(&"fs.edit"));
+        assert!(ids.contains(&"fs.tree"));
+        assert!(ids.contains(&"grep"));
+        assert!(ids.contains(&"glob"));
         assert!(ids.contains(&"shell.exec"));
+        assert!(ids.contains(&"git.diff"));
+        assert!(ids.contains(&"git.log"));
+        assert!(ids.contains(&"read_image"));
     }
 
     #[test]
@@ -1147,5 +2428,242 @@ mod tests {
         let t = tail_text(&long, 10);
         assert_eq!(t.chars().count(), 10);
         assert!(long.ends_with(&t));
+    }
+
+    // ---- git.diff / git.log / read_image -----------------------------
+
+    fn make_invocation(
+        tool: &str,
+        args: BTreeMap<String, serde_json::Value>,
+    ) -> ToolInvocation {
+        ToolInvocation {
+            tool_id: tool.to_string(),
+            args,
+            capability: tool.to_string(),
+            turn_id: 1,
+        }
+    }
+
+    fn git_init_tmp() -> Option<TempDir> {
+        // Skip when `git` is not installed (CI sandboxes without git).
+        which_in_path("git")?;
+        let tmp = TempDir::new().ok()?;
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(tmp.path())
+            .status()
+            .ok()?
+            .success();
+        if !ok {
+            return None;
+        }
+        // Per-repo identity — never `git config --global`.
+        for (k, v) in [
+            ("user.email", "test@example.com"),
+            ("user.name", "Test"),
+            ("commit.gpgsign", "false"),
+        ] {
+            let _ = std::process::Command::new("git")
+                .args(["config", k, v])
+                .current_dir(tmp.path())
+                .status();
+        }
+        Some(tmp)
+    }
+
+    fn git_commit_file(tmp: &Path, name: &str, body: &str, msg: &str) {
+        fs::write(tmp.join(name), body).expect("write");
+        assert!(std::process::Command::new("git")
+            .args(["add", name])
+            .current_dir(tmp)
+            .status()
+            .expect("git add")
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["commit", "-q", "-m", msg])
+            .current_dir(tmp)
+            .status()
+            .expect("git commit")
+            .success());
+    }
+
+    #[test]
+    fn is_safe_ref_accepts_typical_refs() {
+        assert!(is_safe_ref("main"));
+        assert!(is_safe_ref("origin/main"));
+        assert!(is_safe_ref("v1.2.3"));
+        assert!(is_safe_ref("feature/new-thing"));
+        assert!(is_safe_ref("abc123"));
+    }
+
+    #[test]
+    fn is_safe_ref_rejects_metachars_and_ranges() {
+        assert!(!is_safe_ref(""));
+        assert!(!is_safe_ref("-flag"));
+        assert!(!is_safe_ref("a..b"));
+        assert!(!is_safe_ref("HEAD;rm -rf /"));
+        assert!(!is_safe_ref("--all"));
+        assert!(!is_safe_ref(&"a".repeat(200)));
+        // A leading or trailing slash trips git's pathspec heuristic
+        // on some platforms — refuse so the parser stays in revision
+        // mode unambiguously.
+        assert!(!is_safe_ref("/"));
+        assert!(!is_safe_ref("/main"));
+        assert!(!is_safe_ref("v1.0/"));
+    }
+
+    #[test]
+    fn git_log_returns_commit_rows() {
+        let Some(tmp) = git_init_tmp() else { return };
+        git_commit_file(tmp.path(), "a.txt", "one\n", "add a");
+        git_commit_file(tmp.path(), "b.txt", "two\n", "add b");
+        let dispatcher = GitLogToolDispatcher::new(tmp.path().to_path_buf());
+        let inv = make_invocation("git.log", BTreeMap::new());
+        match dispatcher.invoke(&inv) {
+            ToolResult::Ok { body, .. } => {
+                let commits = body
+                    .get("commits")
+                    .and_then(|v| v.as_array())
+                    .expect("commits array");
+                assert_eq!(commits.len(), 2);
+                assert_eq!(
+                    commits[0].get("subject").and_then(|v| v.as_str()),
+                    Some("add b"),
+                );
+                assert_eq!(
+                    commits[1].get("subject").and_then(|v| v.as_str()),
+                    Some("add a"),
+                );
+            }
+            ToolResult::Err { code, message, .. } => {
+                panic!("expected Ok, got Err({code}): {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn git_log_rejects_unsafe_since() {
+        let tmp = TempDir::new().expect("tmp");
+        let dispatcher = GitLogToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("since".to_string(), serde_json::json!("--all"));
+        let inv = make_invocation("git.log", args);
+        assert_err_code(dispatcher.invoke(&inv), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn git_log_rejects_path_traversal() {
+        let tmp = TempDir::new().expect("tmp");
+        let dispatcher = GitLogToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), serde_json::json!("../etc/passwd"));
+        let inv = make_invocation("git.log", args);
+        assert_err_code(dispatcher.invoke(&inv), E_DISPATCH_PATH_ESCAPE);
+    }
+
+    #[test]
+    fn git_diff_shows_unstaged_changes() {
+        let Some(tmp) = git_init_tmp() else { return };
+        git_commit_file(tmp.path(), "a.txt", "one\n", "add a");
+        fs::write(tmp.path().join("a.txt"), "one\ntwo\n").expect("dirty write");
+        let dispatcher = GitDiffToolDispatcher::new(tmp.path().to_path_buf());
+        let inv = make_invocation("git.diff", BTreeMap::new());
+        match dispatcher.invoke(&inv) {
+            ToolResult::Ok { body, .. } => {
+                let patch = body.get("patch").and_then(|v| v.as_str()).unwrap_or("");
+                assert!(patch.contains("a.txt"));
+                assert!(patch.contains("+two"));
+            }
+            ToolResult::Err { code, message, .. } => {
+                panic!("expected Ok, got Err({code}): {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn git_diff_rejects_unsafe_since() {
+        let tmp = TempDir::new().expect("tmp");
+        let dispatcher = GitDiffToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("since".to_string(), serde_json::json!("HEAD;rm -rf /"));
+        let inv = make_invocation("git.diff", args);
+        assert_err_code(dispatcher.invoke(&inv), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn read_image_returns_base64_and_sniffs_png() {
+        let tmp = TempDir::new().expect("tmp");
+        // Minimal PNG header. 8-byte signature, IHDR, IDAT skipped — we
+        // only assert on the MIME sniff path, not the round-trip.
+        let png_bytes: [u8; 16] = [
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R',
+        ];
+        fs::write(tmp.path().join("hi.png"), png_bytes).expect("write");
+        let dispatcher = ReadImageToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), serde_json::json!("hi.png"));
+        let inv = make_invocation("read_image", args);
+        match dispatcher.invoke(&inv) {
+            ToolResult::Ok { body, .. } => {
+                assert_eq!(body.get("mime").and_then(|v| v.as_str()), Some("image/png"));
+                let b64 = body
+                    .get("data_base64")
+                    .and_then(|v| v.as_str())
+                    .expect("data_base64");
+                // PNG signature in base64 is "iVBORw0KGgo".
+                assert!(b64.starts_with("iVBORw0KGgo"));
+            }
+            ToolResult::Err { code, message, .. } => {
+                panic!("expected Ok, got Err({code}): {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn read_image_rejects_oversize() {
+        let tmp = TempDir::new().expect("tmp");
+        let blob = vec![0u8; 2 * 1024 * 1024];
+        fs::write(tmp.path().join("big.bin"), &blob).expect("write");
+        let dispatcher = ReadImageToolDispatcher::new(tmp.path().to_path_buf());
+        // Pull the cap down so we exercise the size-cap path
+        // deterministically without writing megabytes.
+        let dispatcher = ReadImageToolDispatcher {
+            max_bytes: 1024,
+            ..dispatcher
+        };
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), serde_json::json!("big.bin"));
+        let inv = make_invocation("read_image", args);
+        assert_err_code(dispatcher.invoke(&inv), E_DISPATCH_SIZE_CAP);
+    }
+
+    #[test]
+    fn read_image_rejects_path_traversal() {
+        let tmp = TempDir::new().expect("tmp");
+        let dispatcher = ReadImageToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), serde_json::json!("../etc/passwd"));
+        let inv = make_invocation("read_image", args);
+        assert_err_code(dispatcher.invoke(&inv), E_DISPATCH_PATH_ESCAPE);
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn sniff_image_mime_falls_back_to_extension() {
+        let p = PathBuf::from("nope.svg");
+        assert_eq!(sniff_image_mime(&p, b"<svg></svg>"), Some("image/svg+xml"));
+        let p = PathBuf::from("unknown.bin");
+        assert_eq!(sniff_image_mime(&p, b"random"), None);
     }
 }

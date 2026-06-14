@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Stratum (mono)">
+  <title>Stratum mark — monochrome</title>
+  <!-- currentColor variant — pick up the surrounding text color for terminals + dark mode. -->
+  <g fill="currentColor">
+    <rect x="32"  y="56"  width="192" height="28" rx="6" />
+    <rect x="48"  y="100" width="160" height="28" rx="6" />
+    <rect x="64"  y="144" width="128" height="28" rx="6" />
+    <rect x="80"  y="188" width="96"  height="28" rx="6" />
+  </g>
+</svg>

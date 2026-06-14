@@ -14,7 +14,7 @@
 # https://github.com/krishnendu/homebrew-stratum.
 
 class Stratum < Formula
-  desc "Local-LLM agentic TUI agent for laptop-class hardware"
+  desc "Stratum — your local model crew. Local-first chat with an LLM agent"
   homepage "https://github.com/krishnendu/stratum"
   license any_of: ["Apache-2.0", "MIT"]
   version "0.2.1"

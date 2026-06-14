@@ -29,7 +29,7 @@ fn bin() -> Command {
 }
 
 fn transcripts_dir(root: &Path) -> PathBuf {
-    root.join("state").join("transcripts")
+    root.join("state").join("sessions")
 }
 
 fn fixed_at() -> SystemTime {

@@ -1,0 +1,24 @@
+[package]
+name         = "stratum-tui-api"
+description  = "Backend-agnostic API the Stratum TUI calls into. Lets the chat surface swap between a local in-process agent loop, a remote daemon, or a hosted provider without touching the renderer."
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+homepage     = { workspace = true }
+readme       = { workspace = true }
+keywords     = { workspace = true }
+categories   = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+serde      = { workspace = true }
+thiserror  = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
