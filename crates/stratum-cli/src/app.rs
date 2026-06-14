@@ -3145,6 +3145,11 @@ fn chat_with_model(
 /// Wraps `ShellToolDispatcher` with a passthrough sandbox + workspace-root
 /// cwd. Splits the user line on whitespace into `command` + `args`, calls
 /// the dispatcher, and renders the JSON body as plain text for the TUI.
+///
+/// Currently unused — the chat surface routes shell calls through the
+/// agent loop's dispatcher registry. Retained as the integration point
+/// for an upcoming non-agent `/!cmd` palette path.
+#[allow(dead_code, reason = "scaffold for upcoming /!cmd palette path")]
 fn build_shell_runner() -> impl Fn(&str) -> Result<String, String> + Send + Sync + 'static {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -3336,7 +3341,7 @@ fn chat_with_model(
         .with_history_path(paths.state.join("input_history.jsonl"))
         .with_theme_paths(
             paths.state.join("theme.txt"),
-            crate::theme::themes_dir_for(&paths.config),
+            stratum_tui::theme::themes_dir_for(&paths.config),
         )
         .with_statusline(std::env::var("STRATUM_STATUSLINE").unwrap_or_default());
     if let Some(prompt) = args.prompt.as_deref() {
@@ -3514,6 +3519,7 @@ fn build_memory_context(paths: &Paths) -> String {
     memory_loader::concat(&memory_loader::load(&cfg))
 }
 
+#[allow(dead_code, reason = "scaffold; wired in once /tools palette ships")]
 fn default_tool_catalog() -> Vec<(String, String)> {
     // Keep descriptions ONE short line, no JSON examples. Otherwise the
     // model dumps the example payloads back as plain text when a user
@@ -3617,6 +3623,7 @@ fn needs_refetch(target: &Path, _expected_sha256: &str, expected_bytes: u64) -> 
 
 /// Print the most recent assistant turn text to `out`. Used by the
 /// non-interactive `--prompt` flow.
+#[allow(dead_code, reason = "wired in once headless /print mode lands (plan/43)")]
 fn print_assistant_text(
     state: &crate::chat::ChatState,
     out: &mut dyn Write,

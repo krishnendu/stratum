@@ -1213,7 +1213,6 @@ fn is_duplicate_of_prior_call(prior_prompt: &str, this_blocks: &[Block]) -> bool
 }
 
 fn build_continuation_prompt(original: &str, blocks: &[Block]) -> String {
-    use std::fmt::Write;
     // Collect tool call + result lines first so we can drop older ones
     // when the total exceeds the budget.
     let mut entries: Vec<String> = Vec::new();

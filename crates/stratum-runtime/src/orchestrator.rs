@@ -29,7 +29,6 @@ use std::sync::Arc;
 use crate::agent_loop::{AgentLoop, TurnContext, TurnResult};
 use crate::cancel::CancelToken;
 use crate::intent_router::{IntentRouter, RoutedIntent};
-use crate::provider::Provider;
 use crate::reviewer::{ReviewVerdict, ReviewerPass};
 
 /// Configuration for the canonical orchestrator.
@@ -162,6 +161,7 @@ pub fn legacy_single_loop_config() -> OrchestratorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Provider;
     use crate::agent_loop::{AgentLoopBuilder, AgentLoopConfig};
     use crate::event_log::{EventEmitter, MemoryEventSink};
     use crate::intent_router::IntentRouter;

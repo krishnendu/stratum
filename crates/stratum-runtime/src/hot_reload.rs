@@ -27,7 +27,9 @@
 //!   off the libnotify / FSEvents link surface — the production CLI
 //!   build always enables `fs-watch`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(feature = "fs-watch")]
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 

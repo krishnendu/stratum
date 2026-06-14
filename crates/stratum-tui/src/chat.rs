@@ -1334,6 +1334,12 @@ impl ChatState {
         !self.mouse_capture_on
     }
 
+    /// Drain a pending external-editor request, if any.
+    ///
+    /// `/edit` (or Ctrl-E) sets the pending-edit flag; the event loop
+    /// polls this each tick and, on `Some(input)`, opens `$EDITOR` over
+    /// the current buffer and restores the modified text. Returns `None`
+    /// when no request is in flight.
     pub fn take_pending_edit_request(&mut self) -> Option<String> {
         if self.pending_edit_request {
             self.pending_edit_request = false;
@@ -2551,14 +2557,6 @@ impl ChatState {
         }
     }
 
-    /// Join the most recent [`Turn::Assistant`] entry's text blocks into a
-    /// single string.
-    ///
-    /// Returns `None` when the transcript contains no assistant turn or the
-    /// last assistant turn has no [`Block::Text`] blocks. Useful for the
-    /// `--prompt` non-interactive path and integration tests that need to
-    /// inspect what the provider produced without re-walking the transcript.
-    #[must_use]
     /// Most recent turn metrics (prompt+completion tokens, ms, tok/s).
     /// `None` if no turn has settled. Surfaced for `--output-format json`.
     #[must_use]
@@ -2578,6 +2576,14 @@ impl ChatState {
         self.active_model.clone()
     }
 
+    /// Join the most recent [`Turn::Assistant`] entry's text blocks into a
+    /// single string.
+    ///
+    /// Returns `None` when the transcript contains no assistant turn or the
+    /// last assistant turn has no [`Block::Text`] blocks. Useful for the
+    /// `--prompt` non-interactive path and integration tests that need to
+    /// inspect what the provider produced without re-walking the transcript.
+    #[must_use]
     pub fn last_assistant_text(&self) -> Option<String> {
         let blocks = self.transcript.iter().rev().find_map(|t| match t {
             Turn::Assistant(b) => Some(b),
@@ -4443,6 +4449,13 @@ fn restore_terminal() {
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
 }
 
+/// Drive the live TUI against a caller-supplied [`ChatState`] until the
+/// user quits. Optional [`stratum_runtime::TranscriptStore`] persists
+/// the session on exit.
+///
+/// # Errors
+/// Propagates terminal-init failures as [`io::Error`] wrapped in
+/// [`stratum_types::StratumError`].
 #[allow(
     clippy::print_stderr,
     reason = "post-TUI exit hints print after the terminal is restored — intentional shell output"
