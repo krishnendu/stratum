@@ -315,7 +315,10 @@ impl LlamaCppProvider {
         // no-op and the `unwrap_or(u32::MAX)` was dead code since the
         // mask guaranteed the cast would fit. This is the same value with
         // a 1-line comment instead of a misleading mask + fallback.
-        #[allow(clippy::cast_possible_truncation, reason = "intentional u64 → u32 truncation for sampler seed")]
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "intentional u64 → u32 truncation for sampler seed"
+        )]
         let seed = self.seed as u32;
         let mut samplers: Vec<LlamaSampler> = Vec::with_capacity(6);
         // GBNF enable resolution:
@@ -494,10 +497,7 @@ impl LlamaCppProvider {
                     "assistant" | "model" => "assistant",
                     _ => continue,
                 };
-                s.push_str(&format!(
-                    "<|im_start|>{role}\n{}<|im_end|>\n",
-                    turn.content
-                ));
+                s.push_str(&format!("<|im_start|>{role}\n{}<|im_end|>\n", turn.content));
             }
             s.push_str(&format!(
                 "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
@@ -605,11 +605,8 @@ impl LlamaCppProvider {
         // set `n_batch = n_ctx`, which allocates an 8K-token batch for
         // every turn even when the prompt is 200 tokens — wasting
         // hundreds of MB of activation memory on small models.
-        let formatted_prompt = self.format_chat_prompt_with(
-            &req.prompt,
-            req.system_override.as_deref(),
-            &req.history,
-        );
+        let formatted_prompt =
+            self.format_chat_prompt_with(&req.prompt, req.system_override.as_deref(), &req.history);
         let prompt_tokens = self
             .model
             .str_to_token(&formatted_prompt, AddBos::Never)
@@ -622,10 +619,7 @@ impl LlamaCppProvider {
         // to [512, n_ctx]. The lower bound matches llama.cpp's
         // historical default; the upper bound ensures we never exceed
         // the context size (which is also the assert ceiling).
-        let n_batch = prompt_len_u32
-            .next_power_of_two()
-            .max(512)
-            .min(self.n_ctx);
+        let n_batch = prompt_len_u32.next_power_of_two().max(512).min(self.n_ctx);
 
         let kv_type = self.kv_cache_type.to_llama_cpp();
         let mut ctx_params = LlamaContextParams::default()
@@ -1084,8 +1078,8 @@ fn text_to_blocks(text: String) -> Vec<Block> {
                 if let (Some(serde_json::Value::String(tool)), Some(args_val)) =
                     (map.get("tool"), map.get("args"))
                 {
-                    let args_str = serde_json::to_string(args_val)
-                        .unwrap_or_else(|_| "{}".to_string());
+                    let args_str =
+                        serde_json::to_string(args_val).unwrap_or_else(|_| "{}".to_string());
                     blocks.push(Block::ToolCall {
                         id: format!("call-{tool}"),
                         tool: tool.clone(),
@@ -1101,9 +1095,8 @@ fn text_to_blocks(text: String) -> Vec<Block> {
             }
             _ => {
                 blocks.push(Block::Text {
-                    text:
-                        "(model tried to call a tool but emitted a malformed payload; ignoring)"
-                            .to_string(),
+                    text: "(model tried to call a tool but emitted a malformed payload; ignoring)"
+                        .to_string(),
                 });
             }
         }
@@ -1205,7 +1198,10 @@ fn find_all_tool_call_spans(s: &str) -> Vec<(usize, usize)> {
 
 /// Backwards-compat shim: callers that just need the first span (the
 /// streaming-text detector + a couple of tests) still get it here.
-#[allow(dead_code, reason = "kept for test access to the single-span code path")]
+#[allow(
+    dead_code,
+    reason = "kept for test access to the single-span code path"
+)]
 fn find_tool_call_span(s: &str) -> Option<(usize, usize)> {
     let bytes = s.as_bytes();
     for start in 0..bytes.len() {
@@ -1426,13 +1422,7 @@ mod tests {
 
     #[test]
     fn scrubber_handles_back_to_back_think_blocks() {
-        let out = drive(&[
-            "a ",
-            "<think>x</think>",
-            " ",
-            "<think>y</think>",
-            " b",
-        ]);
+        let out = drive(&["a ", "<think>x</think>", " ", "<think>y</think>", " b"]);
         assert_eq!(out, "a   b");
     }
 
@@ -1492,7 +1482,9 @@ mod tests {
         assert_eq!(blocks.len(), 3);
         assert!(matches!(blocks[0], Block::Text { ref text } if text.contains("check the README")));
         assert!(matches!(blocks[1], Block::ToolCall { ref tool, .. } if tool == "fs.read"));
-        assert!(matches!(blocks[2], Block::Text { ref text } if text.contains("Then I'll edit it.")));
+        assert!(
+            matches!(blocks[2], Block::Text { ref text } if text.contains("Then I'll edit it."))
+        );
     }
 
     #[test]
@@ -1517,9 +1509,7 @@ mod tests {
     #[test]
     fn text_to_blocks_prose_with_tool_word_not_destroyed() {
         // Pre-fix bug: any prose with "tool" + { triggered malformed-tool path
-        let blocks = text_to_blocks(
-            "The `tool` field in the {config} controls X.".to_string(),
-        );
+        let blocks = text_to_blocks("The `tool` field in the {config} controls X.".to_string());
         assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0], Block::Text { .. }));
     }
@@ -1542,7 +1532,9 @@ mod tests {
         assert!(output_ends_with_stop_sentinel("done <|im_end|>"));
         assert!(output_ends_with_stop_sentinel("done<end_of_turn>"));
         assert!(!output_ends_with_stop_sentinel("plain ending"));
-        assert!(!output_ends_with_stop_sentinel("<|im_end|> at start, more text after"));
+        assert!(!output_ends_with_stop_sentinel(
+            "<|im_end|> at start, more text after"
+        ));
     }
 
     // ---- JSONL fixture replay -------------------------------------
@@ -1590,30 +1582,49 @@ mod tests {
     fn check_fixture(case: &FixtureCase, blocks: &[Block]) -> Result<(), String> {
         if let Some(n) = case.expect.min_blocks {
             if blocks.len() < n {
-                return Err(format!("{}: want >= {} blocks, got {}", case.name, n, blocks.len()));
+                return Err(format!(
+                    "{}: want >= {} blocks, got {}",
+                    case.name,
+                    n,
+                    blocks.len()
+                ));
             }
         }
         if let Some(n) = case.expect.max_blocks {
             if blocks.len() > n {
-                return Err(format!("{}: want <= {} blocks, got {}", case.name, n, blocks.len()));
+                return Err(format!(
+                    "{}: want <= {} blocks, got {}",
+                    case.name,
+                    n,
+                    blocks.len()
+                ));
             }
         }
         if let Some(t) = case.expect.contains_tool_call.as_deref() {
-            let hit = blocks.iter().any(|b| matches!(b, Block::ToolCall { tool, .. } if tool == t));
+            let hit = blocks
+                .iter()
+                .any(|b| matches!(b, Block::ToolCall { tool, .. } if tool == t));
             if !hit {
                 return Err(format!("{}: missing ToolCall for {t}", case.name));
             }
         }
         if let Some(s) = case.expect.contains_text_substr.as_deref() {
-            let hit = blocks.iter().any(|b| matches!(b, Block::Text { text } if text.contains(s)));
+            let hit = blocks
+                .iter()
+                .any(|b| matches!(b, Block::Text { text } if text.contains(s)));
             if !hit {
                 return Err(format!("{}: no Text block contains {:?}", case.name, s));
             }
         }
         for forbidden in &case.expect.forbids_text_substr {
-            let hit = blocks.iter().any(|b| matches!(b, Block::Text { text } if text.contains(forbidden)));
+            let hit = blocks
+                .iter()
+                .any(|b| matches!(b, Block::Text { text } if text.contains(forbidden)));
             if hit {
-                return Err(format!("{}: forbidden substring {:?} appears in a Text block", case.name, forbidden));
+                return Err(format!(
+                    "{}: forbidden substring {:?} appears in a Text block",
+                    case.name, forbidden
+                ));
             }
         }
         if case.expect.forbids_tool_call {
@@ -1731,7 +1742,10 @@ mod tests {
                 failures.push(msg);
             }
         }
-        assert!(total >= 5, "fixture file should have at least 5 cases, got {total}");
+        assert!(
+            total >= 5,
+            "fixture file should have at least 5 cases, got {total}"
+        );
         assert!(
             failures.is_empty(),
             "fixture failures:\n  {}",
@@ -1781,9 +1795,7 @@ mod tests {
         let blocks = text_to_blocks(text.to_string());
         // Either no blocks emitted, or the original text preserved —
         // either way no ToolCall is fired.
-        assert!(!blocks
-            .iter()
-            .any(|b| matches!(b, Block::ToolCall { .. })));
+        assert!(!blocks.iter().any(|b| matches!(b, Block::ToolCall { .. })));
     }
 
     #[test]
@@ -1792,9 +1804,7 @@ mod tests {
         let text = r#"{"tool":"glob"}"#;
         let blocks = text_to_blocks(text.to_string());
         // No ToolCall because the span scanner requires both keys.
-        assert!(!blocks
-            .iter()
-            .any(|b| matches!(b, Block::ToolCall { .. })));
+        assert!(!blocks.iter().any(|b| matches!(b, Block::ToolCall { .. })));
     }
 
     #[test]
@@ -1803,7 +1813,9 @@ mod tests {
         // catches it (agent_loop test covers that side).
         let text = r#"{"tool":"../../etc/passwd","args":{}}"#;
         let blocks = text_to_blocks(text.to_string());
-        assert!(matches!(blocks[0], Block::ToolCall { ref tool, .. } if tool == "../../etc/passwd"));
+        assert!(
+            matches!(blocks[0], Block::ToolCall { ref tool, .. } if tool == "../../etc/passwd")
+        );
     }
 
     #[test]
@@ -1812,7 +1824,9 @@ mod tests {
         // extractor just hands the args through.
         let text = r#"{"tool":"fs.read","args":{"path":"../../etc/passwd"}}"#;
         let blocks = text_to_blocks(text.to_string());
-        assert!(matches!(blocks[0], Block::ToolCall { ref args, .. } if args.contains("../../etc/passwd")));
+        assert!(
+            matches!(blocks[0], Block::ToolCall { ref args, .. } if args.contains("../../etc/passwd"))
+        );
     }
 
     #[test]
@@ -1830,9 +1844,7 @@ mod tests {
         s.push_str(" more prose");
         let blocks = text_to_blocks(s);
         // Random JSON without tool/args keys is text, not a tool call.
-        assert!(!blocks
-            .iter()
-            .any(|b| matches!(b, Block::ToolCall { .. })));
+        assert!(!blocks.iter().any(|b| matches!(b, Block::ToolCall { .. })));
     }
 
     #[test]
@@ -1848,9 +1860,7 @@ mod tests {
         // Fullwidth left-curly U+FF5B isn't ASCII '{'; scanner skips it.
         let text = "answer: \u{ff5b}\"tool\":\"glob\",\"args\":{}\u{ff5d}".to_string();
         let blocks = text_to_blocks(text);
-        assert!(!blocks
-            .iter()
-            .any(|b| matches!(b, Block::ToolCall { .. })));
+        assert!(!blocks.iter().any(|b| matches!(b, Block::ToolCall { .. })));
     }
 
     #[test]
@@ -1859,9 +1869,7 @@ mod tests {
         // shouldn't latch onto it as a candidate.
         let text = r#"discussion: "the tool field in the config is X""#;
         let blocks = text_to_blocks(text.to_string());
-        assert!(!blocks
-            .iter()
-            .any(|b| matches!(b, Block::ToolCall { .. })));
+        assert!(!blocks.iter().any(|b| matches!(b, Block::ToolCall { .. })));
     }
 
     #[test]
@@ -1936,7 +1944,8 @@ mod tests {
     #[test]
     fn text_to_blocks_qwen_tool_call_becomes_toolcall_block() {
         let blocks = text_to_blocks(
-            r#"<tool_call>{"name":"fs.read","arguments":{"path":"README.md"}}</tool_call>"#.to_string(),
+            r#"<tool_call>{"name":"fs.read","arguments":{"path":"README.md"}}</tool_call>"#
+                .to_string(),
         );
         assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0], Block::ToolCall { ref tool, .. } if tool == "fs.read"));

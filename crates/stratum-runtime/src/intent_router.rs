@@ -488,6 +488,10 @@ fn extract_tool_hint(prompt: &str) -> String {
 }
 
 /// The curated default rule set. Exported so tests can re-load it.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the rule table is the canonical catalogue; splitting it would just hide the surface"
+)]
 fn default_rules() -> Vec<IntentRule> {
     vec![
         IntentRule {
@@ -586,7 +590,8 @@ fn default_rules() -> Vec<IntentRule> {
         // Code-shaped requests: action verbs commonly used for code work.
         IntentRule {
             pattern: IntentPattern::Regex(
-                r"(?i)\b(refactor|debug|implement|fix(?: the)?|convert|add a test|panic|compile)\b".to_string(),
+                r"(?i)\b(refactor|debug|implement|fix(?: the)?|convert|add a test|panic|compile)\b"
+                    .to_string(),
             ),
             intent: Intent::Code { language: None },
             weight: 1.0,
@@ -632,9 +637,7 @@ fn default_rules() -> Vec<IntentRule> {
         },
         // Cancel: bare imperative + /cancel handled above.
         IntentRule {
-            pattern: IntentPattern::Regex(
-                r"(?i)^(cancel|stop|abort|halt)\b".to_string(),
-            ),
+            pattern: IntentPattern::Regex(r"(?i)^(cancel|stop|abort|halt)\b".to_string()),
             intent: Intent::Cancel,
             weight: 2.0,
             tier: ModelTier::Low,
@@ -643,9 +646,7 @@ fn default_rules() -> Vec<IntentRule> {
         },
         // Memory recall: catch "what did i ask" / "earlier".
         IntentRule {
-            pattern: IntentPattern::Regex(
-                r"(?i)\b(what did i (ask|say)|earlier)\b".to_string(),
-            ),
+            pattern: IntentPattern::Regex(r"(?i)\b(what did i (ask|say)|earlier)\b".to_string()),
             intent: Intent::MemoryRecall,
             weight: 1.0,
             tier: ModelTier::Low,
@@ -685,9 +686,12 @@ mod tests {
 
     #[test]
     fn classifier_meets_phase2_accuracy_target() {
-        let raw = include_str!(
-            "../fixtures/intent_router/labeled_50.jsonl"
-        );
+        #[derive(serde::Deserialize)]
+        struct Row {
+            prompt: String,
+            expected: String,
+        }
+        let raw = include_str!("../fixtures/intent_router/labeled_50.jsonl");
         let r = router();
         let mut total = 0_usize;
         let mut correct = 0_usize;
@@ -699,24 +703,23 @@ mod tests {
             if line.is_empty() {
                 continue;
             }
-            #[derive(serde::Deserialize)]
-            struct Row {
-                prompt: String,
-                expected: String,
-            }
-            let row: Row = serde_json::from_str(line)
+            let parsed: Row = serde_json::from_str(line)
                 .unwrap_or_else(|e| panic!("bad fixture row {line:?}: {e}"));
             total += 1;
-            *by_class_total.entry(label_str(&row.expected)).or_insert(0) += 1;
-            let routed = r.classify(&row.prompt);
+            *by_class_total
+                .entry(label_str(&parsed.expected))
+                .or_insert(0) += 1;
+            let routed = r.classify(&parsed.prompt);
             let predicted = label_for(&routed.intent);
-            if predicted == row.expected {
+            if predicted == parsed.expected {
                 correct += 1;
-                *by_class_correct.entry(label_str(&row.expected)).or_insert(0) += 1;
+                *by_class_correct
+                    .entry(label_str(&parsed.expected))
+                    .or_insert(0) += 1;
             } else {
                 misclassified.push((
-                    row.prompt.clone(),
-                    row.expected.clone(),
+                    parsed.prompt.clone(),
+                    parsed.expected.clone(),
                     predicted.to_string(),
                 ));
             }

@@ -1337,7 +1337,11 @@ n.count = { $n }
         let bundle = default_bundle().unwrap();
         let id = MessageId::new("stratum-greeting").unwrap();
         let resolved = bundle
-            .lookup(&LocaleId::new("en").unwrap(), &id, &Default::default())
+            .lookup(
+                &LocaleId::new("en").unwrap(),
+                &id,
+                &std::collections::BTreeMap::default(),
+            )
             .unwrap();
         assert!(!resolved.is_empty());
     }

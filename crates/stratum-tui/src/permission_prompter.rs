@@ -188,7 +188,8 @@ mod tests {
     fn prompt(id: u64) -> PendingPrompt {
         PendingPrompt {
             id: PromptId(id),
-            request: PermissionRequest::ToolUse { args: String::new(),
+            request: PermissionRequest::ToolUse {
+                args: String::new(),
                 tool_id: "fs.write".into(),
             },
             issued_at: SystemTime::UNIX_EPOCH,

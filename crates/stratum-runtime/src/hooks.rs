@@ -48,7 +48,7 @@ impl Event {
     /// Stable string label written to the hook command's stdin payload
     /// and to the per-event matcher table.
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::SessionStart => "SessionStart",
             Self::UserPromptSubmit => "UserPromptSubmit",
@@ -154,12 +154,8 @@ impl HookDispatcher {
     /// Fire all matching hooks for `event` with the given payload.
     /// `matcher_target` is the matcher input (e.g. tool id + first
     /// arg) used when comparing against a hook's `matcher` glob.
-    pub fn fire(
-        &self,
-        event: Event,
-        matcher_target: &str,
-        payload_json: &str,
-    ) -> Outcome {
+    #[must_use]
+    pub fn fire(&self, event: Event, matcher_target: &str, payload_json: &str) -> Outcome {
         let Some(hooks) = self.by_event.get(event.label()) else {
             return Outcome::Allow { transform: None };
         };

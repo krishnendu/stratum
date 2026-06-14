@@ -457,7 +457,8 @@ mod tests {
     }
 
     fn sample_tool() -> PermissionRequest {
-        PermissionRequest::ToolUse { args: String::new(),
+        PermissionRequest::ToolUse {
+            args: String::new(),
             tool_id: "shell.exec".into(),
         }
     }

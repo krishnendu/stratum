@@ -89,20 +89,17 @@ impl ReviewerPass {
     ///
     /// Returns `None` when the reviewer reply isn't parseable —
     /// that's intentional, the reviewer is advisory, not load-bearing.
+    #[must_use]
     pub fn review(
         &self,
         user_prompt: &str,
         draft: &str,
         cancel: &CancelToken,
     ) -> Option<ReviewVerdict> {
-        let history = vec![
-            ChatHistoryTurn {
-                role: "user".to_string(),
-                content: format!(
-                    "User asked: {user_prompt}\n\nAssistant draft to review:\n{draft}"
-                ),
-            },
-        ];
+        let history = vec![ChatHistoryTurn {
+            role: "user".to_string(),
+            content: format!("User asked: {user_prompt}\n\nAssistant draft to review:\n{draft}"),
+        }];
         let req = GenerateRequest {
             model: self.model.clone(),
             prompt: "Score the draft above.".to_string(),
@@ -140,9 +137,8 @@ fn parse_reviewer_reply(reply: &str) -> Option<ReviewVerdict> {
     let body = &trimmed[start..];
     let v: serde_json::Value = serde_json::from_str(body).ok().or_else(|| {
         // Try parsing up to the matching close.
-        find_balanced_close(&body[1..]).and_then(|end| {
-            serde_json::from_str::<serde_json::Value>(&body[..=end + 1]).ok()
-        })
+        find_balanced_close(&body[1..])
+            .and_then(|end| serde_json::from_str::<serde_json::Value>(&body[..=end + 1]).ok())
     })?;
     let obj = v.as_object()?;
     let verdict = obj.get("verdict")?.as_str()?.to_string();
@@ -202,10 +198,8 @@ mod tests {
 
     #[test]
     fn parse_reviewer_reply_clean_verdict() {
-        let r = parse_reviewer_reply(
-            r#"{"verdict":"clean","issues":[],"severity":"low"}"#,
-        )
-        .unwrap();
+        let r =
+            parse_reviewer_reply(r#"{"verdict":"clean","issues":[],"severity":"low"}"#).unwrap();
         assert_eq!(r.verdict, "clean");
         assert!(r.is_clean());
         assert_eq!(r.severity, Severity::Low);
@@ -258,10 +252,8 @@ mod tests {
 
     #[test]
     fn parse_reviewer_reply_unknown_severity_defaults_to_low() {
-        let r = parse_reviewer_reply(
-            r#"{"verdict":"fix","issues":["x"],"severity":"galactic"}"#,
-        )
-        .unwrap();
+        let r = parse_reviewer_reply(r#"{"verdict":"fix","issues":["x"],"severity":"galactic"}"#)
+            .unwrap();
         assert_eq!(r.severity, Severity::Low);
     }
 
@@ -280,7 +272,10 @@ mod tests {
             }],
             severity: Severity::Low,
         };
-        assert!(!v.is_clean(), "clean verdict with issues is not actually clean");
+        assert!(
+            !v.is_clean(),
+            "clean verdict with issues is not actually clean"
+        );
     }
 
     #[test]

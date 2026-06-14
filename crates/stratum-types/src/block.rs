@@ -174,11 +174,11 @@ impl Block {
     ///
     /// Centralises the JSON-string-to-typed-map conversion that
     /// every dispatcher would otherwise re-implement. Cheap on the
-    /// happy path — serde_json is forgiving and tail-recursive over
+    /// happy path — `serde_json` is forgiving and tail-recursive over
     /// short objects.
     #[must_use]
     pub fn tool_args(&self) -> Option<serde_json::Map<String, serde_json::Value>> {
-        if let Block::ToolCall { args, .. } = self {
+        if let Self::ToolCall { args, .. } = self {
             serde_json::from_str::<serde_json::Value>(args)
                 .ok()
                 .and_then(|v| match v {

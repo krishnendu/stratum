@@ -41,18 +41,9 @@ impl IgnoreRule {
         if raw.is_empty() || raw.starts_with('#') {
             return None;
         }
-        let (negated, rest) = match raw.strip_prefix('!') {
-            Some(r) => (true, r),
-            None => (false, raw),
-        };
-        let (anchored, rest) = match rest.strip_prefix('/') {
-            Some(r) => (true, r),
-            None => (false, rest),
-        };
-        let (dir_only, rest) = match rest.strip_suffix('/') {
-            Some(r) => (true, r),
-            None => (false, rest),
-        };
+        let (negated, rest) = raw.strip_prefix('!').map_or((false, raw), |r| (true, r));
+        let (anchored, rest) = rest.strip_prefix('/').map_or((false, rest), |r| (true, r));
+        let (dir_only, rest) = rest.strip_suffix('/').map_or((false, rest), |r| (true, r));
         if rest.is_empty() {
             return None;
         }
@@ -102,7 +93,7 @@ impl Ignore {
     /// Does this matcher have any rules? Used by callers to skip
     /// allocation on the hot path when there's no file at all.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
 
@@ -178,7 +169,7 @@ fn glob_inner(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
         // Single-segment star.
         for k in ti..=t.len() {
             // `*` does NOT consume `/`.
-            if t[ti..k].iter().any(|c| *c == '/') {
+            if t[ti..k].contains(&'/') {
                 break;
             }
             if glob_inner(p, pi + 1, t, k) {
@@ -292,11 +283,7 @@ mod tests {
     fn from_workspace_prefers_stratumignore_over_gitignore() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".gitignore"), "ignored_by_git\n").unwrap();
-        std::fs::write(
-            tmp.path().join(".stratumignore"),
-            "ignored_by_stratum\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join(".stratumignore"), "ignored_by_stratum\n").unwrap();
         let i = Ignore::from_workspace(tmp.path());
         assert!(i.is_ignored("ignored_by_stratum", false));
         assert!(!i.is_ignored("ignored_by_git", false));

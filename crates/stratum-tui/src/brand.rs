@@ -86,14 +86,12 @@ pub const ASCII_MARK: [&str; 4] = [
 /// 10-frame braille animation per `plan/44 §6.1`. Cadence: 80ms per
 /// frame. Same cycle used by lazygit, helix, and most modern Rust
 /// TUIs — feels native rather than novel.
-pub const SPINNER_FRAMES: [&str; 10] = [
-    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-];
+pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Pick the current spinner frame given an elapsed-time in ms.
 /// Centralises the cadence so callers don't tune it independently.
 #[must_use]
-pub fn spinner_frame_for(elapsed_ms: u128) -> &'static str {
+pub const fn spinner_frame_for(elapsed_ms: u128) -> &'static str {
     let idx = ((elapsed_ms / 80) % SPINNER_FRAMES.len() as u128) as usize;
     SPINNER_FRAMES[idx]
 }
@@ -128,6 +126,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(
+        clippy::const_is_empty,
+        reason = "guards against an accidental empty-string regression in the constants"
+    )]
     fn tagline_constants_non_empty() {
         assert!(!TAGLINE.is_empty());
         assert!(!TAGLINE_SHORT.is_empty());
@@ -145,8 +147,10 @@ mod tests {
     fn ascii_mark_is_four_lines() {
         assert_eq!(ASCII_MARK.len(), 4);
         // Each line wider-or-equal to the next — wedge invariant.
-        let widths: Vec<usize> =
-            ASCII_MARK.iter().map(|s| s.chars().filter(|c| *c == '█').count()).collect();
+        let widths: Vec<usize> = ASCII_MARK
+            .iter()
+            .map(|s| s.chars().filter(|c| *c == '█').count())
+            .collect();
         for w in widths.windows(2) {
             assert!(w[0] >= w[1], "wedge invariant violated: {widths:?}");
         }
@@ -176,6 +180,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::const_is_empty,
+        reason = "guards against an accidental empty-tip regression"
+    )]
     fn tips_list_non_empty() {
         assert!(!TIPS.is_empty());
         for t in TIPS {

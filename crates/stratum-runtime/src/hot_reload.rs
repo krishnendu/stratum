@@ -27,9 +27,9 @@
 //!   off the libnotify / FSEvents link surface — the production CLI
 //!   build always enables `fs-watch`.
 
-use std::path::PathBuf;
 #[cfg(feature = "fs-watch")]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -114,6 +114,11 @@ impl HotReloader {
     /// paths (e.g. permission denied, path doesn't exist). Missing
     /// optional paths are silently skipped — only a *registered* path
     /// that fails to install bubbles up.
+    #[allow(
+        clippy::unnecessary_wraps,
+        clippy::needless_pass_by_value,
+        reason = "Result/owned WatchInputs are the public contract; the no-op stub path under !fs-watch is incidental"
+    )]
     pub fn start(inputs: WatchInputs) -> Result<ReloaderHandle, HotReloadError> {
         let _ = inputs.debounce.unwrap_or(DEFAULT_DEBOUNCE);
         #[cfg(feature = "fs-watch")]
@@ -175,7 +180,14 @@ fn start_notify(inputs: WatchInputs) -> Result<ReloaderHandle, HotReloadError> {
     let thread = std::thread::Builder::new()
         .name("stratum-hot-reload".into())
         .spawn(move || {
-            run_dispatch_loop(raw_rx, out_tx, settings_files, agent_dirs, hook_files, debounce);
+            run_dispatch_loop(
+                raw_rx,
+                out_tx,
+                settings_files,
+                agent_dirs,
+                hook_files,
+                debounce,
+            );
         })
         .map_err(|e| HotReloadError::InstallFailed(e.to_string()))?;
 

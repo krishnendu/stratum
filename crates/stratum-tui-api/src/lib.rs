@@ -8,7 +8,7 @@
 //! * **Daemon** — a long-running local agent process the TUI speaks
 //!   to over a unix socket (planned: Phase 8 mobile path so the
 //!   phone UI can drive a desktop agent).
-//! * **Hosted** — a remote provider (Anthropic, OpenAI, LiteLLM)
+//! * **Hosted** — a remote provider (Anthropic, `OpenAI`, `LiteLLM`)
 //!   accessed over HTTP. Each is a thin [`BackendApi`] impl in its
 //!   own crate (`stratum-backend-anthropic`, …) so users opt in via
 //!   feature flag or runtime config without forcing the dependency
@@ -64,10 +64,11 @@ pub struct ModelInfo {
     pub active: bool,
 }
 
-/// What the user typed plus any context the backend needs to start
-/// a turn. Backends receive this once per [`BackendApi::submit`]
-/// call. Free-form fields stay in [`BackendRequest::system_hints`]
-/// so adding new metadata doesn't require a contract bump.
+/// What the user typed plus any context the backend needs to start a turn.
+///
+/// Backends receive this once per [`BackendApi::submit`] call. Free-form
+/// fields stay in [`BackendRequest::system_hints`] so adding new metadata
+/// doesn't require a contract bump.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendRequest {
     /// What the user typed for this turn.
@@ -182,12 +183,7 @@ pub trait BackendApi: Send + Sync {
     /// Implementations spawn whatever worker fits — a thread, a
     /// tokio task, a remote call — and return immediately. The TUI
     /// stays responsive.
-    fn submit(
-        &self,
-        req: BackendRequest,
-        events: Sender<BackendEvent>,
-        cancel: CancellationToken,
-    );
+    fn submit(&self, req: BackendRequest, events: Sender<BackendEvent>, cancel: CancellationToken);
 
     /// Models the user can pick from. Cheap; called when the user
     /// opens `/models` or `/switch`.

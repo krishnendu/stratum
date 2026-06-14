@@ -480,6 +480,11 @@ impl AgentLoop {
         self.run_turn_inner(ctx, cancel, Some(chunk_tx), 0)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        clippy::needless_pass_by_value,
+        reason = "ctx is moved into history at end-of-turn; loop body is the canonical multi-block dispatch path"
+    )]
     fn run_turn_inner(
         &self,
         ctx: TurnContext,
@@ -564,15 +569,15 @@ impl AgentLoop {
         let cancel_for_worker = child_cancel.clone();
         let chunk_tx_for_worker = chunk_tx.clone();
         let worker = thread::spawn(move || {
-            let result = match chunk_tx_for_worker {
-                Some(stream_tx) => {
+            let result = chunk_tx_for_worker.map_or_else(
+                || provider.generate(&req, &cancel_for_worker),
+                |stream_tx| {
                     let cb = |b: &Block| {
                         let _ = stream_tx.send(b.clone());
                     };
                     provider.generate_streaming(&req, &cancel_for_worker, &cb)
-                }
-                None => provider.generate(&req, &cancel_for_worker),
-            };
+                },
+            );
             // Best-effort send; receiver may already be gone if the
             // deadline expired.
             let _ = tx.send(result);
@@ -724,11 +729,9 @@ impl AgentLoop {
             let dispatcher_populated = !self.dispatcher.ids().is_empty();
             if dispatcher_populated && !self.dispatcher.supports(&id) {
                 let known = self.dispatcher.ids().join(", ");
-                let msg = format!(
-                    "Unknown tool: {id}. Available: {known}."
-                );
+                let msg = format!("Unknown tool: {id}. Available: {known}.");
                 blocks.push(Block::ToolResult {
-                    id: call_id.clone(),
+                    id: call_id,
                     output: msg,
                 });
                 let outcome = TurnOutcome::ToolFailure {
@@ -758,19 +761,47 @@ impl AgentLoop {
             // checks to short-circuit them — production sets the
             // flag true via the CLI.
             if self.config.validate_tool_args {
-            // Pre-block disallowed shell.exec commands. The sandbox
-            // would reject them anyway, but going through the
-            // permission flow first is bad UX: the user gets asked
-            // to approve `rm -rf /` and then sees a generic dispatch
-            // failure. Refusing up front is cleaner.
-            if id == "shell.exec" {
-                if let Some(why) = disallowed_shell_command(&args_json) {
-                    let msg = format!(
-                        "shell.exec rejected: {why}. \
+                // Pre-block disallowed shell.exec commands. The sandbox
+                // would reject them anyway, but going through the
+                // permission flow first is bad UX: the user gets asked
+                // to approve `rm -rf /` and then sees a generic dispatch
+                // failure. Refusing up front is cleaner.
+                if id == "shell.exec" {
+                    if let Some(why) = disallowed_shell_command(&args_json) {
+                        let msg = format!(
+                            "shell.exec rejected: {why}. \
                          Use one of: ls, cat, pwd, head, tail, wc, echo, git."
+                        );
+                        blocks.push(Block::ToolResult {
+                            id: call_id,
+                            output: msg,
+                        });
+                        let outcome = TurnOutcome::ToolFailure {
+                            tool_id: id,
+                            code: "STRAT-E5006".into(),
+                        };
+                        let _ = driver.apply(
+                            TurnEvent::Finish {
+                                outcome: outcome.clone(),
+                            },
+                            ctx.started_at,
+                        );
+                        return TurnResult {
+                            turn_id: ctx.turn_id,
+                            outcome,
+                            blocks,
+                            transitions: driver.history().to_vec(),
+                            events_emitted,
+                        };
+                    }
+                }
+                if let Some(missing) = missing_required_args(&id, &args_json) {
+                    let msg = format!(
+                        "{id} called without required arg(s): {missing}. \
+                     Re-issue the call with the missing fields."
                     );
                     blocks.push(Block::ToolResult {
-                        id: call_id.clone(),
+                        id: call_id,
                         output: msg,
                     });
                     let outcome = TurnOutcome::ToolFailure {
@@ -791,35 +822,7 @@ impl AgentLoop {
                         events_emitted,
                     };
                 }
-            }
-            if let Some(missing) = missing_required_args(&id, &args_json) {
-                let msg = format!(
-                    "{id} called without required arg(s): {missing}. \
-                     Re-issue the call with the missing fields."
-                );
-                blocks.push(Block::ToolResult {
-                    id: call_id.clone(),
-                    output: msg,
-                });
-                let outcome = TurnOutcome::ToolFailure {
-                    tool_id: id,
-                    code: "STRAT-E5006".into(),
-                };
-                let _ = driver.apply(
-                    TurnEvent::Finish {
-                        outcome: outcome.clone(),
-                    },
-                    ctx.started_at,
-                );
-                return TurnResult {
-                    turn_id: ctx.turn_id,
-                    outcome,
-                    blocks,
-                    transitions: driver.history().to_vec(),
-                    events_emitted,
-                };
-            }
-            }  // end if dispatcher_populated (schema gate)
+            } // end if dispatcher_populated (schema gate)
             if tool_checks >= self.config.max_tool_calls_per_turn {
                 // Budget exhausted before this call ran — fail fast with
                 // a structured `BudgetExceeded` outcome so the caller can
@@ -1103,7 +1106,7 @@ impl AgentLoop {
 /// tool-call / tool-result pairs that were dispatched this iteration.
 /// Used by [`AgentLoop::run_turn_inner`] to feed the provider context
 /// for the next agentic step. Simple text-append format is provider-
-/// agnostic; per-model formats (Qwen `<tool_call>`, Hermes ChatML, etc.)
+/// agnostic; per-model formats (Qwen `<tool_call>`, Hermes `ChatML`, etc.)
 /// land when GBNF grammar wiring does.
 /// Max bytes per tool-result block in the continuation prompt. Beyond
 /// this we truncate with an ellipsis. Caps prompt growth so the
@@ -1156,9 +1159,9 @@ fn missing_required_args(tool: &str, args_json: &str) -> Option<String> {
         ("shell.exec", &["command"]),
         ("subagent.run", &["name", "task"]),
     ];
-    let required = REQUIRED.iter().find_map(|(t, fields)| {
-        if *t == tool { Some(*fields) } else { None }
-    })?;
+    let required = REQUIRED
+        .iter()
+        .find_map(|(t, fields)| if *t == tool { Some(*fields) } else { None })?;
     if required.is_empty() {
         return None;
     }
@@ -1184,7 +1187,7 @@ fn missing_required_args(tool: &str, args_json: &str) -> Option<String> {
 }
 
 /// True when the current step's tool call repeats one already
-/// embedded in `prior_prompt`. The prior_prompt is the previous
+/// embedded in `prior_prompt`. The `prior_prompt` is the previous
 /// continuation prompt (which lists prior tool calls verbatim), so if
 /// the JSON `{"tool":..,"args":..}` we're about to dispatch again
 /// already appears there, we're spinning. Used to break loops where
@@ -1342,16 +1345,15 @@ mod tests {
 
     #[test]
     fn missing_required_args_detects_missing_path_on_fs_read() {
-        assert_eq!(missing_required_args("fs.read", "{}").as_deref(), Some("path"));
+        assert_eq!(
+            missing_required_args("fs.read", "{}").as_deref(),
+            Some("path")
+        );
     }
 
     #[test]
     fn missing_required_args_passes_well_formed_fs_write() {
-        assert!(missing_required_args(
-            "fs.write",
-            r#"{"path":"a","content":"hi"}"#
-        )
-        .is_none());
+        assert!(missing_required_args("fs.write", r#"{"path":"a","content":"hi"}"#).is_none());
     }
 
     #[test]
@@ -2875,7 +2877,7 @@ mod tests {
         // Provider's original ToolCall + Text blocks are preserved verbatim,
         // followed by the synthesized `Block::ToolResult` emitted by the
         // dispatch loop so the agentic continuation can pick it up.
-        let mut expected = original.clone();
+        let mut expected = original;
         expected.push(Block::ToolResult {
             id: "echo".into(),
             output: "{}".into(),

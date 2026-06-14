@@ -59,7 +59,7 @@ pub enum Tier {
 }
 
 impl Tier {
-    fn label(&self) -> &'static str {
+    const fn label(&self) -> &'static str {
         match self {
             Self::Managed => "Managed",
             Self::User => "User",
@@ -76,7 +76,7 @@ pub struct LoadedSection {
     pub tier: Tier,
     /// The path on disk (for the `[Source: …]` marker).
     pub source: PathBuf,
-    /// The fully-imported body text, capped at MAX_TIER_BYTES.
+    /// The fully-imported body text, capped at `MAX_TIER_BYTES`.
     pub body: String,
 }
 
@@ -92,10 +92,11 @@ pub struct LoaderConfig {
     pub cwd: Option<PathBuf>,
 }
 
-/// Run the loader. Returns one [`LoadedSection`] per tier that
-/// resolved successfully, in concatenation order (managed → user →
-/// project [outermost → innermost] → local). Caller stitches them
-/// into the model's system prompt.
+/// Run the loader.
+///
+/// Returns one [`LoadedSection`] per tier that resolved successfully, in
+/// concatenation order (managed → user → project [outermost → innermost]
+/// → local). Caller stitches them into the model's system prompt.
 #[must_use]
 pub fn load(cfg: &LoaderConfig) -> Vec<LoadedSection> {
     let mut out: Vec<LoadedSection> = Vec::new();
@@ -126,17 +127,19 @@ pub fn load(cfg: &LoaderConfig) -> Vec<LoadedSection> {
 /// markers. Suitable for appending to the model's system prompt.
 #[must_use]
 pub fn concat(sections: &[LoadedSection]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
     for s in sections {
         if !out.is_empty() {
             out.push_str("\n\n");
         }
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "[Source: {} ({})]\n{}",
             s.source.display(),
             s.tier.label(),
             s.body
-        ));
+        );
     }
     out
 }
@@ -152,7 +155,11 @@ fn read_section(tier: Tier, path: &Path) -> Option<LoadedSection> {
         while end > 0 && !resolved.is_char_boundary(end) {
             end -= 1;
         }
-        format!("{}\n[…truncated at {} bytes]", &resolved[..end], MAX_TIER_BYTES)
+        format!(
+            "{}\n[…truncated at {} bytes]",
+            &resolved[..end],
+            MAX_TIER_BYTES
+        )
     };
     Some(LoadedSection {
         tier,
@@ -175,18 +182,12 @@ fn walk_up_project_files(cwd: &Path) -> Vec<(PathBuf, bool)> {
         if depth > MAX_WALK_UP {
             break;
         }
-        for candidate in [
-            p.join("STRATUM.md"),
-            p.join(".stratum/STRATUM.md"),
-        ] {
+        for candidate in [p.join("STRATUM.md"), p.join(".stratum/STRATUM.md")] {
             if candidate.is_file() {
                 hits.push((candidate, false));
             }
         }
-        for candidate in [
-            p.join("STRATUM.local.md"),
-            p.join(".stratum/local.md"),
-        ] {
+        for candidate in [p.join("STRATUM.local.md"), p.join(".stratum/local.md")] {
             if candidate.is_file() {
                 hits.push((candidate, true));
             }
@@ -204,8 +205,9 @@ fn walk_up_project_files(cwd: &Path) -> Vec<(PathBuf, bool)> {
 
 /// Resolve `@file` imports. Lines starting with `@./`, `@~/`, or
 /// `@/` are replaced by the target file's contents (capped at
-/// MAX_TIER_BYTES per import, recursion depth-limited).
+/// `MAX_TIER_BYTES` per import, recursion depth-limited).
 fn resolve_imports(text: &str, anchor: &Path, depth: usize) -> String {
+    use std::fmt::Write as _;
     if depth >= MAX_IMPORT_DEPTH {
         return text.to_string();
     }
@@ -217,29 +219,21 @@ fn resolve_imports(text: &str, anchor: &Path, depth: usize) -> String {
             if let Some(resolved_path) = resolve_import_path(target, anchor) {
                 match std::fs::read_to_string(&resolved_path) {
                     Ok(body) => {
-                        out.push_str(&format!(
-                            "<!-- @import: {} -->\n",
-                            resolved_path.display()
-                        ));
-                        let nested =
-                            resolve_imports(&body, &resolved_path, depth + 1);
+                        let _ = writeln!(out, "<!-- @import: {} -->", resolved_path.display());
+                        let nested = resolve_imports(&body, &resolved_path, depth + 1);
                         out.push_str(&nested);
                         out.push('\n');
                         continue;
                     }
                     Err(e) => {
-                        out.push_str(&format!(
-                            "[import failed: {} ({})]\n",
-                            resolved_path.display(),
-                            e
-                        ));
+                        let _ =
+                            writeln!(out, "[import failed: {} ({})]", resolved_path.display(), e);
                         continue;
                     }
                 }
-            } else {
-                out.push_str(&format!("[import failed: {target} (path rejected)]\n"));
-                continue;
             }
+            let _ = writeln!(out, "[import failed: {target} (path rejected)]");
+            continue;
         }
         out.push_str(line);
         out.push('\n');
@@ -287,7 +281,7 @@ mod tests {
         let user = tmp.path().join("STRATUM.md");
         write(&user, "user rules");
         let cfg = LoaderConfig {
-            user_path: Some(user.clone()),
+            user_path: Some(user),
             ..Default::default()
         };
         let out = load(&cfg);
@@ -309,7 +303,7 @@ mod tests {
         let inner = project.join("crates").join("foo");
         write(&inner.join("STRATUM.md"), "inner crate rules");
         let cfg = LoaderConfig {
-            cwd: Some(inner.clone()),
+            cwd: Some(inner),
             ..Default::default()
         };
         let out = load(&cfg);
@@ -329,7 +323,9 @@ mod tests {
             ..Default::default()
         };
         let out = load(&cfg);
-        assert!(out.iter().any(|s| s.tier == Tier::Local && s.body.contains("local rules")));
+        assert!(out
+            .iter()
+            .any(|s| s.tier == Tier::Local && s.body.contains("local rules")));
     }
 
     #[test]
@@ -352,6 +348,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "single-char filenames mirror the @import depth-chain under test"
+    )]
     fn imports_cap_at_max_depth() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
@@ -375,7 +375,7 @@ mod tests {
         let combined: String = out.iter().map(|s| s.body.clone()).collect();
         // Depth 4 means we get a/b/c/d but the @./e.md inside d is the 5th level.
         assert!(combined.contains("main"));
-        assert!(combined.contains("d"));
+        assert!(combined.contains('d'));
         // "deepest" sits past the recursion cap; the `@./e.md` line
         // is left as literal text inside d.md's rendered body.
         assert!(combined.contains("@./e.md"));
