@@ -2639,11 +2639,12 @@ mod tests {
     #[test]
     fn read_image_rejects_oversize() {
         let tmp = TempDir::new().expect("tmp");
-        let blob = vec![0u8; 2 * 1024 * 1024];
+        // Cap is pulled down below to 1024 bytes; anything above that
+        // triggers the size-cap path. 2 KiB is enough to prove the
+        // cap without writing megabytes on every test run.
+        let blob = vec![0u8; 2048];
         fs::write(tmp.path().join("big.bin"), &blob).expect("write");
         let dispatcher = ReadImageToolDispatcher::new(tmp.path().to_path_buf());
-        // Pull the cap down so we exercise the size-cap path
-        // deterministically without writing megabytes.
         let dispatcher = ReadImageToolDispatcher {
             max_bytes: 1024,
             ..dispatcher
@@ -3599,7 +3600,9 @@ mod tests {
             .get("entries")
             .and_then(|v| v.as_array())
             .expect("entries");
-        assert!(entries.len() <= 3);
+        // Tight equality — `<= 3` would silently pass even if the
+        // cap logic returned 0 entries.
+        assert_eq!(entries.len(), 3);
     }
 
     #[cfg(unix)]
@@ -3908,9 +3911,18 @@ mod tests {
         // A safe ref that exists (HEAD~1 has "..", refuse; use a non-range ref).
         args.insert("since".to_string(), v_str("HEAD"));
         let result = d.invoke(&make_invocation("git.diff", args));
-        // Either Ok with empty patch or Err — but never panic.
+        // Ok means the ref threaded through and produced a (possibly
+        // empty) patch field. Err is acceptable too on hosts whose
+        // git refuses the ref, but the response shape must always be
+        // one of the two — neither a panic nor any other variant.
         match result {
-            ToolResult::Ok { .. } | ToolResult::Err { .. } => {}
+            ToolResult::Ok { body, .. } => {
+                assert!(
+                    body.get("patch").is_some(),
+                    "git.diff with `since` must surface a `patch` field: {body}"
+                );
+            }
+            ToolResult::Err { .. } => {}
         }
     }
 
@@ -4012,9 +4024,14 @@ mod tests {
         let dispatcher = GitLogToolDispatcher::new(tmp.path().to_path_buf());
         let mut args = BTreeMap::new();
         args.insert("since".to_string(), v_str("HEAD"));
-        // Some shape; we don't pin the exact body, just that it returns Ok.
         match dispatcher.invoke(&make_invocation("git.log", args)) {
-            ToolResult::Ok { .. } | ToolResult::Err { .. } => {}
+            ToolResult::Ok { body, .. } => {
+                assert!(
+                    body.get("commits").is_some(),
+                    "git.log with `since` must surface a `commits` field: {body}"
+                );
+            }
+            ToolResult::Err { .. } => {}
         }
     }
 
@@ -4235,7 +4252,7 @@ mod tests {
         let raw = (0u8..32).collect::<Vec<_>>();
         let enc = base64_encode(&raw);
         assert_eq!(enc.len(), 44);
-        // No '=' since 32 % 3 == 2 → exactly 1 pad char.
+        // 32 % 3 == 2 → exactly 1 padding '=' char.
         assert!(enc.ends_with('='));
     }
 
