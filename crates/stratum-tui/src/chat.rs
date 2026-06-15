@@ -2573,6 +2573,24 @@ impl ChatState {
             .or_else(|| raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
             .unwrap_or(raw);
         let raw_path = std::path::PathBuf::from(path_str);
+        // Defense-in-depth: refuse relative paths containing `..`. The
+        // chat surface is local-trust (the user types what they want
+        // to read), but a malicious pasted prompt that hides a
+        // `../../../etc/passwd` traversal inside a `/image` shouldn't
+        // resolve to anything the user couldn't otherwise type. Absolute
+        // paths are explicitly the user's choice; relative paths must
+        // descend cleanly.
+        if !raw_path.is_absolute()
+            && raw_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return PaletteOutcome::Rejected {
+                message: format!(
+                    "/image: relative path traverses parent (`..`) — use an absolute path: {path_str}"
+                ),
+            };
+        }
         let resolved = if raw_path.is_absolute() {
             raw_path.clone()
         } else {
@@ -2617,13 +2635,12 @@ impl ChatState {
         }
         let bytes = std::fs::read(path).map_err(|e| format!("/image: read failed: {e}"))?;
         // Reuse the same magic-byte + extension sniff the
-        // `read_image` tool dispatcher uses, exposed publicly as
-        // `sniff_image_mime_public` (see runtime crate).
-        let mime = stratum_runtime::sniff_image_mime_public(path, &bytes)
-            .unwrap_or("application/octet-stream");
+        // `read_image` tool dispatcher uses.
+        let mime =
+            stratum_runtime::sniff_image_mime(path, &bytes).unwrap_or("application/octet-stream");
         let raw_len = bytes.len() as u64;
         let bytes_u32 = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-        let encoded = stratum_runtime::base64_encode_public(&bytes);
+        let encoded = stratum_runtime::base64_encode(&bytes);
         let block = Block::image_inline_b64(mime, encoded, bytes_u32);
         self.pending_attachments.push(block);
         Ok((mime, raw_len))
@@ -7319,5 +7336,73 @@ mod tests {
             "expected acknowledged for quoted path, got {outcome:?}"
         );
         assert_eq!(s.pending_attachment_count(), 1);
+    }
+
+    #[test]
+    fn image_palette_command_rejects_relative_parent_traversal() {
+        let mut s = state();
+        let outcome = s.execute_palette_command("/image ../../etc/passwd");
+        if let PaletteOutcome::Rejected { message } = outcome {
+            assert!(
+                message.contains("traverses parent") || message.contains("`..`"),
+                "wrong rejection message: {message}"
+            );
+        } else {
+            panic!("expected Rejected for `..` traversal, got {outcome:?}");
+        }
+        assert_eq!(
+            s.pending_attachment_count(),
+            0,
+            "rejected /image must not queue anything"
+        );
+    }
+
+    /// `ChatBackend` that always reports failure. Used to verify
+    /// attachments drain even when the turn doesn't succeed.
+    #[derive(Debug, Default)]
+    struct FailingBackend;
+    impl ChatBackend for FailingBackend {
+        fn run_turn_streaming(
+            &self,
+            ctx: TurnContext,
+            _cancel: &CancelToken,
+            _chunk_tx: mpsc::Sender<Block>,
+        ) -> TurnResult {
+            TurnResult {
+                turn_id: ctx.turn_id,
+                outcome: TurnOutcome::ModelError {
+                    // Existing declared sentinel; the test doesn't
+                    // care which code, only that the outcome is non-success.
+                    code: "STRAT-E3007".into(),
+                },
+                blocks: Vec::new(),
+                transitions: Vec::new(),
+                events_emitted: Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn pending_attachments_drain_even_when_turn_fails() {
+        // Documented contract: attachments are spent per-turn,
+        // regardless of outcome. A failed turn must NOT leave them
+        // queued for the next prompt (which would silently re-charge
+        // them in tokens + bandwidth and surprise the user).
+        let chat_backend: Arc<dyn ChatBackend> = Arc::new(FailingBackend);
+        let mut s = ChatState::with_backend(chat_backend);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_tiny_png(tmp.path(), "tiny.png");
+        let cmd = format!("/image {}", path.display());
+        s.execute_palette_command(&cmd);
+        assert_eq!(s.pending_attachment_count(), 1);
+
+        s.submit_with_prompt("describe this image");
+
+        assert_eq!(
+            s.pending_attachment_count(),
+            0,
+            "attachments must drain on failure too — they belong to the user's turn, not to a retry"
+        );
     }
 }

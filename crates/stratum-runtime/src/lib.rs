@@ -390,7 +390,7 @@ pub use telemetry::{
 pub use tier::Tier;
 pub use tool_dispatcher_mcp::{parse_mcp_tool_id, McpToolDispatcher};
 pub use tool_dispatchers::{
-    base64_encode_public, default_dispatchers, sniff_image_mime_public, FsReadToolDispatcher,
+    base64_encode, default_dispatchers, sniff_image_mime, FsReadToolDispatcher,
     ShellToolDispatcher, SHELL_DEFAULT_ALLOWLIST,
 };
 pub use tool_invocation::{
