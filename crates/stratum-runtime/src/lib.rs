@@ -231,6 +231,8 @@ pub mod tools;
 pub mod transcript;
 /// `stratum self-update` channel-manifest data shape (Phase 1 scaffold).
 pub mod update_manifest;
+/// whisper.cpp subprocess scaffold for Phase 5 voice-in transcription.
+pub mod whisper;
 /// Workspace / project discovery (`stratum.toml`, `.stratumignore`).
 pub mod workspace;
 
@@ -398,7 +400,7 @@ pub use tier::Tier;
 pub use tool_dispatcher_mcp::{parse_mcp_tool_id, McpToolDispatcher};
 pub use tool_dispatchers::{
     base64_encode, default_dispatchers, sniff_image_mime, FsReadToolDispatcher,
-    ShellToolDispatcher, SHELL_DEFAULT_ALLOWLIST,
+    ReadAudioToolDispatcher, ShellToolDispatcher, SHELL_DEFAULT_ALLOWLIST,
 };
 pub use tool_invocation::{
     quick_dispatch, DenyDispatcher, DispatchError, EchoDispatcher, RegistryDispatcher,
