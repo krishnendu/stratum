@@ -58,6 +58,7 @@ regex              = { workspace = true }
 keyring            = { workspace = true, optional = true }
 notify             = { workspace = true, optional = true }
 thiserror          = { workspace = true }
+tiny_http          = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

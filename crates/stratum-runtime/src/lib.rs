@@ -129,6 +129,8 @@ pub mod model_catalog;
 pub mod model_resolver;
 /// Turn-level observability primitives: token meter, latency steps, tok/s.
 pub mod observability;
+/// OpenAI-compatible Chat Completions HTTP egress (`stratum serve --openai`).
+pub mod openai;
 /// Canonical multi-role orchestrator wrapping AgentLoop with router +
 /// reviewer + polish per plan/03 + plan/17.
 pub mod orchestrator;
@@ -316,6 +318,11 @@ pub use model_catalog::{
 pub use model_resolver::{BlobFetcher, ModelResolver, ResolveModelError};
 pub use observability::{
     format_tokens_per_second, RoleStep, RoleTimer, TurnId, TurnIdGen, TurnMetrics, TurnRecorder,
+};
+pub use openai::{
+    loop_factory_from_agent_factory, LoopFactory, OpenAIChatMessage, OpenAIChatRequest,
+    OpenAIChatResponse, OpenAIChoice, OpenAIDelta, OpenAIModelEntry, OpenAIModelList, OpenAIServer,
+    OpenAIServerConfig, OpenAIServerHandle, OpenAIStreamChoice, OpenAIStreamChunk, OpenAIUsage,
 };
 pub use paths::Paths;
 pub use permission_prompt::{
