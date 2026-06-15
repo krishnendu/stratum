@@ -1,0 +1,2 @@
+# Versioned bench-floor history. Written nightly by .github/workflows/bench-floor.yml.
+# Per-month JSONL files (e.g. 2026-06.jsonl) + a latest.json snapshot.
