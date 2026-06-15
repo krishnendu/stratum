@@ -65,6 +65,35 @@ struct Cli {
     #[arg(long, global = true, env = "STRATUM_STORAGE_ROOT")]
     storage_root: Option<PathBuf>,
 
+    /// Headless print mode: run one non-interactive turn against the
+    /// resolved provider, print the assistant's final text to stdout,
+    /// and exit. Mirrors `claude -p "<prompt>"` from Claude Code so
+    /// Stratum participates in shell pipelines and CI. Per plan/43.
+    ///
+    /// Equivalent shorthand for `stratum chat --prompt "<PROMPT>"`.
+    /// Mutually exclusive with passing a subcommand; if both are
+    /// supplied the CLI rejects the invocation with exit 64 instead of
+    /// guessing which path to take.
+    #[arg(short = 'p', long = "print", value_name = "PROMPT")]
+    print: Option<String>,
+
+    /// Output format used by `-p` / `--print` mode. Accepts `text`
+    /// (default — assistant text streamed to stdout), `json` (one
+    /// envelope object with blocks + metrics), or `stream-json` (one
+    /// JSON object per emitted block as NDJSON). Per plan/43 §3.
+    /// Ignored unless `--print` is also set. Clap's `requires` only
+    /// fires for user-supplied values, not the `default_value` — so
+    /// the gate triggers exit 64 only when `--output-format` is
+    /// passed without `--print`, which is the intended behaviour.
+    #[arg(
+        long = "output-format",
+        value_name = "FMT",
+        default_value = "text",
+        value_parser = ["text", "json", "stream-json"],
+        requires = "print"
+    )]
+    output_format: String,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -1131,6 +1160,21 @@ where
             return ExitCode::from(78);
         }
     };
+
+    // Headless `stratum -p "<prompt>"` shortcut (plan/43). Mutually
+    // exclusive with a subcommand — passing both is ambiguous and
+    // exits 64 (clap's bad-args code) so callers don't end up running
+    // an unintended path.
+    if let Some(prompt) = cli.print.as_deref() {
+        if cli.command.is_some() {
+            let _ = writeln!(
+                err,
+                "stratum: --print/-p is mutually exclusive with a subcommand"
+            );
+            return ExitCode::from(64);
+        }
+        return headless_print(prompt, &cli.output_format, &paths, out, err);
+    }
 
     match cli.command {
         None => print_greeting(&paths, out),
@@ -3673,18 +3717,57 @@ fn needs_refetch(target: &Path, _expected_sha256: &str, expected_bytes: u64) -> 
     std::fs::metadata(target).map_or(true, |m| m.len() != expected_bytes)
 }
 
-/// Print the most recent assistant turn text to `out`. Used by the
-/// non-interactive `--prompt` flow.
-#[allow(
-    dead_code,
-    reason = "wired in once headless /print mode lands (plan/43)"
-)]
+/// Print the most recent assistant turn text to `out`. Thin wrapper
+/// over [`print_assistant`] fixed to the `"text"` format — used by
+/// the headless `stratum -p "<prompt>"` entry point (plan/43) when
+/// no `--output-format` is set so the choice of format is centralised
+/// in one place even though the wrapper itself is trivial.
 fn print_assistant_text(
     state: &crate::chat::ChatState,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
     print_assistant(state, out, err, "text")
+}
+
+/// Headless `stratum -p "<prompt>"` entry point (plan/43).
+///
+/// One non-interactive turn against the [`EchoProvider`] (or the
+/// resolved llama.cpp provider once auto-select fires), printed to
+/// `out` in the requested `output_format`, then exit. The path never
+/// touches `crossterm` / raw mode / the alternate screen — it
+/// constructs a [`ChatState`] inline and dispatches through
+/// [`print_assistant_text`] (text) or [`print_assistant`] (json /
+/// stream-json) so the binary stays pipe-friendly.
+///
+/// Exit codes:
+/// * `0` on success (last assistant turn produced at least one text
+///   block).
+/// * `1` on provider / model error (no usable assistant blocks).
+/// * `64` on an empty / whitespace-only prompt (clap's bad-args code).
+fn headless_print(
+    prompt: &str,
+    output_format: &str,
+    paths: &Paths,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    if prompt.trim().is_empty() {
+        let _ = writeln!(err, "stratum: --print/-p was empty; nothing to send");
+        return ExitCode::from(64);
+    }
+    let probe = HardwareProbe::run();
+    let tier = Tier::classify(&probe);
+    let provider = EchoProvider::new("");
+    let mut state = crate::chat::ChatState::new(provider, tier, crate::chat::status_for(paths));
+    state.submit_with_prompt(prompt);
+    match output_format {
+        // Explicit "text" routes through the public `print_assistant_text`
+        // wrapper so callers see a single named entry point in the
+        // backtrace; other formats go straight to the dispatcher.
+        "text" => print_assistant_text(&state, out, err),
+        other => print_assistant(&state, out, err, other),
+    }
 }
 
 /// Dispatch the print path by output format. Per plan/43 §3.
@@ -3695,10 +3778,13 @@ fn print_assistant(
     format: &str,
 ) -> ExitCode {
     match format {
+        "text" => print_assistant_text_inner(state, out, err),
         "json" => print_assistant_json(state, out, err),
         "stream-json" => print_assistant_stream_json(state, out, err),
-        // Anything else falls through to text (the safe default).
-        _ => print_assistant_text_inner(state, out, err),
+        // Clap's `value_parser` on `--output-format` restricts to the
+        // three arms above; anything reaching here is a programming
+        // error, not user input.
+        _ => unreachable!("clap value_parser rejects unknown formats"),
     }
 }
 
@@ -3819,7 +3905,15 @@ fn build_turn_envelope(state: &crate::chat::ChatState) -> TurnEnvelope {
         .unwrap_or_default();
     let blocks: Vec<serde_json::Value> = last_assistant_blocks
         .iter()
-        .map(|b| serde_json::to_value(b).unwrap_or(serde_json::Value::Null))
+        .map(|b| {
+            #[allow(
+                clippy::expect_used,
+                reason = "Block is a primitive-shaped enum (String/u32/Vec); serde_json::to_value is infallible — matches the pattern at app.rs:4487 + carve-out in docs/coverage-exclusions.md"
+            )]
+            {
+                serde_json::to_value(b).expect("Block serialization is infallible")
+            }
+        })
         .collect();
     let outcome =
         if last_assistant_blocks.is_empty() && state.last_assistant_failure_reason().is_some() {
