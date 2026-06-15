@@ -351,6 +351,7 @@ mod tests {
             artifact: sample_artifact(),
             license: "Apache-2.0".to_owned(),
             homepage: None,
+            vision_mmproj: None,
         }
     }
 

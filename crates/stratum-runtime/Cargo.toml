@@ -22,6 +22,13 @@ default = []
 # is exercised by the `provider-llama-cpp` workflow (nightly cron, release
 # tag, manual dispatch) — not per-PR CI.
 provider-llama-cpp = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# Multimodal vision routing via llama.cpp's `mtmd` (mmproj) interface.
+# Implies `provider-llama-cpp`. The `mtmd` module in llama-cpp-2 0.1.146
+# is upstream-tagged experimental — keeping it behind its own feature
+# means the default and `provider-llama-cpp` builds don't depend on the
+# experimental ABI. Per `plan/05-multimodal.md`: Gemma 4 E4B + companion
+# `mmproj-*.gguf` is the v1 vision pair.
+vision = ["provider-llama-cpp", "llama-cpp-2/mtmd"]
 # OS keyring backend for SecretStore. Off by default so per-PR CI doesn't
 # build dbus/SecretService on Linux runners that lack the system libs.
 # Production CLI builds opt in; tests rely on the in-memory backend.

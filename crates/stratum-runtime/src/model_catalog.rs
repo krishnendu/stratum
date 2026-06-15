@@ -347,6 +347,20 @@ pub struct ModelEntry {
     pub license: String,
     /// Optional homepage / model card URL.
     pub homepage: Option<String>,
+    /// Optional companion mmproj (multimodal projection) sidecar
+    /// artifact. Set on entries whose `task` set includes
+    /// [`ModelTask::Vision`]; pairs the model's GGUF weights with a
+    /// separate `mmproj-*.gguf` projector file that llama.cpp's `mtmd`
+    /// interface needs to encode images. `None` for text-only models.
+    ///
+    /// Per `plan/05-multimodal.md`: Gemma 4 E4B + companion
+    /// `mmproj-*.gguf` is the v1 vision pair; the URL + sha256 are
+    /// pinned the same way as `artifact`. When this field is missing
+    /// from a vision-tagged entry the installer should surface a clear
+    /// "no projector available" error rather than silently letting the
+    /// model load without vision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_mmproj: Option<ArtifactRef>,
 }
 
 /// Reference to a downloadable model artifact.
@@ -495,6 +509,7 @@ mod tests {
             artifact: sample_artifact(),
             license: "Apache-2.0".to_owned(),
             homepage: None,
+            vision_mmproj: None,
         }
     }
 

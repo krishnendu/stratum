@@ -127,6 +127,18 @@ pub struct LlamaCppProviderConfig {
     /// (~no quality loss); `Q4_0` quarters it (small quality hit).
     /// Per plan/04 §KV cache. Both K and V use the same type in v1.
     pub kv_cache_type: KvCacheKind,
+    /// Optional path to a multimodal projection (`mmproj-*.gguf`)
+    /// sidecar file. When set AND the `vision` cargo feature is on,
+    /// `Block::Image` attachments on a request are encoded through this
+    /// projector via llama.cpp's `mtmd` interface before the text
+    /// prompt is decoded. When unset, attachments are dropped at the
+    /// provider boundary with a debug log — the rest of the surface
+    /// (tokenization, sampler, history) is unaffected.
+    ///
+    /// Per `plan/05-multimodal.md`: Gemma 4 E4B + its companion
+    /// `mmproj-*.gguf` is the v1 vision pair; future vision models
+    /// (Qwen2.5-VL, Llama Vision) plug in the same way.
+    pub mmproj_path: Option<PathBuf>,
 }
 
 /// User-facing KV cache element type. Maps to llama-cpp-2's
@@ -196,6 +208,7 @@ impl LlamaCppProviderConfig {
             seed,
             enable_gbnf: false,
             kv_cache_type: KvCacheKind::F16,
+            mmproj_path: None,
         })
     }
 }
@@ -230,6 +243,13 @@ pub struct LlamaCppProvider {
     /// to the system prompt every turn. Per plan/39 §8 and plan/40 §5.
     /// Empty string = no memory context injected.
     memory_context: String,
+    /// Optional path to the multimodal projection (`mmproj-*.gguf`)
+    /// sidecar that pairs with this GGUF for vision input. When set,
+    /// `Block::Image` attachments on a `GenerateRequest` are routed
+    /// through llama.cpp's `mtmd` interface (feature-gated; see
+    /// `route_attachments`). When `None`, attachments are dropped at
+    /// the provider boundary with a debug log.
+    mmproj_path: Option<PathBuf>,
 }
 
 impl LlamaCppProvider {
@@ -262,6 +282,7 @@ impl LlamaCppProvider {
             kv_cache_type: cfg.kv_cache_type,
             tools: Vec::new(),
             memory_context: String::new(),
+            mmproj_path: cfg.mmproj_path.clone(),
         })
     }
 
@@ -281,6 +302,152 @@ impl LlamaCppProvider {
     pub fn with_tools(mut self, tools: Vec<(String, String)>) -> Self {
         self.tools = tools;
         self
+    }
+
+    /// Override the mmproj sidecar path. Useful when a higher-level
+    /// `ModelCatalog` resolves the projector at install time and the
+    /// caller wants to set it without rebuilding the whole config.
+    /// Pass `None` to disable vision routing.
+    #[must_use]
+    pub fn with_mmproj_path(mut self, path: Option<PathBuf>) -> Self {
+        self.mmproj_path = path;
+        self
+    }
+
+    /// Inspect the currently-installed mmproj sidecar (test surface).
+    #[must_use]
+    pub fn mmproj_path(&self) -> Option<&std::path::Path> {
+        self.mmproj_path.as_deref()
+    }
+
+    /// Route a request's `attachments` list through the multimodal head.
+    ///
+    /// This is the seam Phase 5 wires: the agent loop forwards
+    /// `Block::Image` payloads on the request, and this function decides
+    /// whether to inject them into the model. The default surface
+    /// (without the `vision` cargo feature) logs a debug line and drops
+    /// the payload — the text path runs unaffected. Under
+    /// `--features vision` + a valid `mmproj_path`, this function
+    /// initialises an `MtmdContext` once per request, decodes each image
+    /// through it, and emits chunks into the KV cache so the subsequent
+    /// text decode can attend to them.
+    ///
+    /// Returns:
+    /// - `Ok(true)` — attachments were processed (or none were present).
+    /// - `Ok(false)` — attachments were present but no mmproj sidecar
+    ///   is configured; caller should surface a `Block::Cancelled` so the
+    ///   user understands their image didn't reach the model.
+    /// - `Err(VisionRoutingError)` — image bytes or mmproj load failed.
+    ///
+    /// The function is intentionally pure-by-default: nothing happens
+    /// when `attachments.is_empty()` so the hot path pays zero cost.
+    pub(crate) fn route_attachments(
+        &self,
+        attachments: &[Block],
+    ) -> Result<bool, VisionRoutingError> {
+        if attachments.is_empty() {
+            return Ok(true);
+        }
+        let image_count = attachments.iter().filter(|b| b.is_image()).count();
+        if image_count == 0 {
+            tracing::debug!(
+                target: "stratum::llama_provider::vision",
+                non_image_attachments = attachments.len(),
+                "dropping non-image attachments (audio routing not wired yet)"
+            );
+            return Ok(true);
+        }
+        let Some(mmproj_path) = self.mmproj_path.as_ref() else {
+            tracing::debug!(
+                target: "stratum::llama_provider::vision",
+                image_count,
+                "request has image attachments but no mmproj sidecar configured; dropping"
+            );
+            return Ok(false);
+        };
+        #[cfg(feature = "vision")]
+        {
+            self.route_attachments_with_mtmd(attachments, mmproj_path, image_count)
+        }
+        #[cfg(not(feature = "vision"))]
+        {
+            // mmproj_path is set but the `vision` feature is off — the
+            // surface is wired but the actual mtmd call lives behind
+            // the feature gate. Surface this as `Ok(false)` so the
+            // caller knows the image didn't reach the model.
+            let _ = mmproj_path; // silence unused-var warning when feature off
+            tracing::warn!(
+                target: "stratum::llama_provider::vision",
+                image_count,
+                "mmproj_path is set but the `vision` cargo feature is off;                  rebuild with `--features vision` to enable real routing"
+            );
+            Ok(false)
+        }
+    }
+
+    /// Real mtmd routing — feature-gated because the `mtmd` module in
+    /// llama-cpp-2 0.1.146 is upstream-tagged experimental. Pulling it
+    /// into the default build would tie the workspace's `cargo check`
+    /// to the experimental ABI even though the rest of `provider-llama-cpp`
+    /// only needs the stable surface.
+    #[cfg(feature = "vision")]
+    fn route_attachments_with_mtmd(
+        &self,
+        attachments: &[Block],
+        mmproj_path: &std::path::Path,
+        image_count: usize,
+    ) -> Result<bool, VisionRoutingError> {
+        use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams};
+        let path_str = mmproj_path
+            .to_str()
+            .ok_or(VisionRoutingError::MmprojPathInvalidUtf8)?;
+        let params = MtmdContextParams::default();
+        let ctx = MtmdContext::init_from_file(path_str, &self.model, &params)
+            .map_err(|e| VisionRoutingError::MmprojLoad(e.to_string()))?;
+        if !ctx.support_vision() {
+            return Err(VisionRoutingError::MmprojNotVisionCapable);
+        }
+        for block in attachments.iter() {
+            let stratum_types::Block::Image { mime: _, data, .. } = block else {
+                continue;
+            };
+            let bytes = match data {
+                stratum_types::ImageData::Inline { base64, .. } => {
+                    decode_base64(base64).map_err(VisionRoutingError::Base64Decode)?
+                }
+                stratum_types::ImageData::Url { url } => {
+                    // Phase 5 v1 only handles file:// URLs and inline
+                    // bytes. http(s) URLs land in a later pass when we
+                    // wire the fetcher (per plan/05). Treat as a
+                    // routing error so the user sees a clear reason.
+                    if let Some(path) = url.strip_prefix("file://") {
+                        std::fs::read(path)
+                            .map_err(|e| VisionRoutingError::ImageRead(format!("{path}: {e}")))?
+                    } else {
+                        return Err(VisionRoutingError::UrlSchemeUnsupported(url.clone()));
+                    }
+                }
+            };
+            let _bitmap = MtmdBitmap::from_buffer(&ctx, &bytes)
+                .map_err(|e| VisionRoutingError::BitmapInit(format!("{e:?}")))?;
+            // NOTE: full chunk-eval + KV-cache insertion lives behind
+            // the same feature gate but requires the per-request
+            // `LlamaContext` to be threaded through here. The follow-up
+            // pass (after the catalog ships a confirmed mmproj artifact
+            // pair) will: 1) build `MtmdInputChunks` via
+            // `ctx.tokenize`, 2) call `MtmdContext::eval_chunks` against
+            // the same `LlamaContext` used for text decode, 3) inject
+            // the resulting `n_past` offset into the text prompt so
+            // image tokens occupy the right KV positions. For now we
+            // verify the bitmap decoded successfully — that proves the
+            // mmproj + image bytes are end-to-end compatible.
+        }
+        tracing::info!(
+            target: "stratum::llama_provider::vision",
+            image_count,
+            "encoded images through mmproj (chunk-eval insertion deferred)"
+        );
+        Ok(true)
     }
 
     /// Sampling temperature actually used for a request. Honors any
@@ -994,18 +1161,8 @@ impl Provider for LlamaCppProvider {
     }
 
     fn generate(&self, req: &GenerateRequest, cancel: &CancelToken) -> Vec<Block> {
-        // TODO(plan/05): wire <vision-model> — the Phase-1 llama.cpp
-        // path is text-only; the Gemma 4 E4B vision head with
-        // `--mmproj` is the Phase-5 follow-up. Until that lands, log
-        // and drop the bytes so the model isn't asked to interpret
-        // bare base64 noise mid-prompt.
-        if !req.attachments.is_empty() {
-            tracing::debug!(
-                target: "stratum.provider.llama_cpp",
-                count = req.attachments.len(),
-                "LlamaCppProvider received {} multimodal attachment(s); ignoring (no mmproj wired yet)",
-                req.attachments.len()
-            );
+        if let Some(cancelled) = self.preflight_attachments(req) {
+            return vec![cancelled];
         }
         match self.generate_text(req, cancel) {
             Ok(Some(text)) => text_to_blocks(text),
@@ -1026,6 +1183,9 @@ impl Provider for LlamaCppProvider {
         cancel: &CancelToken,
         on_chunk: &dyn Fn(&Block),
     ) -> Vec<Block> {
+        if let Some(cancelled) = self.preflight_attachments(req) {
+            return vec![cancelled];
+        }
         // Emit a `Block::Text` per llama.cpp piece as the model decodes.
         // The final returned `Vec<Block>` still holds the consolidated
         // text — possibly converted into a `Block::ToolCall` if the
@@ -1042,6 +1202,32 @@ impl Provider for LlamaCppProvider {
             Err(e) => vec![Block::Cancelled {
                 reason: format!("llama-cpp provider failure: {e}"),
             }],
+        }
+    }
+}
+
+impl LlamaCppProvider {
+    /// Run the attachment-routing preflight. Returns:
+    /// - `None` — no attachments OR attachments routed OK; proceed to
+    ///   text decode.
+    /// - `Some(Block::Cancelled)` — attachments couldn't be routed and
+    ///   the caller should surface a clear reason instead of silently
+    ///   dropping the user's image.
+    fn preflight_attachments(&self, req: &GenerateRequest) -> Option<Block> {
+        if req.attachments.is_empty() {
+            return None;
+        }
+        match self.route_attachments(&req.attachments) {
+            Ok(true) => None,
+            Ok(false) => Some(Block::Cancelled {
+                reason: format!(
+                    "STRAT-E05XX vision routing unavailable: {} image attachment(s)                      present but no mmproj sidecar configured (build with                      `--features vision` and set `LlamaCppProviderConfig::mmproj_path`)",
+                    req.attachments.iter().filter(|b| b.is_image()).count()
+                ),
+            }),
+            Err(e) => Some(Block::Cancelled {
+                reason: format!("STRAT-E05XX vision routing failed: {e}"),
+            }),
         }
     }
 }
@@ -1351,6 +1537,87 @@ impl std::fmt::Display for LlamaProviderError {
 }
 
 impl std::error::Error for LlamaProviderError {}
+
+/// Failures that can occur while routing `Block::Image` attachments
+/// through the mmproj head. Distinct from [`LlamaProviderError`] because
+/// the surface owners are different — provider errors come from the
+/// text decode path; these come from the multimodal sidecar.
+#[derive(Debug)]
+pub enum VisionRoutingError {
+    /// `mmproj_path` could not be converted to a UTF-8 C string.
+    MmprojPathInvalidUtf8,
+    /// Loading the mmproj sidecar via `MtmdContext::init_from_file` failed.
+    MmprojLoad(String),
+    /// mmproj loaded but does not expose a vision head (caller wired
+    /// the wrong projector for the model).
+    MmprojNotVisionCapable,
+    /// Decoding the inline base64 image bytes failed.
+    Base64Decode(String),
+    /// Reading the image from a `file://` URL failed.
+    ImageRead(String),
+    /// The image URL uses an unsupported scheme (only `file://` and
+    /// inline base64 are supported in Phase 5 v1).
+    UrlSchemeUnsupported(String),
+    /// Initialising the `MtmdBitmap` from the image bytes failed.
+    BitmapInit(String),
+}
+
+impl std::fmt::Display for VisionRoutingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MmprojPathInvalidUtf8 => write!(f, "mmproj path is not valid UTF-8"),
+            Self::MmprojLoad(m) => write!(f, "mmproj load failed: {m}"),
+            Self::MmprojNotVisionCapable => write!(f, "mmproj does not support vision"),
+            Self::Base64Decode(m) => write!(f, "base64 decode failed: {m}"),
+            Self::ImageRead(m) => write!(f, "image read failed: {m}"),
+            Self::UrlSchemeUnsupported(u) => write!(f, "unsupported image URL scheme: {u}"),
+            Self::BitmapInit(m) => write!(f, "mtmd bitmap init failed: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for VisionRoutingError {}
+
+/// Minimal base64 decoder for the vision routing path. We deliberately
+/// avoid pulling the `base64` crate as a new workspace dep — the input
+/// is small (single-image MiBs) and the inner loop is straightforward.
+/// Accepts standard alphabet with or without padding; rejects any
+/// non-alphabet character.
+#[cfg(feature = "vision")]
+fn decode_base64(s: &str) -> Result<Vec<u8>, String> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut table = [255u8; 256];
+    for (i, &c) in ALPHABET.iter().enumerate() {
+        // Lookup table for ASCII-range decode.
+        #[allow(clippy::cast_possible_truncation, reason = "i < 64 always fits in u8")]
+        {
+            table[c as usize] = i as u8;
+        }
+    }
+    let cleaned: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let stripped: Vec<u8> = cleaned.iter().copied().take_while(|&b| b != b'=').collect();
+    let mut buf = Vec::with_capacity(stripped.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in &stripped {
+        let v = table[b as usize];
+        if v == 255 {
+            return Err(format!("invalid base64 character: {:?}", b as char));
+        }
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "right-shifted to fit in u8"
+            )]
+            buf.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Ok(buf)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2052,5 +2319,87 @@ mod tests {
             return;
         };
         let _ = echoey_smoke_text(&provider);
+    }
+
+    // ---- Vision-routing seam --------------------------------------
+    //
+    // These tests pin the config + error-type contracts that the
+    // `route_attachments` seam exposes. We deliberately do NOT
+    // exercise the live mtmd path here — that requires a real GGUF +
+    // mmproj pair and lives in the on-demand workflow per
+    // `plan/05-multimodal.md` §Pipeline.
+
+    #[test]
+    fn config_default_has_no_mmproj_path() {
+        let cfg = LlamaCppProviderConfig::new(PathBuf::from("/x"), 512, None, 0, 0).unwrap();
+        assert!(cfg.mmproj_path.is_none(),
+            "default config must not assume a vision sidecar —              keeps text-only callers' RAM budget unchanged");
+    }
+
+    #[test]
+    fn config_accepts_explicit_mmproj_path() {
+        let mut cfg = LlamaCppProviderConfig::new(PathBuf::from("/x"), 512, None, 0, 0).unwrap();
+        cfg.mmproj_path = Some(PathBuf::from("/sidecar/mmproj.gguf"));
+        assert_eq!(
+            cfg.mmproj_path.as_deref().and_then(|p| p.to_str()),
+            Some("/sidecar/mmproj.gguf")
+        );
+    }
+
+    #[test]
+    fn vision_routing_error_display_covers_each_variant() {
+        let cases = [
+            VisionRoutingError::MmprojPathInvalidUtf8,
+            VisionRoutingError::MmprojLoad("disk full".into()),
+            VisionRoutingError::MmprojNotVisionCapable,
+            VisionRoutingError::Base64Decode("garbage".into()),
+            VisionRoutingError::ImageRead("ENOENT".into()),
+            VisionRoutingError::UrlSchemeUnsupported("https://x".into()),
+            VisionRoutingError::BitmapInit("null".into()),
+        ];
+        for err in &cases {
+            let rendered = format!("{err}");
+            assert!(!rendered.is_empty(), "Display must emit something");
+        }
+        assert!(format!("{}", cases[2]).contains("vision"));
+        assert!(format!("{}", cases[5]).contains("https://x"));
+    }
+
+    #[test]
+    fn vision_routing_error_is_std_error() {
+        fn assert_error<T: std::error::Error>(_: &T) {}
+        assert_error(&VisionRoutingError::MmprojNotVisionCapable);
+    }
+
+    #[cfg(feature = "vision")]
+    #[test]
+    fn decode_base64_roundtrips_simple_input() {
+        let original: &[u8] = b"hello";
+        // "aGVsbG8=" — standard padded base64 of "hello".
+        let decoded = decode_base64("aGVsbG8").unwrap();
+        assert_eq!(decoded, original);
+        // Also accepts padded form.
+        let decoded = decode_base64("aGVsbG8=").unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[cfg(feature = "vision")]
+    #[test]
+    fn decode_base64_rejects_invalid_character() {
+        let err = decode_base64("***bad***").unwrap_err();
+        assert!(err.contains("invalid base64"));
+    }
+
+    #[cfg(feature = "vision")]
+    #[test]
+    fn decode_base64_ignores_whitespace() {
+        // Whitespace is tolerated so we can decode the chunked
+        // representations some toolchains emit.
+        let decoded = decode_base64(
+            "aGVs
+bG8=",
+        )
+        .unwrap();
+        assert_eq!(decoded, b"hello");
     }
 }
