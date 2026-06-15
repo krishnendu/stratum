@@ -10,6 +10,14 @@
     clippy::too_long_first_doc_paragraph,
     reason = "false positive on adjacent pub-mod doc lines"
 )]
+// `clippy::large_stack_arrays` emits a span-less warning during the
+// `lib-test` compilation of `tool_dispatchers::tests` once that
+// module's combined macro expansions cross an upstream clippy
+// heuristic. The production `lib` build alone is clean (no array
+// literal in the workspace approaches the 16 KiB cap); the warning
+// has no real source location. Gate behind `cfg(test)` so the lint
+// surface for downstream callers of the library is unchanged.
+#![cfg_attr(test, allow(clippy::large_stack_arrays))]
 
 /// `AgentFactory` builder.
 ///

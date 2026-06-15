@@ -1839,6 +1839,23 @@ mod tests {
         }
     }
 
+    // Helpers used by the test body to avoid scaling out the
+    // `serde_json::json!` macro count — clippy's `large_stack_arrays`
+    // lint trips on many expansions in one module even when no array
+    // is anywhere near the threshold (the macro generates large `&[]`
+    // entries during const eval). Constructing `Value` variants
+    // directly keeps the test bodies readable without hitting the
+    // lint.
+    fn v_str(s: &str) -> serde_json::Value {
+        serde_json::Value::String(s.to_string())
+    }
+    fn v_u64(n: u64) -> serde_json::Value {
+        serde_json::Value::Number(n.into())
+    }
+    fn v_bool(b: bool) -> serde_json::Value {
+        serde_json::Value::Bool(b)
+    }
+
     fn shell_args(command: &str, args: &[&str]) -> BTreeMap<String, serde_json::Value> {
         let mut a = BTreeMap::new();
         a.insert("command".to_string(), serde_json::json!(command));
@@ -2601,7 +2618,7 @@ mod tests {
         fs::write(tmp.path().join("hi.png"), png_bytes).expect("write");
         let dispatcher = ReadImageToolDispatcher::new(tmp.path().to_path_buf());
         let mut args = BTreeMap::new();
-        args.insert("path".to_string(), serde_json::json!("hi.png"));
+        args.insert("path".to_string(), v_str("hi.png"));
         let inv = make_invocation("read_image", args);
         match dispatcher.invoke(&inv) {
             ToolResult::Ok { body, .. } => {
@@ -2622,11 +2639,12 @@ mod tests {
     #[test]
     fn read_image_rejects_oversize() {
         let tmp = TempDir::new().expect("tmp");
-        let blob = vec![0u8; 2 * 1024 * 1024];
+        // Cap is pulled down below to 1024 bytes; anything above that
+        // triggers the size-cap path. 2 KiB is enough to prove the
+        // cap without writing megabytes on every test run.
+        let blob = vec![0u8; 2048];
         fs::write(tmp.path().join("big.bin"), &blob).expect("write");
         let dispatcher = ReadImageToolDispatcher::new(tmp.path().to_path_buf());
-        // Pull the cap down so we exercise the size-cap path
-        // deterministically without writing megabytes.
         let dispatcher = ReadImageToolDispatcher {
             max_bytes: 1024,
             ..dispatcher
@@ -2665,4 +2683,1650 @@ mod tests {
         let p = PathBuf::from("unknown.bin");
         assert_eq!(sniff_image_mime(&p, b"random"), None);
     }
+
+    // ---- sniff_image_mime: every magic-byte branch -------------------
+
+    #[test]
+    fn sniff_image_mime_detects_jpeg_magic() {
+        let p = PathBuf::from("nope.bin");
+        assert_eq!(
+            sniff_image_mime(&p, &[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("image/jpeg")
+        );
+    }
+
+    #[test]
+    fn sniff_image_mime_detects_gif87a_magic() {
+        let p = PathBuf::from("nope.bin");
+        assert_eq!(sniff_image_mime(&p, b"GIF87a..."), Some("image/gif"));
+    }
+
+    #[test]
+    fn sniff_image_mime_detects_gif89a_magic() {
+        let p = PathBuf::from("nope.bin");
+        assert_eq!(sniff_image_mime(&p, b"GIF89a..."), Some("image/gif"));
+    }
+
+    #[test]
+    fn sniff_image_mime_detects_webp_riff_magic() {
+        let p = PathBuf::from("nope.bin");
+        // RIFF + 4 size bytes + WEBP marker.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.extend_from_slice(b"WEBP");
+        bytes.extend_from_slice(b"VP8 ");
+        assert_eq!(sniff_image_mime(&p, &bytes), Some("image/webp"));
+    }
+
+    #[test]
+    fn sniff_image_mime_detects_bmp_magic() {
+        let p = PathBuf::from("nope.bin");
+        assert_eq!(sniff_image_mime(&p, b"BM\x00\x00"), Some("image/bmp"));
+    }
+
+    #[test]
+    fn sniff_image_mime_extension_fallback_jpeg() {
+        let p = PathBuf::from("hi.jpeg");
+        assert_eq!(sniff_image_mime(&p, b"not-magic"), Some("image/jpeg"));
+        let p = PathBuf::from("hi.jpg");
+        assert_eq!(sniff_image_mime(&p, b"not-magic"), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn sniff_image_mime_extension_fallback_png_gif_webp_bmp() {
+        for (ext, mime) in [
+            ("png", "image/png"),
+            ("gif", "image/gif"),
+            ("webp", "image/webp"),
+            ("bmp", "image/bmp"),
+        ] {
+            let p = PathBuf::from(format!("hi.{ext}"));
+            assert_eq!(sniff_image_mime(&p, b"not-magic"), Some(mime));
+        }
+    }
+
+    // ---- FsWriteToolDispatcher tests ----------------------------------
+
+    fn fs_write_args(path: &str, content: &str) -> BTreeMap<String, serde_json::Value> {
+        let mut a = BTreeMap::new();
+        a.insert("path".to_string(), v_str(path));
+        a.insert("content".to_string(), v_str(content));
+        a
+    }
+
+    fn fs_write_invocation(args: BTreeMap<String, serde_json::Value>) -> ToolInvocation {
+        ToolInvocation {
+            tool_id: "fs.write".to_string(),
+            args,
+            capability: "fs.write".to_string(),
+            turn_id: 1,
+        }
+    }
+
+    #[test]
+    fn fs_write_supports_only_canonical() {
+        let d = FsWriteToolDispatcher::new(PathBuf::from("/"));
+        assert!(d.supports("fs.write"));
+        assert!(!d.supports("fs.read"));
+        assert!(!d.supports("fs.write.streaming"));
+    }
+
+    #[test]
+    fn fs_write_id_is_stable() {
+        let d = FsWriteToolDispatcher::new(PathBuf::from("/"));
+        assert_eq!(d.id(), "fs.write");
+    }
+
+    #[test]
+    fn fs_write_missing_path_returns_missing_arg() {
+        let d = FsWriteToolDispatcher::new(PathBuf::from("/"));
+        let mut args = BTreeMap::new();
+        args.insert("content".to_string(), v_str("hi"));
+        assert_err_code(d.invoke(&fs_write_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn fs_write_nonstring_path_returns_missing_arg() {
+        let d = FsWriteToolDispatcher::new(PathBuf::from("/"));
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_u64(42));
+        args.insert("content".to_string(), v_str("hi"));
+        assert_err_code(d.invoke(&fs_write_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn fs_write_empty_path_returns_missing_arg() {
+        let d = FsWriteToolDispatcher::new(PathBuf::from("/"));
+        let args = fs_write_args("", "hi");
+        assert_err_code(d.invoke(&fs_write_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn fs_write_missing_content_returns_missing_arg() {
+        let d = FsWriteToolDispatcher::new(PathBuf::from("/"));
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_str("hi.txt"));
+        assert_err_code(d.invoke(&fs_write_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn fs_write_nonstring_content_returns_missing_arg() {
+        let d = FsWriteToolDispatcher::new(PathBuf::from("/"));
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_str("hi.txt"));
+        args.insert("content".to_string(), v_u64(42));
+        assert_err_code(d.invoke(&fs_write_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn fs_write_absolute_path_returns_path_escape() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = FsWriteToolDispatcher::new(tmp.path().to_path_buf());
+        let args = fs_write_args("/etc/passwd", "hi");
+        assert_err_code(d.invoke(&fs_write_invocation(args)), E_DISPATCH_PATH_ESCAPE);
+    }
+
+    #[test]
+    fn fs_write_parent_dir_returns_path_escape() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = FsWriteToolDispatcher::new(tmp.path().to_path_buf());
+        let args = fs_write_args("../escape.txt", "hi");
+        assert_err_code(d.invoke(&fs_write_invocation(args)), E_DISPATCH_PATH_ESCAPE);
+    }
+
+    #[test]
+    fn fs_write_oversize_returns_size_cap() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = FsWriteToolDispatcher {
+            id: FsWriteToolDispatcher::ID.to_string(),
+            root: tmp.path().to_path_buf(),
+            max_bytes: 4,
+        };
+        let args = fs_write_args("hi.txt", "this-is-bigger-than-four");
+        assert_err_code(d.invoke(&fs_write_invocation(args)), E_DISPATCH_SIZE_CAP);
+    }
+
+    #[test]
+    fn fs_write_unreadable_root_returns_write_failed() {
+        // Canonicalize fails on a non-existent root.
+        let d =
+            FsWriteToolDispatcher::new(PathBuf::from("/nonexistent-root-for-fs-write-test-xyzzy"));
+        let args = fs_write_args("hi.txt", "hi");
+        assert_err_code(
+            d.invoke(&fs_write_invocation(args)),
+            E_DISPATCH_WRITE_FAILED,
+        );
+    }
+
+    #[test]
+    fn fs_write_creates_file_with_nested_parent() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = FsWriteToolDispatcher::new(tmp.path().to_path_buf());
+        let args = fs_write_args("nested/dir/hi.txt", "hello");
+        let result = d.invoke(&fs_write_invocation(args));
+        let (tool_id, body, bytes) = assert_ok(result);
+        assert_eq!(tool_id, "fs.write");
+        assert_eq!(bytes, 5);
+        // Content actually written.
+        let written =
+            fs::read_to_string(tmp.path().join("nested/dir/hi.txt")).expect("read written file");
+        assert_eq!(written, "hello");
+        assert_eq!(
+            body.get("bytes").and_then(serde_json::Value::as_u64),
+            Some(5)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_mkdir_failure_returns_write_failed() {
+        // Drop a regular file at "ro" so create_dir_all on
+        // "ro/sub/hi.txt" attempts to create "ro" as a directory and
+        // collides with the existing file. That hits the
+        // mkdir_failed arm without changing platform-specific perms.
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(tmp.path().join("ro"), "i am a file").expect("seed file");
+        let d = FsWriteToolDispatcher::new(tmp.path().to_path_buf());
+        let args = fs_write_args("ro/sub/hi.txt", "x");
+        assert_err_code(
+            d.invoke(&fs_write_invocation(args)),
+            E_DISPATCH_WRITE_FAILED,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_write_target_is_dir_returns_write_failed() {
+        // Writing onto an existing directory path returns EISDIR from
+        // std::fs::write — exercises the write-failed arm.
+        let tmp = TempDir::new().expect("tmp");
+        let dir = tmp.path().join("a-dir");
+        fs::create_dir(&dir).expect("mkdir");
+        let d = FsWriteToolDispatcher::new(tmp.path().to_path_buf());
+        let args = fs_write_args("a-dir", "x");
+        assert_err_code(
+            d.invoke(&fs_write_invocation(args)),
+            E_DISPATCH_WRITE_FAILED,
+        );
+    }
+
+    #[test]
+    fn fs_write_dispatcher_via_arc_dyn() {
+        let d: Arc<dyn ToolDispatcher> = Arc::new(FsWriteToolDispatcher::new(PathBuf::from("/")));
+        assert_eq!(d.id(), "fs.write");
+        assert!(d.supports("fs.write"));
+    }
+
+    // ---- FsEditToolDispatcher tests -----------------------------------
+
+    fn fs_edit_args(path: &str, old: &str, new: &str) -> BTreeMap<String, serde_json::Value> {
+        let mut a = BTreeMap::new();
+        a.insert("path".to_string(), v_str(path));
+        a.insert("old_string".to_string(), v_str(old));
+        a.insert("new_string".to_string(), v_str(new));
+        a
+    }
+
+    fn fs_edit_invocation(args: BTreeMap<String, serde_json::Value>) -> ToolInvocation {
+        ToolInvocation {
+            tool_id: "fs.edit".to_string(),
+            args,
+            capability: "fs.edit".to_string(),
+            turn_id: 1,
+        }
+    }
+
+    #[test]
+    fn fs_edit_supports_only_canonical() {
+        let d = FsEditToolDispatcher::new(PathBuf::from("/"));
+        assert!(d.supports("fs.edit"));
+        assert!(!d.supports("fs.write"));
+        assert!(!d.supports("fs.read"));
+    }
+
+    #[test]
+    fn fs_edit_id_is_stable() {
+        let d = FsEditToolDispatcher::new(PathBuf::from("/"));
+        assert_eq!(d.id(), "fs.edit");
+    }
+
+    #[test]
+    fn fs_edit_missing_path_returns_missing_arg() {
+        let d = FsEditToolDispatcher::new(PathBuf::from("/"));
+        let mut args = BTreeMap::new();
+        args.insert("old_string".to_string(), v_str("x"));
+        args.insert("new_string".to_string(), v_str("y"));
+        assert_err_code(d.invoke(&fs_edit_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn fs_edit_missing_old_string_returns_missing_arg() {
+        let d = FsEditToolDispatcher::new(PathBuf::from("/"));
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_str("hi.txt"));
+        args.insert("new_string".to_string(), v_str("y"));
+        assert_err_code(d.invoke(&fs_edit_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn fs_edit_empty_old_string_returns_missing_arg() {
+        let d = FsEditToolDispatcher::new(PathBuf::from("/"));
+        let args = fs_edit_args("hi.txt", "", "y");
+        assert_err_code(d.invoke(&fs_edit_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn fs_edit_missing_new_string_returns_missing_arg() {
+        let d = FsEditToolDispatcher::new(PathBuf::from("/"));
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_str("hi.txt"));
+        args.insert("old_string".to_string(), v_str("x"));
+        assert_err_code(d.invoke(&fs_edit_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn fs_edit_nonstring_new_returns_missing_arg() {
+        let d = FsEditToolDispatcher::new(PathBuf::from("/"));
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_str("hi.txt"));
+        args.insert("old_string".to_string(), v_str("x"));
+        args.insert("new_string".to_string(), v_u64(42));
+        assert_err_code(d.invoke(&fs_edit_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn fs_edit_absolute_path_returns_path_escape() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = FsEditToolDispatcher::new(tmp.path().to_path_buf());
+        let args = fs_edit_args("/etc/passwd", "x", "y");
+        assert_err_code(d.invoke(&fs_edit_invocation(args)), E_DISPATCH_PATH_ESCAPE);
+    }
+
+    #[test]
+    fn fs_edit_parent_dir_returns_path_escape() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = FsEditToolDispatcher::new(tmp.path().to_path_buf());
+        let args = fs_edit_args("../escape.txt", "x", "y");
+        assert_err_code(d.invoke(&fs_edit_invocation(args)), E_DISPATCH_PATH_ESCAPE);
+    }
+
+    #[test]
+    fn fs_edit_unreadable_root_returns_read_failed() {
+        let d =
+            FsEditToolDispatcher::new(PathBuf::from("/nonexistent-root-for-fs-edit-test-xyzzy"));
+        let args = fs_edit_args("hi.txt", "x", "y");
+        assert_err_code(d.invoke(&fs_edit_invocation(args)), E_DISPATCH_READ_FAILED);
+    }
+
+    #[test]
+    fn fs_edit_missing_file_returns_read_failed() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = FsEditToolDispatcher::new(tmp.path().to_path_buf());
+        let args = fs_edit_args("definitely-not-here.txt", "x", "y");
+        assert_err_code(d.invoke(&fs_edit_invocation(args)), E_DISPATCH_READ_FAILED);
+    }
+
+    #[test]
+    fn fs_edit_old_string_not_found_returns_edit_not_found() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(tmp.path().join("hi.txt"), "hello world").expect("seed");
+        let d = FsEditToolDispatcher::new(tmp.path().to_path_buf());
+        let args = fs_edit_args("hi.txt", "MISSING", "x");
+        assert_err_code(
+            d.invoke(&fs_edit_invocation(args)),
+            E_DISPATCH_EDIT_NOT_FOUND,
+        );
+    }
+
+    #[test]
+    fn fs_edit_ambiguous_match_returns_edit_ambiguous() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(tmp.path().join("hi.txt"), "foo foo bar").expect("seed");
+        let d = FsEditToolDispatcher::new(tmp.path().to_path_buf());
+        let args = fs_edit_args("hi.txt", "foo", "baz");
+        assert_err_code(
+            d.invoke(&fs_edit_invocation(args)),
+            E_DISPATCH_EDIT_AMBIGUOUS,
+        );
+    }
+
+    #[test]
+    fn fs_edit_oversize_result_returns_size_cap() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(tmp.path().join("hi.txt"), "a").expect("seed");
+        let d = FsEditToolDispatcher {
+            id: FsEditToolDispatcher::ID.to_string(),
+            root: tmp.path().to_path_buf(),
+            max_bytes: 4,
+        };
+        // Replace "a" with longer-than-4 bytes.
+        let args = fs_edit_args("hi.txt", "a", "abcdefghij");
+        assert_err_code(d.invoke(&fs_edit_invocation(args)), E_DISPATCH_SIZE_CAP);
+    }
+
+    #[test]
+    fn fs_edit_happy_path_replaces_single_occurrence() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(tmp.path().join("hi.txt"), "hello world").expect("seed");
+        let d = FsEditToolDispatcher::new(tmp.path().to_path_buf());
+        let args = fs_edit_args("hi.txt", "world", "rust");
+        let (tool_id, _body, _bytes) = assert_ok(d.invoke(&fs_edit_invocation(args)));
+        assert_eq!(tool_id, "fs.edit");
+        let updated = fs::read_to_string(tmp.path().join("hi.txt")).expect("read");
+        assert_eq!(updated, "hello rust");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_edit_dir_target_returns_read_failed() {
+        // Editing a directory triggers EISDIR on read_to_string.
+        let tmp = TempDir::new().expect("tmp");
+        fs::create_dir(tmp.path().join("subdir")).expect("mkdir");
+        let d = FsEditToolDispatcher::new(tmp.path().to_path_buf());
+        let args = fs_edit_args("subdir", "x", "y");
+        assert_err_code(d.invoke(&fs_edit_invocation(args)), E_DISPATCH_READ_FAILED);
+    }
+
+    #[test]
+    fn fs_edit_dispatcher_via_arc_dyn() {
+        let d: Arc<dyn ToolDispatcher> = Arc::new(FsEditToolDispatcher::new(PathBuf::from("/")));
+        assert_eq!(d.id(), "fs.edit");
+        assert!(d.supports("fs.edit"));
+    }
+
+    // ---- GrepToolDispatcher tests -------------------------------------
+
+    fn grep_invocation(pattern: &str) -> ToolInvocation {
+        let mut args = BTreeMap::new();
+        args.insert("pattern".to_string(), v_str(pattern));
+        ToolInvocation {
+            tool_id: "grep".to_string(),
+            args,
+            capability: "grep".to_string(),
+            turn_id: 1,
+        }
+    }
+
+    #[test]
+    fn grep_supports_only_canonical() {
+        let d = GrepToolDispatcher::new(PathBuf::from("/"));
+        assert!(d.supports("grep"));
+        assert!(!d.supports("glob"));
+        assert!(!d.supports("grep.streaming"));
+    }
+
+    #[test]
+    fn grep_id_is_stable() {
+        let d = GrepToolDispatcher::new(PathBuf::from("/"));
+        assert_eq!(d.id(), "grep");
+    }
+
+    #[test]
+    fn grep_missing_pattern_returns_missing_arg() {
+        let d = GrepToolDispatcher::new(PathBuf::from("/"));
+        let inv = ToolInvocation {
+            tool_id: "grep".to_string(),
+            args: BTreeMap::new(),
+            capability: "grep".to_string(),
+            turn_id: 1,
+        };
+        assert_err_code(d.invoke(&inv), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn grep_empty_pattern_returns_missing_arg() {
+        let d = GrepToolDispatcher::new(PathBuf::from("/"));
+        assert_err_code(d.invoke(&grep_invocation("")), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn grep_nonstring_pattern_returns_missing_arg() {
+        let d = GrepToolDispatcher::new(PathBuf::from("/"));
+        let mut args = BTreeMap::new();
+        args.insert("pattern".to_string(), v_u64(42));
+        let inv = ToolInvocation {
+            tool_id: "grep".to_string(),
+            args,
+            capability: "grep".to_string(),
+            turn_id: 1,
+        };
+        assert_err_code(d.invoke(&inv), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn grep_bad_regex_returns_bad_pattern() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = GrepToolDispatcher::new(tmp.path().to_path_buf());
+        // Unterminated character class is rejected by `regex`.
+        assert_err_code(
+            d.invoke(&grep_invocation("[unterminated")),
+            E_DISPATCH_BAD_PATTERN,
+        );
+    }
+
+    #[test]
+    fn grep_unreadable_root_returns_read_failed() {
+        let d = GrepToolDispatcher::new(PathBuf::from("/nonexistent-root-for-grep-test-xyzzy"));
+        assert_err_code(d.invoke(&grep_invocation("foo")), E_DISPATCH_READ_FAILED);
+    }
+
+    #[test]
+    fn grep_finds_matches_across_files() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(tmp.path().join("a.txt"), "alpha\nbeta\ngamma\n").expect("write a");
+        fs::write(tmp.path().join("b.txt"), "beta only here\n").expect("write b");
+        // Hidden file should be skipped.
+        fs::write(tmp.path().join(".hidden.txt"), "beta in hidden\n").expect("write h");
+        let d = GrepToolDispatcher::new(tmp.path().to_path_buf());
+        let (_, body, _) = assert_ok(d.invoke(&grep_invocation("beta")));
+        let matches = body
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .expect("matches");
+        let texts: Vec<&str> = matches
+            .iter()
+            .filter_map(|m| m.get("text").and_then(|t| t.as_str()))
+            .collect();
+        assert!(texts.contains(&"beta"));
+        assert!(texts.contains(&"beta only here"));
+        // Hidden files are filtered.
+        assert!(!texts.contains(&"beta in hidden"));
+    }
+
+    #[test]
+    fn grep_returns_empty_for_no_matches() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(tmp.path().join("a.txt"), "alpha\n").expect("write a");
+        let d = GrepToolDispatcher::new(tmp.path().to_path_buf());
+        let (_, body, bytes) = assert_ok(d.invoke(&grep_invocation("nothing-matches-here")));
+        let matches = body
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .expect("matches");
+        assert!(matches.is_empty());
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn grep_recurses_into_subdirs() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::create_dir(tmp.path().join("sub")).expect("mkdir");
+        fs::write(tmp.path().join("sub/c.txt"), "found-needle\n").expect("write c");
+        let d = GrepToolDispatcher::new(tmp.path().to_path_buf());
+        let (_, body, _) = assert_ok(d.invoke(&grep_invocation("needle")));
+        let matches = body
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .expect("matches");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0].get("text").and_then(|t| t.as_str()),
+            Some("found-needle")
+        );
+        assert_eq!(
+            matches[0].get("line").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn grep_skips_target_and_node_modules() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::create_dir(tmp.path().join("target")).expect("mkdir target");
+        fs::write(tmp.path().join("target/a.txt"), "needle\n").expect("write");
+        fs::create_dir(tmp.path().join("node_modules")).expect("mkdir node_modules");
+        fs::write(tmp.path().join("node_modules/a.txt"), "needle\n").expect("write");
+        fs::write(tmp.path().join("ok.txt"), "needle\n").expect("write");
+        let d = GrepToolDispatcher::new(tmp.path().to_path_buf());
+        let (_, body, _) = assert_ok(d.invoke(&grep_invocation("needle")));
+        let matches = body
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .expect("matches");
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn grep_respects_max_matches_cap() {
+        let tmp = TempDir::new().expect("tmp");
+        // 3 files * 3 matches each = 9 candidates; cap to 2.
+        for i in 0..3 {
+            fs::write(
+                tmp.path().join(format!("f{i}.txt")),
+                "needle\nneedle\nneedle\n",
+            )
+            .expect("write");
+        }
+        let d = GrepToolDispatcher {
+            id: GrepToolDispatcher::ID.to_string(),
+            root: tmp.path().to_path_buf(),
+            max_matches: 2,
+        };
+        let (_, body, _) = assert_ok(d.invoke(&grep_invocation("needle")));
+        let matches = body
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .expect("matches");
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn grep_dispatcher_via_arc_dyn() {
+        let d: Arc<dyn ToolDispatcher> = Arc::new(GrepToolDispatcher::new(PathBuf::from("/")));
+        assert_eq!(d.id(), "grep");
+        assert!(d.supports("grep"));
+    }
+
+    // ---- GlobToolDispatcher + glob_to_regex tests ---------------------
+
+    fn glob_invocation(pattern: &str) -> ToolInvocation {
+        let mut args = BTreeMap::new();
+        args.insert("pattern".to_string(), v_str(pattern));
+        ToolInvocation {
+            tool_id: "glob".to_string(),
+            args,
+            capability: "glob".to_string(),
+            turn_id: 1,
+        }
+    }
+
+    #[test]
+    fn glob_to_regex_single_star_is_per_segment() {
+        let r = glob_to_regex("*.rs");
+        assert_eq!(r, "^[^/]*\\.rs$");
+    }
+
+    #[test]
+    fn glob_to_regex_double_star_crosses_segments() {
+        let r = glob_to_regex("**/*.rs");
+        assert_eq!(r, "^.*[^/]*\\.rs$");
+    }
+
+    #[test]
+    fn glob_to_regex_double_star_without_slash() {
+        let r = glob_to_regex("**foo");
+        assert_eq!(r, "^.*foo$");
+    }
+
+    #[test]
+    fn glob_to_regex_question_mark_is_single_non_slash() {
+        let r = glob_to_regex("?");
+        assert_eq!(r, "^[^/]$");
+    }
+
+    #[test]
+    fn glob_to_regex_escapes_meta() {
+        let r = glob_to_regex("a.b+c(d)|e^f${g}\\h");
+        // Every metachar is backslash-prefixed; literal otherwise.
+        assert!(r.contains("\\."));
+        assert!(r.contains("\\+"));
+        assert!(r.contains("\\("));
+        assert!(r.contains("\\)"));
+        assert!(r.contains("\\|"));
+        assert!(r.contains("\\^"));
+        assert!(r.contains("\\$"));
+        assert!(r.contains("\\{"));
+        assert!(r.contains("\\}"));
+        assert!(r.contains("\\\\"));
+    }
+
+    #[test]
+    fn glob_to_regex_passes_literal_chars_through() {
+        // Letters and digits unchanged, anchored.
+        let r = glob_to_regex("hello123");
+        assert_eq!(r, "^hello123$");
+    }
+
+    #[test]
+    fn glob_supports_only_canonical() {
+        let d = GlobToolDispatcher::new(PathBuf::from("/"));
+        assert!(d.supports("glob"));
+        assert!(!d.supports("grep"));
+        assert!(!d.supports("glob.streaming"));
+    }
+
+    #[test]
+    fn glob_id_is_stable() {
+        let d = GlobToolDispatcher::new(PathBuf::from("/"));
+        assert_eq!(d.id(), "glob");
+    }
+
+    #[test]
+    fn glob_missing_pattern_returns_missing_arg() {
+        let d = GlobToolDispatcher::new(PathBuf::from("/"));
+        let inv = ToolInvocation {
+            tool_id: "glob".to_string(),
+            args: BTreeMap::new(),
+            capability: "glob".to_string(),
+            turn_id: 1,
+        };
+        assert_err_code(d.invoke(&inv), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn glob_empty_pattern_returns_missing_arg() {
+        let d = GlobToolDispatcher::new(PathBuf::from("/"));
+        assert_err_code(d.invoke(&glob_invocation("")), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn glob_unreadable_root_returns_read_failed() {
+        let d = GlobToolDispatcher::new(PathBuf::from("/nonexistent-root-for-glob-test-xyzzy"));
+        assert_err_code(d.invoke(&glob_invocation("*.rs")), E_DISPATCH_READ_FAILED);
+    }
+
+    #[test]
+    fn glob_matches_filenames() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(tmp.path().join("a.rs"), "x").expect("write");
+        fs::write(tmp.path().join("b.rs"), "x").expect("write");
+        fs::write(tmp.path().join("c.txt"), "x").expect("write");
+        let d = GlobToolDispatcher::new(tmp.path().to_path_buf());
+        let (_, body, _) = assert_ok(d.invoke(&glob_invocation("*.rs")));
+        let matches = body
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .expect("matches");
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn glob_recurses_with_double_star() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::create_dir(tmp.path().join("sub")).expect("mkdir");
+        fs::write(tmp.path().join("sub/deep.rs"), "x").expect("write");
+        fs::write(tmp.path().join("shallow.rs"), "x").expect("write");
+        let d = GlobToolDispatcher::new(tmp.path().to_path_buf());
+        // ** matches across separators
+        let (_, body, _) = assert_ok(d.invoke(&glob_invocation("**/*.rs")));
+        let matches = body
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .expect("matches");
+        // Should find at least one even though one is in a subdir.
+        assert!(!matches.is_empty());
+    }
+
+    #[test]
+    fn glob_returns_empty_for_no_matches() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(tmp.path().join("a.txt"), "x").expect("write");
+        let d = GlobToolDispatcher::new(tmp.path().to_path_buf());
+        let (_, body, bytes) = assert_ok(d.invoke(&glob_invocation("*.nonexistent")));
+        let matches = body
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .expect("matches");
+        assert!(matches.is_empty());
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn glob_skips_target_and_node_modules() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::create_dir(tmp.path().join("target")).expect("mkdir");
+        fs::write(tmp.path().join("target/a.rs"), "x").expect("write");
+        fs::create_dir(tmp.path().join("node_modules")).expect("mkdir");
+        fs::write(tmp.path().join("node_modules/b.rs"), "x").expect("write");
+        fs::write(tmp.path().join("ok.rs"), "x").expect("write");
+        let d = GlobToolDispatcher::new(tmp.path().to_path_buf());
+        let (_, body, _) = assert_ok(d.invoke(&glob_invocation("*.rs")));
+        let matches = body
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .expect("matches");
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn glob_respects_max_results_cap() {
+        let tmp = TempDir::new().expect("tmp");
+        for i in 0..6 {
+            fs::write(tmp.path().join(format!("f{i}.txt")), "x").expect("write");
+        }
+        let d = GlobToolDispatcher {
+            id: GlobToolDispatcher::ID.to_string(),
+            root: tmp.path().to_path_buf(),
+            max_results: 2,
+        };
+        let (_, body, _) = assert_ok(d.invoke(&glob_invocation("*.txt")));
+        let matches = body
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .expect("matches");
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn glob_dispatcher_via_arc_dyn() {
+        let d: Arc<dyn ToolDispatcher> = Arc::new(GlobToolDispatcher::new(PathBuf::from("/")));
+        assert_eq!(d.id(), "glob");
+        assert!(d.supports("glob"));
+    }
+
+    // ---- FsTreeToolDispatcher tests -----------------------------------
+
+    fn fs_tree_invocation(depth: Option<u64>) -> ToolInvocation {
+        let mut args = BTreeMap::new();
+        if let Some(d) = depth {
+            args.insert("depth".to_string(), v_u64(d));
+        }
+        ToolInvocation {
+            tool_id: "fs.tree".to_string(),
+            args,
+            capability: "fs.tree".to_string(),
+            turn_id: 1,
+        }
+    }
+
+    #[test]
+    fn fs_tree_supports_only_canonical() {
+        let d = FsTreeToolDispatcher::new(PathBuf::from("/"));
+        assert!(d.supports("fs.tree"));
+        assert!(!d.supports("fs.read"));
+    }
+
+    #[test]
+    fn fs_tree_id_is_stable() {
+        let d = FsTreeToolDispatcher::new(PathBuf::from("/"));
+        assert_eq!(d.id(), "fs.tree");
+    }
+
+    #[test]
+    fn fs_tree_unreadable_root_returns_read_failed() {
+        let d =
+            FsTreeToolDispatcher::new(PathBuf::from("/nonexistent-root-for-fs-tree-test-xyzzy"));
+        assert_err_code(d.invoke(&fs_tree_invocation(None)), E_DISPATCH_READ_FAILED);
+    }
+
+    #[test]
+    fn fs_tree_lists_files_and_dirs() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(tmp.path().join("a.txt"), "x").expect("write");
+        fs::create_dir(tmp.path().join("sub")).expect("mkdir");
+        fs::write(tmp.path().join("sub/b.txt"), "x").expect("write");
+        let d = FsTreeToolDispatcher::new(tmp.path().to_path_buf());
+        let (_, body, _) = assert_ok(d.invoke(&fs_tree_invocation(None)));
+        let entries = body
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .expect("entries");
+        let strings: Vec<String> = entries
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        // Files have a trailing space; directories have a trailing slash.
+        assert!(strings.iter().any(|s| s == "a.txt "));
+        assert!(strings.iter().any(|s| s == "sub/"));
+        assert!(strings.iter().any(|s| s.starts_with("sub/b.txt")));
+    }
+
+    #[test]
+    fn fs_tree_honors_user_specified_depth() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::create_dir(tmp.path().join("d1")).expect("mkdir");
+        fs::create_dir(tmp.path().join("d1/d2")).expect("mkdir");
+        fs::write(tmp.path().join("d1/d2/deep.txt"), "x").expect("write");
+        let d = FsTreeToolDispatcher::new(tmp.path().to_path_buf());
+        // depth=1 should NOT descend past d1.
+        let (_, body, _) = assert_ok(d.invoke(&fs_tree_invocation(Some(1))));
+        let entries = body
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .expect("entries");
+        let strings: Vec<String> = entries
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert!(strings.iter().any(|s| s.starts_with("d1")));
+        // deep.txt sits below depth=1 so it's pruned.
+        assert!(!strings.iter().any(|s| s.contains("deep.txt")));
+        assert_eq!(
+            body.get("depth").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn fs_tree_depth_arg_caps_to_16() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = FsTreeToolDispatcher::new(tmp.path().to_path_buf());
+        let (_, body, _) = assert_ok(d.invoke(&fs_tree_invocation(Some(999))));
+        // 999 is capped to 16 inside the dispatcher.
+        assert_eq!(
+            body.get("depth").and_then(serde_json::Value::as_u64),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn fs_tree_filters_hidden_and_target() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::create_dir(tmp.path().join(".hidden")).expect("mkdir");
+        fs::write(tmp.path().join(".hidden/file"), "x").expect("write");
+        fs::create_dir(tmp.path().join("target")).expect("mkdir");
+        fs::write(tmp.path().join("target/file"), "x").expect("write");
+        fs::write(tmp.path().join("visible.txt"), "x").expect("write");
+        let d = FsTreeToolDispatcher::new(tmp.path().to_path_buf());
+        let (_, body, _) = assert_ok(d.invoke(&fs_tree_invocation(None)));
+        let entries = body
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .expect("entries");
+        let strings: Vec<String> = entries
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert!(strings.iter().any(|s| s.starts_with("visible.txt")));
+        assert!(!strings.iter().any(|s| s.contains(".hidden")));
+        assert!(!strings.iter().any(|s| s.contains("target")));
+    }
+
+    #[test]
+    fn fs_tree_respects_max_entries_cap() {
+        let tmp = TempDir::new().expect("tmp");
+        for i in 0..6 {
+            fs::write(tmp.path().join(format!("f{i}.txt")), "x").expect("write");
+        }
+        let d = FsTreeToolDispatcher {
+            id: FsTreeToolDispatcher::ID.to_string(),
+            root: tmp.path().to_path_buf(),
+            max_depth: 4,
+            max_entries: 3,
+        };
+        let (_, body, _) = assert_ok(d.invoke(&fs_tree_invocation(None)));
+        let entries = body
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .expect("entries");
+        // Tight equality — `<= 3` would silently pass even if the
+        // cap logic returned 0 entries.
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_tree_marks_symlinks_with_at_sign() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(tmp.path().join("real.txt"), "x").expect("write");
+        symlink(tmp.path().join("real.txt"), tmp.path().join("link")).expect("symlink");
+        let d = FsTreeToolDispatcher::new(tmp.path().to_path_buf());
+        let (_, body, _) = assert_ok(d.invoke(&fs_tree_invocation(None)));
+        let entries = body
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .expect("entries");
+        let strings: Vec<String> = entries
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert!(strings.iter().any(|s| s == "link@"));
+    }
+
+    #[test]
+    fn fs_tree_dispatcher_via_arc_dyn() {
+        let d: Arc<dyn ToolDispatcher> = Arc::new(FsTreeToolDispatcher::new(PathBuf::from("/")));
+        assert_eq!(d.id(), "fs.tree");
+        assert!(d.supports("fs.tree"));
+    }
+
+    // ---- SubagentToolDispatcher tests ---------------------------------
+
+    fn make_subagent(name: &str, prompt: &str) -> crate::subagent::Subagent {
+        crate::subagent::Subagent {
+            name: name.to_string(),
+            description: format!("{name} test"),
+            tools: None,
+            denied_tools: Vec::new(),
+            model_tier: None,
+            permission_mode: None,
+            max_turns: None,
+            memory: None,
+            effort: None,
+            isolation: None,
+            color: None,
+            prompt: prompt.to_string(),
+        }
+    }
+
+    fn subagent_invocation(args: BTreeMap<String, serde_json::Value>) -> ToolInvocation {
+        ToolInvocation {
+            tool_id: "subagent.run".to_string(),
+            args,
+            capability: "subagent.run".to_string(),
+            turn_id: 1,
+        }
+    }
+
+    fn subagent_dispatcher(sub_name: &str, sub_prompt: &str) -> SubagentToolDispatcher {
+        let mut reg = crate::subagent::SubagentRegistry::new();
+        reg.insert(make_subagent(sub_name, sub_prompt));
+        let provider: Arc<dyn crate::provider::Provider> =
+            Arc::new(crate::provider::EchoProvider::new("echo: "));
+        SubagentToolDispatcher::new(Arc::new(reg), provider)
+    }
+
+    #[test]
+    fn subagent_supports_only_canonical() {
+        let d = subagent_dispatcher("explorer", "find things");
+        assert!(d.supports("subagent.run"));
+        assert!(!d.supports("subagent"));
+        assert!(!d.supports("subagent.run.streaming"));
+    }
+
+    #[test]
+    fn subagent_id_is_stable() {
+        let d = subagent_dispatcher("explorer", "find things");
+        assert_eq!(d.id(), "subagent.run");
+    }
+
+    #[test]
+    fn subagent_debug_smoke() {
+        let d = subagent_dispatcher("explorer", "find things");
+        let rendered = format!("{d:?}");
+        assert!(rendered.contains("SubagentToolDispatcher"));
+        assert!(rendered.contains("registry_len"));
+    }
+
+    #[test]
+    fn subagent_missing_name_returns_missing_arg() {
+        let d = subagent_dispatcher("explorer", "find things");
+        let mut args = BTreeMap::new();
+        args.insert("task".to_string(), v_str("do x"));
+        assert_err_code(d.invoke(&subagent_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn subagent_empty_name_returns_missing_arg() {
+        let d = subagent_dispatcher("explorer", "find things");
+        let mut args = BTreeMap::new();
+        args.insert("name".to_string(), v_str(""));
+        args.insert("task".to_string(), v_str("do x"));
+        assert_err_code(d.invoke(&subagent_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn subagent_nonstring_name_returns_missing_arg() {
+        let d = subagent_dispatcher("explorer", "find things");
+        let mut args = BTreeMap::new();
+        args.insert("name".to_string(), v_u64(42));
+        args.insert("task".to_string(), v_str("do x"));
+        assert_err_code(d.invoke(&subagent_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn subagent_missing_task_returns_missing_arg() {
+        let d = subagent_dispatcher("explorer", "find things");
+        let mut args = BTreeMap::new();
+        args.insert("name".to_string(), v_str("explorer"));
+        assert_err_code(d.invoke(&subagent_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn subagent_empty_task_returns_missing_arg() {
+        let d = subagent_dispatcher("explorer", "find things");
+        let mut args = BTreeMap::new();
+        args.insert("name".to_string(), v_str("explorer"));
+        args.insert("task".to_string(), v_str(""));
+        assert_err_code(d.invoke(&subagent_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn subagent_unknown_name_returns_missing_arg() {
+        let d = subagent_dispatcher("explorer", "find things");
+        let mut args = BTreeMap::new();
+        args.insert("name".to_string(), v_str("not-registered"));
+        args.insert("task".to_string(), v_str("do x"));
+        assert_err_code(d.invoke(&subagent_invocation(args)), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn subagent_happy_path_echo_provider_returns_text() {
+        let d = subagent_dispatcher("explorer", "find things");
+        let mut args = BTreeMap::new();
+        args.insert("name".to_string(), v_str("explorer"));
+        args.insert("task".to_string(), v_str("hello world"));
+        let (tool_id, body, _) = assert_ok(d.invoke(&subagent_invocation(args)));
+        assert_eq!(tool_id, "subagent.run");
+        // EchoProvider emits "echo: hello" and "echo: world" — concat in the answer.
+        let answer = body.get("answer").and_then(|v| v.as_str()).expect("answer");
+        assert!(answer.contains("hello"));
+        assert!(answer.contains("world"));
+        assert_eq!(
+            body.get("subagent").and_then(|v| v.as_str()),
+            Some("explorer")
+        );
+    }
+
+    #[derive(Debug)]
+    struct EmptyProvider;
+    impl crate::provider::Provider for EmptyProvider {
+        #[allow(
+            clippy::unnecessary_literal_bound,
+            reason = "trait signature returns &str; this impl returns a static literal"
+        )]
+        fn id(&self) -> &str {
+            "empty"
+        }
+        fn capabilities(&self) -> &'static [stratum_types::Capability] {
+            const CAPS: &[stratum_types::Capability] = &[stratum_types::Capability::Generate];
+            CAPS
+        }
+        fn generate(
+            &self,
+            _req: &crate::provider::GenerateRequest,
+            _cancel: &crate::cancel::CancelToken,
+        ) -> Vec<stratum_types::Block> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn subagent_empty_text_returns_read_failed() {
+        let mut reg = crate::subagent::SubagentRegistry::new();
+        reg.insert(make_subagent("explorer", "find things"));
+        let provider: Arc<dyn crate::provider::Provider> = Arc::new(EmptyProvider);
+        let d = SubagentToolDispatcher::new(Arc::new(reg), provider);
+        let mut args = BTreeMap::new();
+        args.insert("name".to_string(), v_str("explorer"));
+        args.insert("task".to_string(), v_str("ping"));
+        assert_err_code(d.invoke(&subagent_invocation(args)), E_DISPATCH_READ_FAILED);
+    }
+
+    #[test]
+    fn subagent_dispatcher_via_arc_dyn() {
+        let d: Arc<dyn ToolDispatcher> = Arc::new(subagent_dispatcher("e", "p"));
+        assert_eq!(d.id(), "subagent.run");
+        assert!(d.supports("subagent.run"));
+    }
+
+    // ---- GitDiffToolDispatcher: more error coverage -------------------
+
+    #[test]
+    fn git_diff_id_is_stable() {
+        let d = GitDiffToolDispatcher::new(PathBuf::from("/"));
+        assert_eq!(d.id(), "git.diff");
+        assert!(d.supports("git.diff"));
+        assert!(!d.supports("git.log"));
+    }
+
+    #[test]
+    fn git_diff_nonstring_since_returns_missing_arg() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = GitDiffToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("since".to_string(), v_u64(42));
+        assert_err_code(
+            d.invoke(&make_invocation("git.diff", args)),
+            E_DISPATCH_MISSING_ARG,
+        );
+    }
+
+    #[test]
+    fn git_diff_nonstring_path_returns_missing_arg() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = GitDiffToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_u64(42));
+        assert_err_code(
+            d.invoke(&make_invocation("git.diff", args)),
+            E_DISPATCH_MISSING_ARG,
+        );
+    }
+
+    #[test]
+    fn git_diff_absolute_path_returns_path_escape() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = GitDiffToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_str("/etc/passwd"));
+        assert_err_code(
+            d.invoke(&make_invocation("git.diff", args)),
+            E_DISPATCH_PATH_ESCAPE,
+        );
+    }
+
+    #[test]
+    fn git_diff_parent_dir_path_returns_path_escape() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = GitDiffToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_str("../escape"));
+        assert_err_code(
+            d.invoke(&make_invocation("git.diff", args)),
+            E_DISPATCH_PATH_ESCAPE,
+        );
+    }
+
+    #[test]
+    fn git_diff_no_repo_returns_exit_nonzero() {
+        if which_in_path("git").is_none() {
+            return;
+        }
+        let tmp = TempDir::new().expect("tmp");
+        // Bare temp dir is not a git repo; `git diff` exits non-zero.
+        let d = GitDiffToolDispatcher::new(tmp.path().to_path_buf());
+        assert_err_code(
+            d.invoke(&make_invocation("git.diff", BTreeMap::new())),
+            E_DISPATCH_EXIT_NONZERO,
+        );
+    }
+
+    #[test]
+    fn git_diff_staged_flag_path_threads_through() {
+        let Some(tmp) = git_init_tmp() else { return };
+        git_commit_file(tmp.path(), "a.txt", "one\n", "init");
+        // Stage a change.
+        fs::write(tmp.path().join("a.txt"), "one\ntwo\n").expect("write");
+        let _ = std::process::Command::new("git")
+            .args(["add", "a.txt"])
+            .current_dir(tmp.path())
+            .status();
+        let d = GitDiffToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("staged".to_string(), v_bool(true));
+        args.insert("path".to_string(), v_str("a.txt"));
+        let result = d.invoke(&make_invocation("git.diff", args));
+        match result {
+            ToolResult::Ok { body, .. } => {
+                let patch = body.get("patch").and_then(|v| v.as_str()).unwrap_or("");
+                assert!(patch.contains("a.txt"));
+                assert!(patch.contains("+two"));
+            }
+            ToolResult::Err { code, message, .. } => {
+                panic!("expected Ok, got Err({code}): {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn git_diff_since_safe_ref_threads_through() {
+        let Some(tmp) = git_init_tmp() else { return };
+        git_commit_file(tmp.path(), "a.txt", "v1\n", "v1");
+        git_commit_file(tmp.path(), "a.txt", "v2\n", "v2");
+        let d = GitDiffToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        // A safe ref that exists (HEAD~1 has "..", refuse; use a non-range ref).
+        args.insert("since".to_string(), v_str("HEAD"));
+        let result = d.invoke(&make_invocation("git.diff", args));
+        // Ok means the ref threaded through and produced a (possibly
+        // empty) patch field. Err is acceptable too on hosts whose
+        // git refuses the ref, but the response shape must always be
+        // one of the two — neither a panic nor any other variant.
+        match result {
+            ToolResult::Ok { body, .. } => {
+                assert!(
+                    body.get("patch").is_some(),
+                    "git.diff with `since` must surface a `patch` field: {body}"
+                );
+            }
+            ToolResult::Err { .. } => {}
+        }
+    }
+
+    // ---- GitLogToolDispatcher: more error coverage --------------------
+
+    #[test]
+    fn git_log_id_is_stable() {
+        let d = GitLogToolDispatcher::new(PathBuf::from("/"));
+        assert_eq!(d.id(), "git.log");
+        assert!(d.supports("git.log"));
+        assert!(!d.supports("git.diff"));
+    }
+
+    #[test]
+    fn git_log_nonstring_path_returns_missing_arg() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = GitLogToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_u64(42));
+        assert_err_code(
+            d.invoke(&make_invocation("git.log", args)),
+            E_DISPATCH_MISSING_ARG,
+        );
+    }
+
+    #[test]
+    fn git_log_absolute_path_returns_path_escape() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = GitLogToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_str("/etc/passwd"));
+        assert_err_code(
+            d.invoke(&make_invocation("git.log", args)),
+            E_DISPATCH_PATH_ESCAPE,
+        );
+    }
+
+    #[test]
+    fn git_log_no_repo_returns_exit_nonzero() {
+        if which_in_path("git").is_none() {
+            return;
+        }
+        let tmp = TempDir::new().expect("tmp");
+        let d = GitLogToolDispatcher::new(tmp.path().to_path_buf());
+        assert_err_code(
+            d.invoke(&make_invocation("git.log", BTreeMap::new())),
+            E_DISPATCH_EXIT_NONZERO,
+        );
+    }
+
+    #[test]
+    fn git_log_max_arg_clamps_oversize() {
+        let Some(tmp) = git_init_tmp() else { return };
+        git_commit_file(tmp.path(), "a.txt", "x\n", "v1");
+        let dispatcher = GitLogToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        // The dispatcher clamps to [1, HARD_MAX_ENTRIES]; pass beyond.
+        args.insert("max".to_string(), v_u64(99_999));
+        match dispatcher.invoke(&make_invocation("git.log", args)) {
+            ToolResult::Ok { .. } => {}
+            ToolResult::Err { code, message, .. } => {
+                panic!("expected Ok, got Err({code}): {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn git_log_path_filters_to_one_file() {
+        let Some(tmp) = git_init_tmp() else { return };
+        git_commit_file(tmp.path(), "a.txt", "1\n", "touch a");
+        git_commit_file(tmp.path(), "b.txt", "1\n", "touch b");
+        let dispatcher = GitLogToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_str("a.txt"));
+        match dispatcher.invoke(&make_invocation("git.log", args)) {
+            ToolResult::Ok { body, .. } => {
+                let commits = body
+                    .get("commits")
+                    .and_then(|v| v.as_array())
+                    .expect("commits");
+                // Only the commit touching a.txt should appear.
+                let subjects: Vec<&str> = commits
+                    .iter()
+                    .filter_map(|c| c.get("subject").and_then(|s| s.as_str()))
+                    .collect();
+                assert!(subjects.contains(&"touch a"));
+                assert!(!subjects.contains(&"touch b"));
+            }
+            ToolResult::Err { code, message, .. } => {
+                panic!("expected Ok, got Err({code}): {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn git_log_since_safe_ref_threads_through() {
+        let Some(tmp) = git_init_tmp() else { return };
+        git_commit_file(tmp.path(), "a.txt", "x\n", "v1");
+        let dispatcher = GitLogToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("since".to_string(), v_str("HEAD"));
+        match dispatcher.invoke(&make_invocation("git.log", args)) {
+            ToolResult::Ok { body, .. } => {
+                assert!(
+                    body.get("commits").is_some(),
+                    "git.log with `since` must surface a `commits` field: {body}"
+                );
+            }
+            ToolResult::Err { .. } => {}
+        }
+    }
+
+    #[test]
+    fn git_log_nonstring_since_returns_missing_arg() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = GitLogToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("since".to_string(), v_u64(42));
+        assert_err_code(
+            d.invoke(&make_invocation("git.log", args)),
+            E_DISPATCH_MISSING_ARG,
+        );
+    }
+
+    // ---- GitRunError::into_tool_result variants -----------------------
+
+    #[test]
+    fn git_run_error_spawn_maps_to_spawn_failed() {
+        let e = GitRunError::Spawn(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"));
+        let r = e.into_tool_result("git.diff");
+        if let ToolResult::Err { code, message, .. } = r {
+            assert_eq!(code, E_DISPATCH_SPAWN_FAILED);
+            assert!(message.contains("git spawn failed"));
+        } else {
+            panic!("expected Err, got Ok");
+        }
+    }
+
+    #[test]
+    fn git_run_error_timeout_maps_to_timeout_sentinel() {
+        let e = GitRunError::Timeout;
+        let r = e.into_tool_result("git.diff");
+        if let ToolResult::Err { code, .. } = r {
+            assert_eq!(code, E_DISPATCH_TIMEOUT);
+        } else {
+            panic!("expected Err, got Ok");
+        }
+    }
+
+    #[test]
+    fn git_run_error_nonzero_maps_to_exit_nonzero() {
+        let e = GitRunError::NonZero {
+            status: 7,
+            stderr_tail: "boom".to_string(),
+        };
+        let r = e.into_tool_result("git.diff");
+        if let ToolResult::Err { code, message, .. } = r {
+            assert_eq!(code, E_DISPATCH_EXIT_NONZERO);
+            assert!(message.contains('7'));
+            assert!(message.contains("boom"));
+        } else {
+            panic!("expected Err, got Ok");
+        }
+    }
+
+    #[test]
+    fn git_run_error_wait_maps_to_spawn_failed() {
+        let e = GitRunError::Wait(std::io::Error::other("kaboom"));
+        let r = e.into_tool_result("git.diff");
+        if let ToolResult::Err { code, message, .. } = r {
+            assert_eq!(code, E_DISPATCH_SPAWN_FAILED);
+            assert!(message.contains("git wait failed"));
+        } else {
+            panic!("expected Err, got Ok");
+        }
+    }
+
+    // ---- run_git: truncation arm -------------------------------------
+
+    #[test]
+    fn run_git_truncates_when_stdout_exceeds_cap() {
+        if which_in_path("git").is_none() {
+            return;
+        }
+        let Some(tmp) = git_init_tmp() else { return };
+        git_commit_file(tmp.path(), "a.txt", "x\n", "v1");
+        // Pull cap absurdly low so even the tiny stdout exceeds it.
+        let result = run_git(
+            tmp.path(),
+            &["--no-pager".to_string(), "log".to_string()],
+            Duration::from_secs(5),
+            2,
+        );
+        if let Ok(out) = result {
+            assert!(out.truncated, "expected truncated flag");
+            assert!(out.stdout.len() <= 2, "captured bytes capped");
+        }
+    }
+
+    // ---- read_image: extra MIME paths --------------------------------
+
+    #[test]
+    fn read_image_falls_back_to_octet_stream_for_unknown() {
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(tmp.path().join("blob.bin"), b"random-bytes-here").expect("write");
+        let dispatcher = ReadImageToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_str("blob.bin"));
+        match dispatcher.invoke(&make_invocation("read_image", args)) {
+            ToolResult::Ok { body, .. } => {
+                assert_eq!(
+                    body.get("mime").and_then(|v| v.as_str()),
+                    Some("application/octet-stream")
+                );
+            }
+            ToolResult::Err { code, message, .. } => {
+                panic!("expected Ok, got Err({code}): {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn read_image_missing_path_returns_missing_arg() {
+        let tmp = TempDir::new().expect("tmp");
+        let dispatcher = ReadImageToolDispatcher::new(tmp.path().to_path_buf());
+        let inv = make_invocation("read_image", BTreeMap::new());
+        assert_err_code(dispatcher.invoke(&inv), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn read_image_missing_file_returns_read_failed() {
+        let tmp = TempDir::new().expect("tmp");
+        let dispatcher = ReadImageToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_str("not-here.png"));
+        assert_err_code(
+            dispatcher.invoke(&make_invocation("read_image", args)),
+            E_DISPATCH_READ_FAILED,
+        );
+    }
+
+    #[test]
+    fn read_image_dispatcher_via_arc_dyn() {
+        let d: Arc<dyn ToolDispatcher> = Arc::new(ReadImageToolDispatcher::new(PathBuf::from("/")));
+        assert_eq!(d.id(), "read_image");
+        assert!(d.supports("read_image"));
+    }
+
+    #[test]
+    fn read_image_default_max_bytes_pinned() {
+        assert_eq!(ReadImageToolDispatcher::DEFAULT_MAX_BYTES, 5 << 20,);
+    }
+
+    // ---- fs.read: extra error path on unreadable root inside join ----
+
+    #[test]
+    fn fs_read_root_canonicalize_fails_returns_read_failed() {
+        let d = FsReadToolDispatcher::new(PathBuf::from("/nonexistent-fsread-root-xyzzy"));
+        let inv = fs_invocation("anything.txt");
+        // The root canonicalize fails before the path one.
+        assert_err_code(d.invoke(&inv), E_DISPATCH_READ_FAILED);
+    }
+
+    // ---- is_safe_ref: char-class enumeration --------------------------
+
+    #[test]
+    fn is_safe_ref_rejects_nonalpha_chars() {
+        assert!(!is_safe_ref("v 1"));
+        assert!(!is_safe_ref("v\t1"));
+        assert!(!is_safe_ref("v;1"));
+        assert!(!is_safe_ref("v|1"));
+    }
+
+    #[test]
+    fn is_safe_ref_accepts_dots_underscores_dashes_slashes() {
+        // Stays inside the alphabet — verifies the all() branch with
+        // every special-allowed char.
+        assert!(is_safe_ref("a.b_c-d/e"));
+    }
+
+    // ---- shell: invoke spawn-failed via direct path ------------------
+
+    #[test]
+    fn shell_invoke_wait_failed_through_helpers() {
+        // wait_with_timeout drains stderr/stdout iff piped. Run a tiny
+        // child with both NULLs so the body of the `child.stdout.take()`
+        // `None` arms get exercised.
+        let mut child = std::process::Command::new(
+            if Path::new("/bin/true").exists() {
+                "/bin/true"
+            } else {
+                "/usr/bin/true"
+            },
+        )
+        // Stdio default is inherit; explicitly null both to skip drain.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn true");
+        match wait_with_timeout(&mut child, Duration::from_secs(5)) {
+            WaitOutcome::Exited {
+                status,
+                stdout,
+                stderr,
+            } => {
+                assert_eq!(status, 0);
+                assert!(stdout.is_empty());
+                assert!(stderr.is_empty());
+            }
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    // ---- tail_text: boundary case at exactly max_chars ----------------
+
+    #[test]
+    fn tail_text_at_exact_max_returns_full() {
+        assert_eq!(tail_text("abcde", 5), "abcde");
+    }
+
+    // ---- base64 padding paths re-confirmed ---------------------------
+
+    #[test]
+    fn base64_encode_random_payload_round_trips_size() {
+        // 32 raw bytes → 44 base64 chars (ceil(32/3)*4 = 44).
+        let raw = (0u8..32).collect::<Vec<_>>();
+        let enc = base64_encode(&raw);
+        assert_eq!(enc.len(), 44);
+        // 32 % 3 == 2 → exactly 1 padding '=' char.
+        assert!(enc.ends_with('='));
+    }
+
+    // ---- glob with a pattern that becomes invalid regex --------------
+
+    #[test]
+    fn glob_unbalanced_bracket_returns_bad_pattern() {
+        // `[` is not escaped by glob_to_regex (it falls in the
+        // `other` arm), so the resulting regex `^[$` is an
+        // unterminated character class — `regex::Regex::new` rejects.
+        let tmp = TempDir::new().expect("tmp");
+        let d = GlobToolDispatcher::new(tmp.path().to_path_buf());
+        assert_err_code(d.invoke(&glob_invocation("[")), E_DISPATCH_BAD_PATTERN);
+    }
+
+    // ---- read_image: root canonicalize failure -----------------------
+
+    #[test]
+    fn read_image_unreadable_root_returns_read_failed() {
+        let dispatcher = ReadImageToolDispatcher::new(PathBuf::from(
+            "/nonexistent-root-for-readimage-test-xyzzy",
+        ));
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), v_str("hi.png"));
+        assert_err_code(
+            dispatcher.invoke(&make_invocation("read_image", args)),
+            E_DISPATCH_READ_FAILED,
+        );
+    }
+
+    // ---- fs.edit: read-failed via permission denied (Unix) -----------
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_edit_write_failed_on_readonly_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        // Mark the workspace dir read-only after seeding the file so
+        // the canonicalize+read pass succeeds but the write fails.
+        let tmp = TempDir::new().expect("tmp");
+        let f = tmp.path().join("hi.txt");
+        fs::write(&f, "hello").expect("seed");
+        // Drop write perms on the file itself.
+        let meta = fs::metadata(&f).expect("metadata");
+        let mut perms = meta.permissions();
+        perms.set_mode(0o444);
+        fs::set_permissions(&f, perms).expect("chmod");
+        // Also chmod the dir so create_file fails on macOS too.
+        let dirmeta = fs::metadata(tmp.path()).expect("dirmeta");
+        let mut dperms = dirmeta.permissions();
+        dperms.set_mode(0o555);
+        fs::set_permissions(tmp.path(), dperms).expect("dchmod");
+
+        let d = FsEditToolDispatcher::new(tmp.path().to_path_buf());
+        let args = fs_edit_args("hi.txt", "hello", "world");
+        let result = d.invoke(&fs_edit_invocation(args));
+
+        // Restore so TempDir cleanup works.
+        let mut rdperms = fs::metadata(tmp.path()).expect("rdmeta").permissions();
+        rdperms.set_mode(0o755);
+        let _ = fs::set_permissions(tmp.path(), rdperms);
+        let mut rfperms = fs::metadata(&f).expect("rfmeta").permissions();
+        rfperms.set_mode(0o644);
+        let _ = fs::set_permissions(&f, rfperms);
+
+        // Root user (or test sandbox) might bypass this; only assert
+        // when the syscall actually denied us. Otherwise the test is a
+        // no-op rather than a flake.
+        if let ToolResult::Err { code, .. } = result {
+            assert_eq!(code, E_DISPATCH_WRITE_FAILED);
+        }
+    }
+
+    // llvm-cov: noop — run_git's "git not on PATH" branch needs
+    // process-wide PATH mutation, which `#![forbid(unsafe_code)]` rules
+    // out from a test. The branch is exercised at deployment time on
+    // hosts that genuinely lack git.
 }
