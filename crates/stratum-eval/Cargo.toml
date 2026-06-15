@@ -12,9 +12,21 @@ readme       = { workspace = true }
 keywords     = { workspace = true }
 categories   = { workspace = true }
 
+[lib]
+name = "stratum_eval"
+path = "src/lib.rs"
+
 [[bin]]
 name = "stratum-eval"
 path = "src/main.rs"
+
+[[bin]]
+name = "bench-floor"
+path = "src/bin/bench_floor.rs"
+
+[[bin]]
+name = "bench-history"
+path = "src/bin/bench_history.rs"
 
 [lints]
 workspace = true
