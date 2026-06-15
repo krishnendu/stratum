@@ -211,6 +211,20 @@ fn output_format_stream_json_emits_ndjson_with_done_footer() {
     for line in &lines {
         let _v: serde_json::Value = serde_json::from_str(line).expect("each line is valid JSON");
     }
+    // At least one non-footer line must have `kind: "text"` — without
+    // this assertion a regression that emitted only the footer or
+    // some other unrelated shape would still pass the JSON-validity
+    // check above.
+    let saw_text_block = lines.iter().take(lines.len() - 1).any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(|s| s == "text"))
+            .unwrap_or(false)
+    });
+    assert!(
+        saw_text_block,
+        "stream-json should emit at least one `kind: text` block before the footer: {lines:?}"
+    );
     let footer: serde_json::Value = serde_json::from_str(lines.last().expect("at least one line"))
         .expect("footer is valid JSON");
     assert_eq!(
@@ -239,4 +253,21 @@ fn text_format_default_prints_assistant_text_only() {
         "text format must not emit a JSON envelope: {stdout}"
     );
     assert!(stdout.contains("plain"), "missing assistant text: {stdout}");
+}
+
+#[test]
+fn output_format_unknown_value_is_rejected_by_clap() {
+    let tmp = TempDir::new().expect("tempdir");
+    let out = run(tmp.path(), &["-p", "hi", "--output-format", "gorp"]);
+    assert_eq!(
+        out.status.code(),
+        Some(64),
+        "unknown --output-format should exit 64; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("gorp") || stderr.contains("invalid value"),
+        "clap should explain the unknown value in stderr: {stderr}"
+    );
 }

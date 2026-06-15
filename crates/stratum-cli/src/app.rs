@@ -81,11 +81,15 @@ struct Cli {
     /// (default — assistant text streamed to stdout), `json` (one
     /// envelope object with blocks + metrics), or `stream-json` (one
     /// JSON object per emitted block as NDJSON). Per plan/43 §3.
-    /// Ignored unless `--print` is also set.
+    /// Ignored unless `--print` is also set. Clap's `requires` only
+    /// fires for user-supplied values, not the `default_value` — so
+    /// the gate triggers exit 64 only when `--output-format` is
+    /// passed without `--print`, which is the intended behaviour.
     #[arg(
         long = "output-format",
         value_name = "FMT",
         default_value = "text",
+        value_parser = ["text", "json", "stream-json"],
         requires = "print"
     )]
     output_format: String,
@@ -3774,10 +3778,13 @@ fn print_assistant(
     format: &str,
 ) -> ExitCode {
     match format {
+        "text" => print_assistant_text_inner(state, out, err),
         "json" => print_assistant_json(state, out, err),
         "stream-json" => print_assistant_stream_json(state, out, err),
-        // Anything else falls through to text (the safe default).
-        _ => print_assistant_text_inner(state, out, err),
+        // Clap's `value_parser` on `--output-format` restricts to the
+        // three arms above; anything reaching here is a programming
+        // error, not user input.
+        _ => unreachable!("clap value_parser rejects unknown formats"),
     }
 }
 
@@ -3898,7 +3905,15 @@ fn build_turn_envelope(state: &crate::chat::ChatState) -> TurnEnvelope {
         .unwrap_or_default();
     let blocks: Vec<serde_json::Value> = last_assistant_blocks
         .iter()
-        .map(|b| serde_json::to_value(b).unwrap_or(serde_json::Value::Null))
+        .map(|b| {
+            #[allow(
+                clippy::expect_used,
+                reason = "Block is a primitive-shaped enum (String/u32/Vec); serde_json::to_value is infallible — matches the pattern at app.rs:4487 + carve-out in docs/coverage-exclusions.md"
+            )]
+            {
+                serde_json::to_value(b).expect("Block serialization is infallible")
+            }
+        })
         .collect();
     let outcome =
         if last_assistant_blocks.is_empty() && state.last_assistant_failure_reason().is_some() {
