@@ -116,6 +116,7 @@ const HELP_TEXT: &str = "available commands:\n\
     /budget, /cost, /usage — show the latest turn metrics (tokens · ms · tok/s · turn id)\n\
     /recap — one-line session summary\n\
     /diff — show recent fs.write / fs.edit calls\n\
+    /image <path> — attach an image to the next turn (scaffold; vision provider TBD)\n\
     /init — scaffold STRATUM.md for the current workspace\n\
     /editor — open the current input in $VISUAL / $EDITOR (Ctrl+G shortcut)\n\
     /select — toggle between select-mode (default, drag-to-copy) and mouse-scroll mode; alias for Ctrl+T\n\
@@ -413,6 +414,15 @@ pub struct ChatState {
     /// updated after every successful [`AgentHandoff::run_turn_with_handoff`]
     /// to the chain's final role.
     current_role: Option<SuggestedRole>,
+    /// Multimodal attachments staged via `/image <path>` (and the
+    /// future `/audio <path>`) for the NEXT user turn. Drained into
+    /// [`TurnContext::attachments`] on `submit()` so they ride along
+    /// with the prompt to the provider exactly once.
+    //
+    // TODO(plan/05): wire <vision-model> — until a vision-capable
+    // provider lands, these bytes are forwarded but ignored downstream
+    // (EchoProvider / LlamaCppProvider drop them with a log line).
+    pending_attachments: Vec<Block>,
 }
 
 impl Default for ChatState {
@@ -511,6 +521,7 @@ impl ChatState {
             session_id: stratum_runtime::SessionId::new_random(),
             created_at: SystemTime::now(),
             current_role: None,
+            pending_attachments: Vec::new(),
         }
     }
 
@@ -1840,6 +1851,18 @@ impl ChatState {
                 }
             }
             "export" => self.dispatch_export(arg),
+            "image" => {
+                // `/image <path>` — path may contain spaces, so reparse
+                // off the trimmed tail rather than the whitespace-split
+                // `arg` slot we used for single-token commands.
+                let tail = trimmed.strip_prefix("image").unwrap_or("").trim();
+                if tail.is_empty() {
+                    return PaletteOutcome::Rejected {
+                        message: "usage: /image <path>".to_string(),
+                    };
+                }
+                self.dispatch_image(tail)
+            }
             "recap" => self.dispatch_recap(),
             "compact" => self.dispatch_compact(),
             "diff" => self.dispatch_diff(),
@@ -2040,6 +2063,11 @@ impl ChatState {
             turn_id,
             started_at: SystemTime::now(),
             history: self.build_history_turns(),
+            // Parallel-roles palette path does not consume staged
+            // attachments today (the parallel surface predates the
+            // multimodal seam). Keep them queued for the next normal
+            // turn instead of dropping silently.
+            attachments: Vec::new(),
         };
         let intent = IntentRouter::default().classify(&prompt);
         let result = match handoff.run_turn_parallel(ctx, intent, &self.cancel, &roles) {
@@ -2241,6 +2269,9 @@ impl ChatState {
                 role: "system".to_string(),
                 content: system.to_string(),
             }],
+            // `/recap` is a text-only compression of the transcript; the
+            // multimodal seam carries through the normal submit path.
+            attachments: Vec::new(),
         };
         // Run synchronously on the dispatch thread — the caller is
         // already a palette command, so we don't need the streaming
@@ -2513,6 +2544,119 @@ impl ChatState {
                 message: format!("could not write {}: {e}", path.display()),
             },
         }
+    }
+
+    /// Handle `/image <path>`: resolve the path against cwd, sniff its
+    /// MIME, base64-encode the bytes, and queue a `Block::Image` for
+    /// the NEXT user turn. The transcript records an `[image: <mime>
+    /// @ <path>]` line so the user can see the attachment is pending.
+    ///
+    /// `plan/05` scaffold — the bytes are forwarded to the provider via
+    /// [`crate::TurnContext::attachments`] but every shipped provider
+    /// today ignores them (see TODO markers tagged
+    /// `TODO(plan/05): wire <vision-model>`). The vision-head wiring
+    /// lands in a follow-up commit when llama.cpp `--mmproj` is plumbed
+    /// through `LlamaCppProvider`.
+    //
+    // Path cap policy: 5 MiB matches `ReadImageToolDispatcher::DEFAULT_MAX_BYTES`
+    // so the palette path and the tool path agree on the largest image
+    // we will read into memory in one go.
+    fn dispatch_image(&mut self, raw_path: &str) -> PaletteOutcome {
+        const MAX_BYTES: u64 = 5 << 20;
+        let raw = raw_path.trim();
+        // Strip a single layer of quotes if the user wrote `/image "foo bar.png"`
+        // — the chat surface is a single-line input so this is the
+        // common shape for paths with spaces.
+        let path_str = raw
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+            .unwrap_or(raw);
+        let raw_path = std::path::PathBuf::from(path_str);
+        // Defense-in-depth: refuse relative paths containing `..`. The
+        // chat surface is local-trust (the user types what they want
+        // to read), but a malicious pasted prompt that hides a
+        // `../../../etc/passwd` traversal inside a `/image` shouldn't
+        // resolve to anything the user couldn't otherwise type. Absolute
+        // paths are explicitly the user's choice; relative paths must
+        // descend cleanly.
+        if !raw_path.is_absolute()
+            && raw_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return PaletteOutcome::Rejected {
+                message: format!(
+                    "/image: relative path traverses parent (`..`) — use an absolute path: {path_str}"
+                ),
+            };
+        }
+        let resolved = if raw_path.is_absolute() {
+            raw_path.clone()
+        } else {
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(&raw_path),
+                Err(e) => {
+                    return PaletteOutcome::Rejected {
+                        message: format!("/image: cannot resolve cwd: {e}"),
+                    };
+                }
+            }
+        };
+        match self.stage_image_attachment(&resolved, MAX_BYTES) {
+            Ok((mime, bytes)) => PaletteOutcome::Acknowledged {
+                message: format!(
+                    "[image: {mime} @ {} ({bytes} bytes); queued for next turn]",
+                    resolved.display()
+                ),
+            },
+            Err(msg) => PaletteOutcome::Rejected { message: msg },
+        }
+    }
+
+    /// Read `path` from disk and push a `Block::Image` onto
+    /// `pending_attachments`. Returns `(mime, raw_bytes)` for the
+    /// caller's success message.
+    fn stage_image_attachment(
+        &mut self,
+        path: &std::path::Path,
+        max_bytes: u64,
+    ) -> Result<(&'static str, u64), String> {
+        let metadata = std::fs::metadata(path)
+            .map_err(|e| format!("/image: cannot stat {}: {e}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("/image: not a regular file: {}", path.display()));
+        }
+        if metadata.len() > max_bytes {
+            return Err(format!(
+                "/image: {} bytes exceeds {max_bytes}-byte cap",
+                metadata.len()
+            ));
+        }
+        let bytes = std::fs::read(path).map_err(|e| format!("/image: read failed: {e}"))?;
+        // Reuse the same magic-byte + extension sniff the
+        // `read_image` tool dispatcher uses.
+        let mime =
+            stratum_runtime::sniff_image_mime(path, &bytes).unwrap_or("application/octet-stream");
+        let raw_len = bytes.len() as u64;
+        let bytes_u32 = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        let encoded = stratum_runtime::base64_encode(&bytes);
+        let block = Block::image_inline_b64(mime, encoded, bytes_u32);
+        self.pending_attachments.push(block);
+        Ok((mime, raw_len))
+    }
+
+    /// Number of attachments currently queued for the next turn.
+    /// Test-only accessor; production callers don't branch on this.
+    #[must_use]
+    pub const fn pending_attachment_count(&self) -> usize {
+        self.pending_attachments.len()
+    }
+
+    /// Snapshot of the queued attachments. Test-only accessor.
+    #[must_use]
+    pub fn pending_attachments(&self) -> &[Block] {
+        &self.pending_attachments
     }
 
     /// Stage `prompt` into the input buffer and dispatch [`Self::submit`].
@@ -2815,12 +2959,18 @@ impl ChatState {
         self.pending_started = Some(Instant::now());
         self.last_turn_id = Some(turn_id);
 
+        // Drain any `/image <path>`-staged attachments into THIS turn's
+        // context. Attachments are spent on a single user turn — they
+        // do not persist into the next one. See `pending_attachments`
+        // on `ChatState`.
+        let attachments = std::mem::take(&mut self.pending_attachments);
         let ctx = TurnContext {
             user_prompt: prompt.clone(),
             model: ModelId::from("echo"),
             turn_id,
             started_at: SystemTime::now(),
             history: self.build_history_turns(),
+            attachments,
         };
 
         // Handoff path stays synchronous for now — multi-role chains
@@ -6962,5 +7112,297 @@ mod tests {
         );
         assert_eq!(parse_role_label("unknown"), None);
         assert_eq!(parse_role_label(""), None);
+    }
+
+    // ---------- /image palette + attachment plumbing (plan/05) ----------
+
+    /// Test backend that captures the last `TurnContext` it saw. Lets
+    /// the multimodal-scaffold tests assert that `pending_attachments`
+    /// actually rides into the provider request.
+    #[derive(Debug)]
+    struct CapturingBackend {
+        last_ctx: Mutex<Option<TurnContext>>,
+    }
+
+    impl CapturingBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                last_ctx: Mutex::new(None),
+            })
+        }
+
+        fn last_attachments(&self) -> Vec<Block> {
+            self.last_ctx
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|c| c.attachments.clone()))
+                .unwrap_or_default()
+        }
+    }
+
+    impl ChatBackend for CapturingBackend {
+        fn run_turn_streaming(
+            &self,
+            ctx: TurnContext,
+            _cancel: &CancelToken,
+            chunk_tx: mpsc::Sender<Block>,
+        ) -> TurnResult {
+            // 1×1 PNG echo back so the transcript has *some* assistant turn.
+            let echo_text = format!("saw {} attachment(s)", ctx.attachments.len());
+            let _ = chunk_tx.send(Block::Text {
+                text: echo_text.clone(),
+            });
+            let turn_id = ctx.turn_id;
+            if let Ok(mut guard) = self.last_ctx.lock() {
+                *guard = Some(ctx);
+            }
+            TurnResult {
+                turn_id,
+                outcome: TurnOutcome::Success,
+                blocks: vec![Block::Text { text: echo_text }],
+                transitions: Vec::new(),
+                events_emitted: Vec::new(),
+            }
+        }
+    }
+
+    /// Smallest valid PNG: the 8-byte signature followed by a minimal
+    /// IHDR + IEND. We only need enough for the magic-byte sniff to
+    /// classify the file as `image/png`; the bytes do not need to be
+    /// a renderable image.
+    fn tiny_png_bytes() -> Vec<u8> {
+        let mut buf = Vec::with_capacity(67);
+        // PNG signature.
+        buf.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        // IHDR chunk: length (13), type, payload, crc — we use zeros
+        // for everything except the chunk type since the sniffer only
+        // checks the leading signature.
+        buf.extend_from_slice(&[0, 0, 0, 13]);
+        buf.extend_from_slice(b"IHDR");
+        buf.extend_from_slice(&[0; 13]);
+        buf.extend_from_slice(&[0; 4]);
+        // IEND chunk.
+        buf.extend_from_slice(&[0, 0, 0, 0]);
+        buf.extend_from_slice(b"IEND");
+        buf.extend_from_slice(&[0; 4]);
+        buf
+    }
+
+    fn write_tiny_png(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, tiny_png_bytes()).expect("write tiny png");
+        path
+    }
+
+    #[test]
+    fn image_palette_command_with_no_arg_is_rejected() {
+        let mut s = state();
+        let outcome = s.execute_palette_command("/image");
+        assert!(matches!(outcome, PaletteOutcome::Rejected { .. }));
+        assert_eq!(s.pending_attachment_count(), 0);
+    }
+
+    #[test]
+    fn image_palette_command_with_missing_path_is_rejected() {
+        let mut s = state();
+        // Use an obviously-nonexistent path inside a tempdir so the test
+        // is isolated from whatever happens to live at /no/such/file on
+        // the host.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bogus = tmp.path().join("nope.png");
+        let cmd = format!("/image {}", bogus.display());
+        let outcome = s.execute_palette_command(&cmd);
+        assert!(matches!(outcome, PaletteOutcome::Rejected { .. }));
+        assert_eq!(s.pending_attachment_count(), 0);
+    }
+
+    #[test]
+    fn image_palette_command_stages_attachment() {
+        let mut s = state();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_tiny_png(tmp.path(), "tiny.png");
+        let cmd = format!("/image {}", path.display());
+        let outcome = s.execute_palette_command(&cmd);
+        let PaletteOutcome::Acknowledged { message } = outcome else {
+            panic!("expected acknowledged, got {outcome:?}");
+        };
+        assert!(message.contains("image/png"), "message: {message}");
+        assert!(message.contains(&path.display().to_string()));
+        assert_eq!(s.pending_attachment_count(), 1);
+        // Verify the staged block shape.
+        let blocks = s.pending_attachments();
+        assert!(matches!(
+            &blocks[0],
+            Block::Image {
+                mime,
+                data: stratum_types::ImageData::Inline { .. },
+                ..
+            } if mime == "image/png"
+        ));
+    }
+
+    #[test]
+    fn image_palette_command_appears_in_transcript() {
+        // The palette path records its outcome via `Turn::Command`; the
+        // tip in the message ("[image: <mime> @ <path>]") is what users
+        // see when they queue an attachment.
+        let mut s = state();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_tiny_png(tmp.path(), "tiny.png");
+        let cmd = format!("/image {}", path.display());
+        s.execute_palette_command(&cmd);
+        let last = s.transcript().last().expect("at least one turn");
+        match last {
+            Turn::Command { ok, message, .. } => {
+                assert!(*ok);
+                assert!(message.contains("image/png"));
+            }
+            other => panic!("expected Turn::Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_forwards_pending_attachments_into_turn_context() {
+        // End-to-end seam check: `/image <path>` queues a Block::Image,
+        // the next `submit()` drains it into TurnContext.attachments,
+        // and the agent loop forwards it to the provider. Asserted via
+        // a CapturingBackend that snapshots the last TurnContext.
+        let backend = CapturingBackend::new();
+        let chat_backend: Arc<dyn ChatBackend> = backend.clone();
+        let mut s = ChatState::with_backend(chat_backend);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_tiny_png(tmp.path(), "tiny.png");
+        let cmd = format!("/image {}", path.display());
+        s.execute_palette_command(&cmd);
+        assert_eq!(s.pending_attachment_count(), 1);
+
+        s.submit_with_prompt("describe this image");
+
+        // After submit, the queue is drained — exactly once.
+        assert_eq!(s.pending_attachment_count(), 0);
+
+        let seen = backend.last_attachments();
+        assert_eq!(seen.len(), 1, "backend should see 1 attachment");
+        assert!(matches!(&seen[0], Block::Image { mime, .. } if mime == "image/png"));
+    }
+
+    #[test]
+    fn echo_provider_does_not_panic_on_attachments() {
+        // Regression seam: even though EchoProvider is text-only, it
+        // MUST tolerate a populated `attachments` field (Phase-5
+        // multimodal scaffold). Build a request directly and verify
+        // generate() returns text blocks without panicking.
+        use stratum_runtime::{EchoProvider, GenerateRequest, Provider, SamplerParams};
+        use stratum_types::Capability;
+
+        let provider = EchoProvider::new("echo: ");
+        // Make sure the provider still advertises Generate capability.
+        assert!(provider.capabilities().contains(&Capability::Generate));
+
+        let req = GenerateRequest {
+            model: ModelId::from("echo"),
+            prompt: "hello world".to_string(),
+            max_blocks: 4,
+            system_override: None,
+            history: Vec::new(),
+            sampler: SamplerParams::default(),
+            attachments: vec![Block::image_inline_b64("image/png", "AAAA", 3)],
+        };
+        let cancel = CancelToken::new();
+        let blocks = provider.generate(&req, &cancel);
+        // EchoProvider emits one Text per word + Usage + Done. The
+        // attachment is silently dropped; the assertion is that no
+        // panic / error variant landed in the output.
+        assert!(
+            blocks.iter().any(|b| matches!(b, Block::Text { .. })),
+            "expected at least one Text block, got {blocks:?}"
+        );
+        assert!(
+            !blocks.iter().any(|b| matches!(b, Block::Cancelled { .. })),
+            "EchoProvider must not surface Cancelled for attachments: {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn image_palette_command_accepts_quoted_path_with_spaces() {
+        let mut s = state();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_tiny_png(tmp.path(), "with space.png");
+        let cmd = format!("/image \"{}\"", path.display());
+        let outcome = s.execute_palette_command(&cmd);
+        assert!(
+            matches!(outcome, PaletteOutcome::Acknowledged { .. }),
+            "expected acknowledged for quoted path, got {outcome:?}"
+        );
+        assert_eq!(s.pending_attachment_count(), 1);
+    }
+
+    #[test]
+    fn image_palette_command_rejects_relative_parent_traversal() {
+        let mut s = state();
+        let outcome = s.execute_palette_command("/image ../../etc/passwd");
+        if let PaletteOutcome::Rejected { message } = outcome {
+            assert!(
+                message.contains("traverses parent") || message.contains("`..`"),
+                "wrong rejection message: {message}"
+            );
+        } else {
+            panic!("expected Rejected for `..` traversal, got {outcome:?}");
+        }
+        assert_eq!(
+            s.pending_attachment_count(),
+            0,
+            "rejected /image must not queue anything"
+        );
+    }
+
+    /// `ChatBackend` that always reports failure. Used to verify
+    /// attachments drain even when the turn doesn't succeed.
+    #[derive(Debug, Default)]
+    struct FailingBackend;
+    impl ChatBackend for FailingBackend {
+        fn run_turn_streaming(
+            &self,
+            ctx: TurnContext,
+            _cancel: &CancelToken,
+            _chunk_tx: mpsc::Sender<Block>,
+        ) -> TurnResult {
+            TurnResult {
+                turn_id: ctx.turn_id,
+                outcome: TurnOutcome::ModelError {
+                    // Existing declared sentinel; the test doesn't
+                    // care which code, only that the outcome is non-success.
+                    code: "STRAT-E3007".into(),
+                },
+                blocks: Vec::new(),
+                transitions: Vec::new(),
+                events_emitted: Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn pending_attachments_drain_even_when_turn_fails() {
+        // Documented contract: attachments are spent per-turn,
+        // regardless of outcome. A failed turn must NOT leave them
+        // queued for the next prompt (which would silently re-charge
+        // them in tokens + bandwidth and surprise the user).
+        let chat_backend: Arc<dyn ChatBackend> = Arc::new(FailingBackend);
+        let mut s = ChatState::with_backend(chat_backend);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_tiny_png(tmp.path(), "tiny.png");
+        let cmd = format!("/image {}", path.display());
+        s.execute_palette_command(&cmd);
+        assert_eq!(s.pending_attachment_count(), 1);
+
+        s.submit_with_prompt("describe this image");
+
+        assert_eq!(
+            s.pending_attachment_count(),
+            0,
+            "attachments must drain on failure too — they belong to the user's turn, not to a retry"
+        );
     }
 }

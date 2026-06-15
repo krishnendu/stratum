@@ -486,6 +486,10 @@ impl AgentHandoff {
                 turn_id: next_turn_id,
                 started_at: current_ctx.started_at,
                 history: current_ctx.history.clone(),
+                // Attachments are bound to the user's explicit turn and
+                // are spent on the first hop. Subsequent handoff steps
+                // carry an empty list so we don't re-charge image tokens.
+                attachments: Vec::new(),
             };
         }
     }
@@ -804,6 +808,7 @@ mod tests {
             turn_id: TurnId(1),
             started_at: t0(),
             history: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 

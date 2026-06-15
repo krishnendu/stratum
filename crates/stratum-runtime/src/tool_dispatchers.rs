@@ -958,6 +958,7 @@ impl ToolDispatcher for SubagentToolDispatcher {
             system_override: Some(sub.prompt.clone()),
             history: Vec::new(),
             sampler: crate::provider::SamplerParams::default(),
+            attachments: Vec::new(),
         };
         let cancel = crate::cancel::CancelToken::new();
         let blocks = self.provider.generate(&req, &cancel);
@@ -1704,7 +1705,16 @@ fn is_safe_ref(s: &str) -> bool {
 
 // ---- image helpers -------------------------------------------------------
 
-fn sniff_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
+/// Sniff the MIME type of an image from its raw bytes (falling back to
+/// Sniff the MIME type of an image from its bytes (and fall back to the
+/// file extension when the magic-byte prefix is ambiguous).
+///
+/// Returns `None` only when neither the byte prefix nor the extension is
+/// a recognised image format. Pulled out of [`ReadImageToolDispatcher`]
+/// so the TUI palette path (`/image <path>`) can reuse the exact same
+/// sniff logic without going through the full dispatcher invocation.
+#[must_use]
+pub fn sniff_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
     // Magic-byte sniff first; fall back to extension if the bytes are
     // ambiguous. Order matters — JPEG has multiple framings.
     if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
@@ -1740,7 +1750,11 @@ fn sniff_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
 
 /// Standard alphabet base64 with `=` padding. Kept inline to avoid pulling
 /// the `base64` crate into the runtime dep graph for a single use site.
-fn base64_encode(bytes: &[u8]) -> String {
+///
+/// Public so the TUI palette path can produce the same payload shape that
+/// [`ReadImageToolDispatcher`] writes into a `Block::Image`.
+#[must_use]
+pub fn base64_encode(bytes: &[u8]) -> String {
     const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut iter = bytes.chunks_exact(3);

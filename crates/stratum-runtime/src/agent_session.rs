@@ -225,6 +225,9 @@ impl AgentSession {
             turn_id: TurnId(next),
             started_at,
             history: Vec::new(),
+            // Headless session entry point — no attachments yet. The
+            // chat TUI / API gateway carry the multimodal seam.
+            attachments: Vec::new(),
         };
 
         let result = self.loop_.run_turn(ctx, &self.cancel);

@@ -994,6 +994,19 @@ impl Provider for LlamaCppProvider {
     }
 
     fn generate(&self, req: &GenerateRequest, cancel: &CancelToken) -> Vec<Block> {
+        // TODO(plan/05): wire <vision-model> — the Phase-1 llama.cpp
+        // path is text-only; the Gemma 4 E4B vision head with
+        // `--mmproj` is the Phase-5 follow-up. Until that lands, log
+        // and drop the bytes so the model isn't asked to interpret
+        // bare base64 noise mid-prompt.
+        if !req.attachments.is_empty() {
+            tracing::debug!(
+                target: "stratum.provider.llama_cpp",
+                count = req.attachments.len(),
+                "LlamaCppProvider received {} multimodal attachment(s); ignoring (no mmproj wired yet)",
+                req.attachments.len()
+            );
+        }
         match self.generate_text(req, cancel) {
             Ok(Some(text)) => text_to_blocks(text),
             Ok(None) => Vec::new(),
@@ -1302,6 +1315,7 @@ pub fn echoey_smoke_text(provider: &LlamaCppProvider) -> Result<String, LlamaPro
         system_override: None,
         history: Vec::new(),
         sampler: crate::provider::SamplerParams::default(),
+        attachments: Vec::new(),
     };
     let cancel = CancelToken::new();
     provider

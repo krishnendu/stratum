@@ -269,6 +269,7 @@ impl EvalRunner {
             turn_id: TurnId(0),
             started_at: SystemTime::now(),
             history: Vec::new(),
+            attachments: Vec::new(),
         };
         let cancel = CancelToken::new();
         let started = Instant::now();

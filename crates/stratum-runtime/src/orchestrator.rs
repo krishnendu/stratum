@@ -191,6 +191,7 @@ mod tests {
             turn_id: crate::observability::TurnId(1),
             started_at: SystemTime::UNIX_EPOCH,
             history: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 

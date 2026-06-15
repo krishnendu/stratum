@@ -373,6 +373,7 @@ mod tests {
             turn_id: TurnId(1),
             started_at: t0(),
             history: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -845,6 +846,7 @@ mod tests {
                 system_override: None,
                 history: Vec::new(),
                 sampler: crate::provider::SamplerParams::default(),
+                attachments: Vec::new(),
             },
             &CancelToken::new(),
         );
