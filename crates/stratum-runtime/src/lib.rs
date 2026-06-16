@@ -121,6 +121,8 @@ pub mod mcp;
 pub mod mcp_jsonrpc;
 /// `STRATUM.md` walk-up loader with `@file` imports (plan/39).
 pub mod memory_loader;
+/// cpal-backed microphone capture scaffold for Phase 5 voice-in.
+pub mod mic;
 /// Curated model catalog: structured index of installer-resolvable models.
 pub mod model_catalog;
 /// Slug → local GGUF path resolver composing a [`model_catalog::ModelCatalog`]

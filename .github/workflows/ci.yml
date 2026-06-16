@@ -42,6 +42,13 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # `libasound2-dev` provides the ALSA pkg-config / headers that
+      # `alsa-sys` (a transitive dep of `cpal`, used by
+      # `stratum-runtime::mic`) links against on Linux. macOS gets
+      # CoreAudio for free.
+      - name: Install ALSA dev headers (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       # Intentionally NOT --all-features: the off-by-default
       # `provider-llama-cpp` feature pulls in the heavy llama.cpp build and
       # is exercised on nightly cron / release / manual dispatch via
@@ -63,9 +70,9 @@ jobs:
       # PR #69; without it those tests early-return (skip). macOS uses
       # `sandbox-exec`, which ships with the OS. See
       # `docs/verification-gates.md` for the sandbox gate.
-      - name: Install bubblewrap (Ubuntu)
+      - name: Install bubblewrap + ALSA dev headers (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap libasound2-dev
       # See clippy job comment re: `provider-llama-cpp`.
       - run: cargo test --workspace --no-fail-fast
 
@@ -76,6 +83,9 @@ jobs:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # See clippy job comment re: ALSA headers.
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: cargo test --test doctor_schema
         run: cargo test --package stratum-cli --test doctor_schema -- --include-ignored
 
@@ -86,6 +96,9 @@ jobs:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # See clippy job comment re: ALSA headers.
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo run -p xtask -- check-error-codes
 
   coverage:
@@ -100,6 +113,9 @@ jobs:
       - uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2.81.11
         with:
           tool: cargo-llvm-cov
+      # See clippy job comment re: ALSA headers.
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       # `cargo llvm-cov` has historically silently skipped
       # `--fail-under-lines` enforcement when combined with `--lcov
       # --output-path` in some versions. To guarantee G2.1 is a hard gate, we
@@ -113,7 +129,11 @@ jobs:
         # `stratum-tui` + `stratum-backend-local` (workspace-internal
         # crates housing the moved chat.rs whose render/event-loop
         # paths are TTY-bound; same carve-out as the original CLI
-        # chat::run + chat::event_loop). See
+        # chat::run + chat::event_loop). Excludes `mic.rs` via
+        # `--ignore-filename-regex`: the file mixes pure-data helpers
+        # (covered) with cpal-bound methods (SIGSEGV under cargo test on
+        # headless CI), and the OS-audio half cannot be unit-tested
+        # without a synthetic device backend; see
         # `docs/coverage-exclusions.md`.
         run: |
           set -euxo pipefail
@@ -122,6 +142,7 @@ jobs:
             --exclude xtask \
             --exclude stratum-tui \
             --exclude stratum-backend-local \
+            --ignore-filename-regex 'crates/stratum-runtime/src/mic\.rs' \
             --fail-under-lines 96
       - name: cargo llvm-cov (lcov artifact)
         shell: bash
@@ -155,5 +176,8 @@ jobs:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
       - uses: dtolnay/rust-toolchain@b18f7037bce1ea84c086f4d5e9493f853c0ce412 # 1.90.0
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # See clippy job comment re: ALSA headers.
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       # Excludes the `provider-llama-cpp` feature; see clippy job comment.
       - run: cargo check --workspace --locked
