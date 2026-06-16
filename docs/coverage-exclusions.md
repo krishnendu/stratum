@@ -1,6 +1,6 @@
 # Coverage Exclusions
 
-Stratum's CI gate (`G2.1` in `plan/36-verification-gates.md`) requires line coverage **≥ 93%** (`cargo llvm-cov --fail-under-lines 93`). The plan v2 target is 100%; the gap is the documented carve-outs below plus the freshly-landed Phase 1-4 runtime modules whose error / sandbox-spawn branches need OS-specific triggers (notably `tool_dispatchers.rs` at 70.98%). The threshold drops temporarily; a tracking task to bring it back to 96 lives alongside the Phase 4 v2 work in `plan/07-implementation-phases.md`.
+Stratum's CI gate (`G2.1` in `plan/36-verification-gates.md`) requires line coverage **≥ 96%** (`cargo llvm-cov --fail-under-lines 96`). The plan v2 target is 100%; the gap is the documented carve-outs below.
 
 When a new carve-out is added it MUST be appended here in the same PR. The PR description's `G2.1` checkbox cannot be ticked otherwise.
 
@@ -20,7 +20,7 @@ When a new carve-out is added it MUST be appended here in the same PR. The PR de
 | `crates/stratum-tui/**` | Entire crate | Workspace-internal crate (`publish = false`) housing the chat renderer + palette + theme + brand that moved out of `stratum-cli`. The previous CLI-resident `chat::run` and `chat::event_loop` were already carved out as TTY-bound (see two rows above); the same paths move with the file, so the exclusion moves too. Other items inside the crate are exercised through the CLI's integration tests. Excluded via `cargo llvm-cov --workspace --exclude stratum-tui`. |
 | `crates/stratum-backend-local/**` | Entire crate | Workspace-internal adapter crate. The translation layer between `AgentLoop` blocks and `BackendApi::BackendEvent` is exercised by integration tests against the CLI; covering it as its own crate boundary would require a duplicate test surface that's not yet built. Excluded via `cargo llvm-cov --workspace --exclude stratum-backend-local`. |
 
-## Why 98 instead of 100
+## Why 96 instead of 100
 
 Two classes of carve-out:
 

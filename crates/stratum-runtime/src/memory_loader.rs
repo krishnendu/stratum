@@ -426,4 +426,144 @@ mod tests {
         assert!(out[0].body.contains("truncated at"));
         assert!(out[0].body.len() <= MAX_TIER_BYTES + 80);
     }
+
+    #[test]
+    fn tier_labels_cover_all_variants() {
+        assert_eq!(Tier::Managed.label(), "Managed");
+        assert_eq!(Tier::User.label(), "User");
+        assert_eq!(Tier::Project.label(), "Project");
+        assert_eq!(Tier::Local.label(), "Local");
+    }
+
+    #[test]
+    fn load_managed_tier() {
+        let tmp = TempDir::new().unwrap();
+        let managed = tmp.path().join("STRATUM.md");
+        write(&managed, "managed admin policy");
+        let cfg = LoaderConfig {
+            managed_path: Some(managed),
+            ..Default::default()
+        };
+        let out = load(&cfg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tier, Tier::Managed);
+        assert!(out[0].body.contains("managed admin policy"));
+    }
+
+    #[test]
+    fn load_skips_missing_files() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = LoaderConfig {
+            managed_path: Some(tmp.path().join("no-such.md")),
+            user_path: Some(tmp.path().join("also-missing.md")),
+            cwd: None,
+        };
+        let out = load(&cfg);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn concat_empty_sections_returns_empty_string() {
+        assert_eq!(concat(&[]), "");
+    }
+
+    #[test]
+    fn concat_inserts_separator_between_sections() {
+        let s1 = LoadedSection {
+            tier: Tier::User,
+            source: PathBuf::from("/a"),
+            body: "first".to_string(),
+        };
+        let s2 = LoadedSection {
+            tier: Tier::Project,
+            source: PathBuf::from("/b"),
+            body: "second".to_string(),
+        };
+        let out = concat(&[s1, s2]);
+        assert!(out.contains("\n\n"));
+        assert!(out.contains("(User)"));
+        assert!(out.contains("(Project)"));
+    }
+
+    #[test]
+    fn body_truncated_respects_char_boundary() {
+        // Force a multi-byte char straddling MAX_TIER_BYTES so the
+        // boundary-walk-back loop executes.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
+        // Prefix of (MAX_TIER_BYTES - 1) ASCII bytes, then a 3-byte char.
+        let mut s = "a".repeat(MAX_TIER_BYTES - 1);
+        s.push('€'); // 3-byte UTF-8 char crossing the cap
+        s.push_str(&"b".repeat(100));
+        write(&tmp.path().join("STRATUM.md"), &s);
+        let cfg = LoaderConfig {
+            cwd: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = load(&cfg);
+        assert!(out[0].body.contains("truncated at"));
+        // Must not have panicked on a non-boundary slice.
+    }
+
+    #[test]
+    fn import_path_rejected_when_anchor_has_no_parent() {
+        // anchor with no parent => resolve_import_path returns None.
+        let bare = Path::new("");
+        assert!(resolve_import_path("./x", bare).is_none());
+    }
+
+    #[test]
+    fn import_resolves_absolute_path() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
+        let target = tmp.path().join("abs.md");
+        write(&target, "absolute body");
+        let main = tmp.path().join("STRATUM.md");
+        write(&main, &format!("head\n@{}\ntail", target.display()));
+        let cfg = LoaderConfig {
+            cwd: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = load(&cfg);
+        let combined: String = out.iter().map(|s| s.body.clone()).collect();
+        assert!(combined.contains("absolute body"));
+    }
+
+    #[test]
+    fn import_resolves_bare_relative_path() {
+        // A bare path like `@notes.md` (no ./ or / or ~) should also resolve.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
+        write(&tmp.path().join("notes.md"), "bare relative body");
+        write(&tmp.path().join("STRATUM.md"), "head\n@notes.md\ntail");
+        let cfg = LoaderConfig {
+            cwd: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = load(&cfg);
+        let combined: String = out.iter().map(|s| s.body.clone()).collect();
+        assert!(combined.contains("bare relative body"));
+    }
+
+    #[test]
+    fn import_with_tilde_home_path() {
+        // ~/ paths resolve via dirs::home_dir(); we don't write into HOME, so
+        // the file won't exist and we should see a marker rather than a panic.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
+        write(
+            &tmp.path().join("STRATUM.md"),
+            "@~/definitely-not-a-real-stratum-import.md",
+        );
+        let cfg = LoaderConfig {
+            cwd: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+        let out = load(&cfg);
+        let combined: String = out.iter().map(|s| s.body.clone()).collect();
+        // Either the import fails (most common) or — if HOME happens to
+        // contain that file in CI — it resolved. Both are fine. The point
+        // is exercising the `~/` branch of resolve_import_path.
+        assert!(!combined.is_empty());
+    }
 }

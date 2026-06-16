@@ -368,4 +368,87 @@ mod tests {
         assert_eq!(labels.len(), 1);
         assert!(labels[0].starts_with("user="));
     }
+
+    #[test]
+    fn settings_tier_labels_cover_all_variants() {
+        assert_eq!(SettingsTier::Managed.label(), "managed");
+        assert_eq!(SettingsTier::User.label(), "user");
+        assert_eq!(SettingsTier::Project.label(), "project");
+        assert_eq!(SettingsTier::Local.label(), "local");
+    }
+
+    #[test]
+    fn managed_tier_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("managed.json");
+        write_json(
+            &path,
+            r#"{
+                "output_style": "concise",
+                "status_line": "echo hi",
+                "editor_mode": "vim"
+            }"#,
+        );
+        let m = load(&LoaderInputs {
+            managed: Some(path),
+            ..Default::default()
+        });
+        assert_eq!(m.output_style.as_deref(), Some("concise"));
+        assert_eq!(m.status_line.as_deref(), Some("echo hi"));
+        assert_eq!(m.editor_mode.as_deref(), Some("vim"));
+        let labels = m.source_labels();
+        assert!(labels[0].starts_with("managed="));
+    }
+
+    #[test]
+    fn local_toml_fallback_loaded() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(project_root.join(".stratum")).unwrap();
+        // Only .stratum/local.toml present, not settings.local.json.
+        std::fs::write(
+            project_root.join(".stratum").join("local.toml"),
+            "theme = \"local-toml\"\n",
+        )
+        .unwrap();
+        let m = load(&LoaderInputs {
+            project_root: Some(project_root),
+            ..Default::default()
+        });
+        assert_eq!(m.theme.as_deref(), Some("local-toml"));
+        let labels = m.source_labels();
+        assert!(labels.iter().any(|l| l.starts_with("local=")));
+    }
+
+    #[test]
+    fn malformed_toml_silently_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(project_root.join("stratum.toml"), "= not = toml\n").unwrap();
+        let m = load(&LoaderInputs {
+            project_root: Some(project_root),
+            ..Default::default()
+        });
+        assert!(m.sources.is_empty());
+    }
+
+    #[test]
+    fn ask_unions_across_tiers() {
+        let tmp = TempDir::new().unwrap();
+        let user_path = tmp.path().join("user.json");
+        write_json(&user_path, r#"{ "permissions": { "ask": ["fs.write"] } }"#);
+        let project_root = tmp.path().join("project");
+        let project_path = project_root.join(".stratum").join("settings.json");
+        write_json(
+            &project_path,
+            r#"{ "permissions": { "ask": ["fs.write", "shell.exec"] } }"#,
+        );
+        let m = load(&LoaderInputs {
+            user: Some(user_path),
+            project_root: Some(project_root),
+            ..Default::default()
+        });
+        assert_eq!(m.permissions.ask.len(), 2);
+    }
 }
