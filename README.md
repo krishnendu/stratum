@@ -105,6 +105,10 @@ The runtime is built around a small set of core abstractions in `crates/stratum-
 
 Deeper design notes live in `plan/` (gitignored, not published). Architecture docs intended for public consumption land under [`docs/`](docs/).
 
+## IDE / agent integrations
+
+`stratum serve --openai` exposes an OpenAI-compatible HTTP endpoint on loopback. See [`docs/integrations/`](docs/integrations/README.md) for copy-pasteable setup guides covering Aider, Cline (VSCode), Continue (VSCode / JetBrains), and OpenHands.
+
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md). Branch protection on `main`: PR required, 5 CI checks, local review gate, squash merge, linear history.
