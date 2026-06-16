@@ -1,0 +1,94 @@
+name: bench-floor
+
+# Phase 7: nightly deterministic regression bench.
+#
+# Runs every documented eval suite via `stratum-eval`'s `bench-floor`
+# binary against the synthetic EchoProvider floor, then `bench-history`
+# appends the result to `.github/bench-history/<YYYY-MM>.jsonl` and
+# refreshes `latest.json`. The updated history dir is committed back to
+# `main` by the workflow (the bin never touches git itself).
+#
+# Gated on `schedule:` + `workflow_dispatch:` only — never per-PR.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 03:17 UTC nightly; offset from eval-baseline/eval-llm windows.
+    - cron: '17 3 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+
+concurrency:
+  # Workflow-global group (NOT ref-scoped) so two simultaneous runs
+  # — e.g. one cron + one manual dispatch on a different ref — queue
+  # rather than race on the JSONL append in bench-history.
+  group: bench-floor
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: bench-floor + bench-history
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # The workflow commits the history dir back; need write token.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-floor-${{ hashFiles('Cargo.lock') }}
+      - name: Build bench bins
+        run: |
+          cargo build --release \
+            -p stratum-eval \
+            --bin bench-floor \
+            --bin bench-history
+      - name: Prepare artifact dir
+        run: mkdir -p target/bench
+      - name: Run bench-floor
+        run: |
+          ./target/release/bench-floor \
+            --evals-dir evals \
+            --out target/bench/result.json
+      - name: Run bench-history
+        run: |
+          ./target/release/bench-history \
+            --result target/bench/result.json \
+            --history-dir .github/bench-history
+      - name: Upload result artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-floor-result
+          path: target/bench/result.json
+      - name: Commit history update
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          # Per-repo identity (no global git config — see MEMORY).
+          git config user.name "stratum-bench-bot"
+          git config user.email "stratum-bench-bot@users.noreply.github.com"
+          # Nothing to do if the bench produced an identical row (rare
+          # because mtime moves) — skip silently.
+          if [ -z "$(git status --porcelain .github/bench-history)" ]; then
+            echo "bench-history: no changes to commit"
+            exit 0
+          fi
+          git add .github/bench-history
+          # `[skip ci]` so the auto-commit doesn't trigger sibling
+          # workflows that watch `push: branches: [main]`.
+          git commit -m "chore(bench): nightly floor result $(date -u +%Y-%m-%d) [skip ci]"
+          git push origin HEAD:main
