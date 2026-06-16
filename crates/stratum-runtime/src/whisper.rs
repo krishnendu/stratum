@@ -127,12 +127,21 @@ impl WhisperSubprocess {
         self.timeout
     }
 
-    /// Returns `true` iff the configured binary is resolvable on `PATH`.
-    /// Cheaper than [`Self::transcribe`] when callers only need to know
-    /// whether to render the "unavailable" sentinel.
+    /// Returns `true` iff the configured binary is resolvable.
+    ///
+    /// Single-component names (no directory separator) are looked up on
+    /// `PATH`; multi-component paths (containing any `Path` component
+    /// beyond the leaf) are checked for file existence directly so tests
+    /// — and users with a non-`PATH` install — can point at an absolute
+    /// binary. Cheaper than [`Self::transcribe`] when callers only need
+    /// to know whether to render the "unavailable" sentinel.
     #[must_use]
     pub fn is_available(&self) -> bool {
-        which_in_path(&self.binary).is_some()
+        if Path::new(&self.binary).components().count() > 1 {
+            Path::new(&self.binary).is_file()
+        } else {
+            which_in_path(&self.binary).is_some()
+        }
     }
 
     /// Transcribe the audio file at `input` to text.
@@ -150,7 +159,20 @@ impl WhisperSubprocess {
     /// a failure status; [`WhisperError::OutputMissing`] when the
     /// `.txt` output file is unreadable after a successful run.
     pub fn transcribe(&self, input: &Path) -> Result<String, WhisperError> {
-        let bin = which_in_path(&self.binary).ok_or(WhisperError::MissingBinary)?;
+        // Resolve the binary: single-component names go through PATH
+        // lookup; multi-component paths are accepted as-is so tests /
+        // sideloads can target a binary outside `PATH`. Component count
+        // is platform-agnostic — works for both `/usr/bin/whisper` and
+        // `C:\tools\whisper.exe` without a separator-character branch.
+        let bin: PathBuf = if Path::new(&self.binary).components().count() > 1 {
+            let p = Path::new(&self.binary);
+            if !p.is_file() {
+                return Err(WhisperError::MissingBinary);
+            }
+            p.to_path_buf()
+        } else {
+            which_in_path(&self.binary).ok_or(WhisperError::MissingBinary)?
+        };
 
         // Pick a unique tmp stem so `-of <stem>` doesn't collide with
         // sibling runs. whisper.cpp appends `.txt`; we manage the full
@@ -280,5 +302,130 @@ mod tests {
     fn whisper_subprocess_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<WhisperSubprocess>();
+    }
+
+    // The script-driven tests below stand up a fake whisper.cpp via a
+    // shell script in a tempdir and point `WhisperSubprocess` at the
+    // absolute path. They cover the `transcribe()` body — spawn, poll,
+    // success, NonZero, Timeout, OutputMissing — without depending on a
+    // real whisper.cpp install on the test host.
+    #[cfg(unix)]
+    mod script_driven {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+
+        use tempfile::TempDir;
+
+        use super::*;
+
+        /// Write a `#!/bin/sh` script under `tmp` with mode 0o755 and
+        /// return its absolute path. The script body is appended after a
+        /// `#!/bin/sh\n` shebang line.
+        fn write_script(tmp: &TempDir, name: &str, body: &str) -> PathBuf {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}")).expect("write script");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod script");
+            p
+        }
+
+        /// Convert a tempdir-backed script path to `&str` without lossy
+        /// substitution. Fails loudly if the temp directory is non-UTF-8
+        /// rather than silently substituting `U+FFFD` and producing a
+        /// path that no longer exists.
+        fn script_str(p: &Path) -> &str {
+            p.to_str()
+                .expect("tempdir-backed script path must be valid UTF-8")
+        }
+
+        #[test]
+        fn happy_path_writes_stem_txt_and_returns_trimmed_transcript() {
+            let tmp = TempDir::new().expect("tmp");
+            // The fake whisper finds the `-of <stem>` argument and writes
+            // a transcript to `<stem>.txt`, then exits 0. Args (1-indexed):
+            // 1=`-f`, 2=<input>, 3=`-otxt`, 4=`-of`, 5=<stem>.
+            let script = write_script(
+                &tmp,
+                "fake-whisper.sh",
+                "echo '  hello world  ' > \"$5.txt\"\nexit 0\n",
+            );
+            let input = tmp.path().join("clip.wav");
+            std::fs::write(&input, b"fake-audio").expect("input");
+            let w = WhisperSubprocess::new().with_binary(script_str(&script));
+            assert!(w.is_available(), "absolute path should be available");
+            let text = w.transcribe(&input).expect("transcribe");
+            assert_eq!(text, "hello world", "transcript should be trimmed");
+        }
+
+        #[test]
+        fn nonzero_exit_captures_stderr_tail() {
+            let tmp = TempDir::new().expect("tmp");
+            let script = write_script(
+                &tmp,
+                "fake-whisper.sh",
+                "echo 'whisper boom on stderr' 1>&2\nexit 7\n",
+            );
+            let input = tmp.path().join("clip.wav");
+            std::fs::write(&input, b"fake-audio").expect("input");
+            let w = WhisperSubprocess::new().with_binary(script_str(&script));
+            let err = w.transcribe(&input).expect_err("expected NonZero");
+            match err {
+                WhisperError::NonZero {
+                    status,
+                    stderr_tail,
+                } => {
+                    assert_eq!(status, 7);
+                    assert!(
+                        stderr_tail.contains("whisper boom on stderr"),
+                        "stderr_tail = {stderr_tail:?}"
+                    );
+                }
+                other => panic!("expected NonZero, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn timeout_kills_child_and_returns_typed_error() {
+            let tmp = TempDir::new().expect("tmp");
+            // Sleep longer than the configured timeout so the poll loop
+            // hits its wall-clock cap.
+            let script = write_script(&tmp, "fake-whisper.sh", "sleep 5\n");
+            let input = tmp.path().join("clip.wav");
+            std::fs::write(&input, b"fake-audio").expect("input");
+            let w = WhisperSubprocess::new()
+                .with_binary(script_str(&script))
+                // Bumped above the 50 ms poll interval by ~10× so a busy
+                // CI host that takes >50 ms to execve /bin/sh + reach the
+                // first poll still has comfortable margin before the
+                // wall-clock cap fires. The child sleeps 5 s so kill is
+                // fast regardless of the budget.
+                .with_timeout(Duration::from_millis(500));
+            let err = w.transcribe(&input).expect_err("expected Timeout");
+            assert!(matches!(err, WhisperError::Timeout), "got {err:?}");
+        }
+
+        #[test]
+        fn success_but_missing_output_returns_output_missing() {
+            let tmp = TempDir::new().expect("tmp");
+            // Exit 0 without writing the `.txt`, exercising the
+            // OutputMissing arm.
+            let script = write_script(&tmp, "fake-whisper.sh", "exit 0\n");
+            let input = tmp.path().join("clip.wav");
+            std::fs::write(&input, b"fake-audio").expect("input");
+            let w = WhisperSubprocess::new().with_binary(script_str(&script));
+            let err = w.transcribe(&input).expect_err("expected OutputMissing");
+            assert!(matches!(err, WhisperError::OutputMissing(_)), "got {err:?}");
+        }
+
+        #[test]
+        fn absolute_path_to_missing_file_yields_missing_binary() {
+            let w =
+                WhisperSubprocess::new().with_binary("/tmp/definitely-not-a-real-whisper-binary");
+            assert!(!w.is_available());
+            let err = w
+                .transcribe(Path::new("/tmp/anything.wav"))
+                .expect_err("expected MissingBinary");
+            assert!(matches!(err, WhisperError::MissingBinary), "got {err:?}");
+        }
     }
 }

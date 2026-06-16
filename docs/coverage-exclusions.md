@@ -1,10 +1,11 @@
 # Coverage Exclusions
 
-Stratum's CI gate (`G2.1` in `plan/36-verification-gates.md`) requires line coverage **≥ 95%** (`cargo llvm-cov --fail-under-lines 95`). The plan v2 target is 100%; the gap is the documented carve-outs below.
+Stratum's CI gate (`G2.1` in `plan/36-verification-gates.md`) requires line coverage **≥ 96%** (`cargo llvm-cov --fail-under-lines 96`). The plan v2 target is 100%; the gap is the documented carve-outs below.
 
-The threshold is temporarily 95 (rather than the previous 96) because the freshly-landed `crates/stratum-runtime/src/openai.rs` adds ~1.1k LOC of HTTP-handler code whose acceptor / streaming / per-thread response paths are hard to drive under llvm-cov instrumentation. Integration tests cover the surface; raising back to 96 needs a follow-up unit-test backfill on the handler internals.
+The threshold was temporarily lowered to 95 when `crates/stratum-runtime/src/openai.rs` (~1.1k LOC of HTTP-handler code) landed without full unit-test coverage on its acceptor / streaming / per-thread response paths. Two backfills closed the gap and restored the 96 gate:
 
-A partial backfill has landed (PR-tracked): `openai.rs` itself is now at ~98% line coverage (up from ~93%) after the unit-test additions in `crates/stratum-runtime/src/openai.rs::tests`. Workspace measures at ~95.8% on this branch; the remaining ~0.2% to reach the historical 96 floor sits primarily in `stratum-cli/src/app.rs` CLI command branches and `stratum-runtime/src/agent_loop.rs` provider-error branches, both of which require integration-test scaffolding outside the openai-only scope. The threshold stays at 95 until that scaffolding lands.
+1. `openai.rs` itself moved from ~93% to ~98% line coverage via unit tests in `crates/stratum-runtime/src/openai.rs::tests`.
+2. `whisper.rs` moved from ~60% to ~97% line coverage via the `script_driven` test module that exercises the spawn/poll/success/NonZero/Timeout/OutputMissing arms with a fake `#!/bin/sh` whisper.cpp stand-in. To enable this, `WhisperSubprocess::transcribe` was relaxed to accept either a bare name (PATH lookup) or a path containing a separator (direct file check).
 
 When a new carve-out is added it MUST be appended here in the same PR. The PR description's `G2.1` checkbox cannot be ticked otherwise.
 
