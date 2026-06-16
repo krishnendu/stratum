@@ -4,6 +4,8 @@ Stratum's CI gate (`G2.1` in `plan/36-verification-gates.md`) requires line cove
 
 The threshold is temporarily 95 (rather than the previous 96) because the freshly-landed `crates/stratum-runtime/src/openai.rs` adds ~1.1k LOC of HTTP-handler code whose acceptor / streaming / per-thread response paths are hard to drive under llvm-cov instrumentation. Integration tests cover the surface; raising back to 96 needs a follow-up unit-test backfill on the handler internals.
 
+A partial backfill has landed (PR-tracked): `openai.rs` itself is now at ~98% line coverage (up from ~93%) after the unit-test additions in `crates/stratum-runtime/src/openai.rs::tests`. Workspace measures at ~95.8% on this branch; the remaining ~0.2% to reach the historical 96 floor sits primarily in `stratum-cli/src/app.rs` CLI command branches and `stratum-runtime/src/agent_loop.rs` provider-error branches, both of which require integration-test scaffolding outside the openai-only scope. The threshold stays at 95 until that scaffolding lands.
+
 When a new carve-out is added it MUST be appended here in the same PR. The PR description's `G2.1` checkbox cannot be ticked otherwise.
 
 ## Documented carve-outs
