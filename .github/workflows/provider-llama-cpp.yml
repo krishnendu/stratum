@@ -32,11 +32,11 @@ jobs:
     env:
       MATRIX_FEATURES: provider-llama-cpp
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Cold cache for this workflow is multi-minute.
           key: ubuntu-latest-${{ hashFiles('Cargo.lock') }}
@@ -46,7 +46,7 @@ jobs:
 
       - name: Cache GGUF model file
         id: gguf-cache
-        uses: actions/cache@v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/stratum-models
           # Key the cache by the expected SHA so a change in the model

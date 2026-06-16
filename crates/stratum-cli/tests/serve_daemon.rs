@@ -23,7 +23,8 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,34 @@ use tempfile::TempDir;
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_stratum"))
+}
+
+/// Read a single line from a piped child stdout with a hard timeout.
+///
+/// `std`'s pipe-backed `ChildStdout` has no `set_read_timeout` analogue
+/// (`File`/pipe descriptors don't surface `SO_RCVTIMEO`), so a buggy
+/// daemon that emits an error on stderr but never writes to stdout
+/// would otherwise hang the test runner until the CI watchdog kills
+/// it. We hand the stdout off to a worker thread that does the actual
+/// `read_line`, then wait on a bounded `recv_timeout`.
+fn read_startup_line(stdout: ChildStdout, timeout: Duration, child: &mut Child) -> String {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let res = reader.read_line(&mut line);
+        let _ = tx.send((line, res));
+    });
+    if let Ok((line, res)) = rx.recv_timeout(timeout) {
+        res.expect("read startup line");
+        line
+    } else {
+        // Kill the child so it doesn't linger as a zombie holding
+        // the stdout pipe open, then panic the test.
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child stdout read_line timed out");
+    }
 }
 
 /// Parse the bound address from a `--json` startup line. Returns the
@@ -181,11 +210,11 @@ fn serve_accepts_jsonrpc_ping_over_tcp() {
 
     // The CLI flushes stdout after writing the startup JSON, so a single
     // `read_line` on the child's stdout is enough to grab the address.
+    // The 10 s ceiling guards against a daemon that fails on stderr but
+    // never writes to stdout — see `read_startup_line`.
     let stdout = child.stdout.take().expect("child stdout");
     let stderr = child.stderr.take().expect("child stderr");
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read startup line");
+    let line = read_startup_line(stdout, Duration::from_secs(10), &mut child);
     let bound = bound_from_json(&line);
 
     // Drain stderr in the background so the child doesn't block on a

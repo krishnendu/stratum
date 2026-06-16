@@ -43,16 +43,16 @@ jobs:
             builder: cargo
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.target }}
       - name: install zig + cargo-zigbuild
         if: matrix.builder == 'zigbuild'
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.13.0
       - name: install cargo-zigbuild
@@ -84,7 +84,7 @@ jobs:
           fi
           ls -lh ${name}.tar.gz*
       - name: upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: stratum-${{ matrix.target }}
           path: |
@@ -96,8 +96,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v6
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           path: artifacts
       - name: collect artifacts + manifest
@@ -194,7 +194,7 @@ jobs:
           PY
           ls -lh release-files
       - name: create github release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: release-files/*
           generate_release_notes: true

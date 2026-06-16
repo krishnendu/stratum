@@ -4104,6 +4104,10 @@ fn sniff_audio_mime_chat(path: &std::path::Path, bytes: &[u8]) -> String {
     if bytes.starts_with(b"ID3") {
         return "audio/mpeg".to_string();
     }
+    // The mask `(bytes[1] & 0xE0) == 0xE0` matches any MPEG audio sync
+    // frame (MPEG-1/2/2.5, layers I/II/III), not just MPEG-1 layer-III
+    // (0xFFFB / 0xFFFA / 0xFFF3 / 0xFFF2). Used as a heuristic — false
+    // positives degrade to audio/mpeg rather than crashing.
     if bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0 {
         return "audio/mpeg".to_string();
     }
@@ -7509,6 +7513,25 @@ mod tests {
     /// always runs before the lock is released.
     static AUDIO_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Acquire `AUDIO_CWD_LOCK`, surfacing (not swallowing) the
+    /// poison case: a prior `/audio` test panicked while holding the
+    /// lock. We still continue with the inner guard so the suite
+    /// doesn't snowball into a cascade of failures, but we emit a
+    /// `tracing::warn!` so the recovery is visible in CI logs rather
+    /// than silently masked. Tracked as a Phase 7 deferred item in
+    /// issue #172.
+    fn lock_audio_cwd() -> std::sync::MutexGuard<'static, ()> {
+        AUDIO_CWD_LOCK.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                target: "stratum_tui::chat::tests",
+                "AUDIO_CWD_LOCK recovered from poisoned mutex \
+                 (a prior /audio test panicked while holding it); \
+                 continuing with inner guard"
+            );
+            poisoned.into_inner()
+        })
+    }
+
     fn write_wav_fixture(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
         // Synthetic RIFF/WAVE prefix — recognised by the sniffer.
         let mut bytes = Vec::with_capacity(16);
@@ -7571,9 +7594,7 @@ mod tests {
 
     #[test]
     fn audio_dispatch_stages_block_audio() {
-        let _lock = AUDIO_CWD_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = lock_audio_cwd();
         let tmp = tempfile::TempDir::new().expect("tmp");
         let prev = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(tmp.path()).expect("chdir");
@@ -7786,9 +7807,7 @@ mod tests {
         //       stands in for "[transcript: …]" on hosts with whisper,
         //   (2) the per-turn attachments accessor surfaces the staged
         //       Block::Audio for the future agent-loop seam.
-        let _lock = AUDIO_CWD_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = lock_audio_cwd();
         let tmp = tempfile::TempDir::new().expect("tmp");
         let prev = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(tmp.path()).expect("chdir");
@@ -7984,9 +8003,7 @@ mod tests {
         //
         // We force a missing whisper binary so the test is
         // deterministic on hosts that happen to have whisper on PATH.
-        let _lock = AUDIO_CWD_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = lock_audio_cwd();
         let tmp = tempfile::TempDir::new().expect("tmp");
         let prev = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(tmp.path()).expect("chdir");
@@ -8062,9 +8079,7 @@ mod tests {
         // attachment queued for the same submit. The backend's
         // TurnContext.attachments must carry both blocks in a stable
         // order: pending_attachments (image) first, then the audio.
-        let _lock = AUDIO_CWD_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = lock_audio_cwd();
         let tmp = tempfile::TempDir::new().expect("tmp");
         let prev = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(tmp.path()).expect("chdir");
@@ -8099,6 +8114,11 @@ mod tests {
         );
         // Order: image first (pending_attachments drains into the
         // outgoing vector before the audio mirror appends).
+        // Stable because `submit()` does
+        // `let mut attachments = std::mem::take(&mut self.pending_attachments);`
+        // (which holds the image) BEFORE
+        // `attachments.extend(self.last_turn_attachments.iter().cloned());`
+        // (which holds the audio mirror). See `submit()` drain order in this file.
         assert!(
             matches!(&seen[0], Block::Image { mime, .. } if mime == "image/png"),
             "first attachment should be the image: {:?}",
