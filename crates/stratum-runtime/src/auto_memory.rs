@@ -557,4 +557,152 @@ mod tests {
         let url = read_git_origin(tmp.path()).unwrap();
         assert!(url.contains("foo/bar.git"));
     }
+
+    #[test]
+    fn clear_removes_root_dir() {
+        let tmp = TempDir::new().unwrap();
+        let s = AutoMemoryStore::open(tmp.path(), "to-clear").unwrap();
+        let root = s.root.clone();
+        assert!(root.exists());
+        s.clear().unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn clear_on_already_missing_dir_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let s = AutoMemoryStore::open(tmp.path(), "ghost").unwrap();
+        std::fs::remove_dir_all(&s.root).unwrap();
+        assert!(s.clear().is_ok());
+    }
+
+    #[test]
+    fn list_sorts_by_name() {
+        let (_tmp, s) = open_store();
+        for name in ["zulu", "alpha", "mike"] {
+            let m = Memory {
+                frontmatter: MemoryFrontmatter {
+                    name: name.to_string(),
+                    description: "d".to_string(),
+                    kind: MemoryType::Project,
+                },
+                body: "b".to_string(),
+            };
+            s.save(&m).unwrap();
+        }
+        let names: Vec<_> = s.list().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["alpha", "mike", "zulu"]);
+    }
+
+    #[test]
+    fn save_renders_all_memory_kinds() {
+        // Exercise the Reference / Feedback / Project arms of render_memory.
+        for kind in [
+            MemoryType::User,
+            MemoryType::Feedback,
+            MemoryType::Project,
+            MemoryType::Reference,
+        ] {
+            let (_tmp, s) = open_store();
+            let m = Memory {
+                frontmatter: MemoryFrontmatter {
+                    name: format!("{kind:?}").to_ascii_lowercase(),
+                    description: "d".to_string(),
+                    kind,
+                },
+                body: "b".to_string(),
+            };
+            s.save(&m).unwrap();
+            let back = s.load(&format!("{kind:?}").to_ascii_lowercase()).unwrap();
+            assert_eq!(back.frontmatter.kind, kind);
+        }
+    }
+
+    #[test]
+    fn parse_memory_rejects_missing_frontmatter() {
+        assert!(parse_memory("just body, no frontmatter").is_none());
+    }
+
+    #[test]
+    fn parse_memory_rejects_unclosed_frontmatter() {
+        assert!(parse_memory("---\nname: x\nno closer here").is_none());
+    }
+
+    #[test]
+    fn parse_memory_rejects_unknown_kind() {
+        let raw = "---\nname: x\ndescription: d\ntype: bogus\n---\nbody\n";
+        assert!(parse_memory(raw).is_none());
+    }
+
+    #[test]
+    fn parse_memory_rejects_missing_required_field() {
+        let raw = "---\nname: x\ndescription: d\n---\nbody\n";
+        assert!(parse_memory(raw).is_none());
+    }
+
+    #[test]
+    fn parse_memory_accepts_all_kinds() {
+        for kind in ["user", "feedback", "project", "reference"] {
+            let raw = format!("---\nname: x\ndescription: d\ntype: {kind}\n---\nbody\n");
+            assert!(parse_memory(&raw).is_some(), "kind {kind} should parse");
+        }
+    }
+
+    #[test]
+    fn index_entry_parse_rejects_missing_md_suffix() {
+        // Path lacks `.md` → strip_suffix returns None.
+        assert!(IndexEntry::parse("- [Title](slug) — desc").is_none());
+        // No `)` at all → close_paren find returns None.
+        assert!(IndexEntry::parse("- [Title](slug.md").is_none());
+    }
+
+    #[test]
+    fn read_git_origin_returns_some_when_remote_present() {
+        // Direct coverage of `repo_id_for`'s git-remote branch.
+        let tmp = TempDir::new().unwrap();
+        let git = tmp.path().join(".git");
+        std::fs::create_dir(&git).unwrap();
+        std::fs::write(
+            git.join("config"),
+            "[remote \"origin\"]\nurl = https://example.com/x.git\n",
+        )
+        .unwrap();
+        let id = repo_id_for(tmp.path()).unwrap();
+        assert_eq!(id.len(), 16);
+    }
+
+    #[test]
+    fn read_git_origin_skips_non_origin_remote_and_other_sections() {
+        let tmp = TempDir::new().unwrap();
+        let git = tmp.path().join(".git");
+        std::fs::create_dir(&git).unwrap();
+        // `upstream` remote (not origin), then a `[core]` section that flips
+        // in_remote off, then no origin URL anywhere → None.
+        std::fs::write(
+            git.join("config"),
+            "[remote \"upstream\"]\nurl = wrong\n[core]\nbare = false\n",
+        )
+        .unwrap();
+        assert!(read_git_origin(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn read_git_origin_returns_none_when_no_git_anywhere() {
+        let tmp = TempDir::new().unwrap();
+        assert!(read_git_origin(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn auto_memory_enabled_ignores_unrelated_config_sections() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".stratum")).unwrap();
+        // `[other]` toggles in_memory off; the `auto = false` underneath is
+        // outside [memory] and should be ignored.
+        std::fs::write(
+            tmp.path().join(".stratum").join("config.toml"),
+            "[other]\nauto = false\n",
+        )
+        .unwrap();
+        assert!(auto_memory_enabled(Some(tmp.path())));
+    }
 }

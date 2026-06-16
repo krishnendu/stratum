@@ -1,6 +1,6 @@
 # Coverage Exclusions
 
-Stratum's CI gate (`G2.1` in `plan/36-verification-gates.md`) requires line coverage **≥ 93%** (`cargo llvm-cov --fail-under-lines 93`). The plan v2 target is 100%; the gap is the documented carve-outs below plus the freshly-landed Phase 1-4 runtime modules whose error / sandbox-spawn branches need OS-specific triggers (notably `tool_dispatchers.rs` at 70.98%). The threshold drops temporarily; a tracking task to bring it back to 96 lives alongside the Phase 4 v2 work in `plan/07-implementation-phases.md`.
+Stratum's CI gate (`G2.1` in `plan/36-verification-gates.md`) requires line coverage **≥ 96%** (`cargo llvm-cov --fail-under-lines 96`). The plan v2 target is 100%; the gap is the documented carve-outs below.
 
 When a new carve-out is added it MUST be appended here in the same PR. The PR description's `G2.1` checkbox cannot be ticked otherwise.
 

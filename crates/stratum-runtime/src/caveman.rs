@@ -347,4 +347,40 @@ mod tests {
         let s = compress("the code was E_DISPATCH_TIMEOUT in logs");
         assert!(s.contains("E_DISPATCH_TIMEOUT"));
     }
+
+    #[test]
+    fn compress_handles_escaped_quote_inside_string() {
+        // Forces find_string_close to take the escape branch.
+        let s = compress("the value was \"hi \\\"world\\\"\" final");
+        assert!(s.contains("\"hi \\\"world\\\"\""));
+    }
+
+    #[test]
+    fn compress_handles_nested_json_with_strings() {
+        // Inner JSON contains quotes (taking the in_string branch) and a
+        // nested brace pair (taking the depth-increment branch).
+        let s = compress("blob {\"k\":{\"v\":\"x\\\"y\"}} tail");
+        assert!(s.contains("{\"k\":{\"v\":\"x\\\"y\"}}"));
+    }
+
+    #[test]
+    fn compress_handles_pure_punctuation_word() {
+        // A "word" of only punctuation makes the trim leave an empty string,
+        // which the is_filler is_empty branch treats as filler.
+        let s = compress("alpha --- beta");
+        // Both real words preserved; the --- run is dropped (treated as filler).
+        assert!(s.contains("alpha"));
+        assert!(s.contains("beta"));
+    }
+
+    #[test]
+    fn compress_preserves_short_uppercase_word() {
+        // Short all-caps without hyphen/underscore should not match the
+        // error-code preserve rule (len >= 3 required), exercising that
+        // branch's false path.
+        let s = compress("see AB and CD codes");
+        // "AB"/"CD" are length 2, slip through as plain words (not filler).
+        assert!(s.contains("AB"));
+        assert!(s.contains("CD"));
+    }
 }

@@ -680,4 +680,34 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
     }
+
+    #[test]
+    fn rag_index_builder_debug_includes_fields() {
+        let tmp = TempDir::new().unwrap();
+        let b = RagIndexBuilder::new(make_workspace(&tmp), make_embedder())
+            .with_max_file_bytes(123)
+            .with_chunk_plan(ChunkPlan {
+                max_chars: 5,
+                overlap_chars: 1,
+            });
+        let dbg = format!("{b:?}");
+        assert!(dbg.contains("RagIndexBuilder"));
+        assert!(dbg.contains("max_file_bytes"));
+        assert!(dbg.contains("123"));
+        assert!(dbg.contains("chunk_plan"));
+        assert!(dbg.contains("allowed_extensions"));
+    }
+
+    #[test]
+    fn build_silently_drops_nested_subdirectories_at_depth_one() {
+        // The depth-1 walker should hit the Ok(_) (non-file) arm when it
+        // encounters a sub-directory, exercising the silent-drop branch.
+        let tmp = TempDir::new().unwrap();
+        // Sub directory with one nested sub-dir (no leaves matching).
+        std::fs::create_dir_all(tmp.path().join("sub/nested")).unwrap();
+        let b = RagIndexBuilder::new(make_workspace(&tmp), make_embedder());
+        let built = b.build(vec![tmp.path().join("sub")]).expect("build");
+        // Nested sub-dir silently dropped → 0 files indexed.
+        assert_eq!(built.stats.files_indexed, 0);
+    }
 }
