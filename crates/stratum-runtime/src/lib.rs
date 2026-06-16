@@ -322,9 +322,11 @@ pub use observability::{
     format_tokens_per_second, RoleStep, RoleTimer, TurnId, TurnIdGen, TurnMetrics, TurnRecorder,
 };
 pub use openai::{
-    loop_factory_from_agent_factory, LoopFactory, OpenAIChatMessage, OpenAIChatRequest,
-    OpenAIChatResponse, OpenAIChoice, OpenAIDelta, OpenAIModelEntry, OpenAIModelList, OpenAIServer,
-    OpenAIServerConfig, OpenAIServerHandle, OpenAIStreamChoice, OpenAIStreamChunk, OpenAIUsage,
+    audio_format_to_mime, loop_factory_from_agent_factory, LoopFactory, OpenAIChatMessage,
+    OpenAIChatRequest, OpenAIChatResponse, OpenAIChoice, OpenAIContentPart, OpenAIDelta,
+    OpenAIImageUrl, OpenAIInputAudio, OpenAIMessageContent, OpenAIModelEntry, OpenAIModelList,
+    OpenAIServer, OpenAIServerConfig, OpenAIServerHandle, OpenAIStreamChoice, OpenAIStreamChunk,
+    OpenAIUsage,
 };
 pub use paths::Paths;
 pub use permission_prompt::{

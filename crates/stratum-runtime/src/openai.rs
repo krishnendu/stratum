@@ -55,7 +55,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use stratum_types::{Block, ModelId};
+use stratum_types::{AudioData, Block, ImageData, ModelId};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use crate::agent_factory::AgentFactory;
@@ -71,15 +71,287 @@ use crate::provider::ChatHistoryTurn;
 // ---------------------------------------------------------------------------
 
 /// One chat message in an [`OpenAIChatRequest`].
+///
+/// `content` is a serde-untagged enum so both legacy shapes work on the
+/// wire:
+///
+/// * `"content": "hello"` — the original 2023 shape, still emitted by
+///   most CLI/SDK callers for text-only turns. Deserialises into
+///   [`OpenAIMessageContent::Text`].
+/// * `"content": [{"type":"text", ...}, {"type":"image_url", ...}, ...]`
+///   — OpenAI's 2024 multimodal shape. Each element is an
+///   [`OpenAIContentPart`]; `text` parts concatenate onto the user
+///   prompt, `image_url` parts become [`Block::Image`] on
+///   [`TurnContext.attachments`], `input_audio` parts become
+///   [`Block::Audio`].
+///
+/// On serialise we always emit the plain-string shape (we only produce
+/// assistant text today), so clients that don't understand the array
+/// variant see something they can render.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAIChatMessage {
     /// `"system"`, `"user"`, `"assistant"`, or `"tool"`.
     pub role: String,
-    /// Message body. Free-form text in this minimal surface.
-    pub content: String,
+    /// Message body. Either a free-form string or an array of typed
+    /// content parts (text / image_url / input_audio). See
+    /// [`OpenAIMessageContent`].
+    pub content: OpenAIMessageContent,
     /// Optional explicit name (e.g. for `"role":"tool"` messages).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// Either a plain-string message body or an array of typed content
+/// parts. Mirrors OpenAI's wire-format: `content` is `string |
+/// Array<ContentPart>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OpenAIMessageContent {
+    /// Legacy plain-string shape: `"content": "hello"`. Always emitted
+    /// on the response path.
+    Text(String),
+    /// 2024 multimodal shape: `"content": [{"type":"text",...}, ...]`.
+    /// Each part is interpreted by [`OpenAIContentPart`].
+    Parts(Vec<OpenAIContentPart>),
+}
+
+impl Default for OpenAIMessageContent {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+impl From<String> for OpenAIMessageContent {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl From<&str> for OpenAIMessageContent {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
+}
+
+impl OpenAIMessageContent {
+    /// Flatten this `content` field into `(text, attachments)`.
+    ///
+    /// * For the [`Self::Text`] variant: the string is the text,
+    ///   attachments is empty.
+    /// * For the [`Self::Parts`] variant: each `text` part is
+    ///   concatenated (separated by `\n` when there are multiple),
+    ///   each `image_url` / `input_audio` part is converted to the
+    ///   matching [`Block`] variant.
+    ///
+    /// Returns a tuple so the caller can route the text into
+    /// [`TurnContext.user_prompt`] / [`ChatHistoryTurn.content`] and
+    /// the attachments into [`TurnContext.attachments`].
+    #[must_use]
+    pub fn flatten(self) -> (String, Vec<Block>) {
+        match self {
+            Self::Text(s) => (s, Vec::new()),
+            Self::Parts(parts) => {
+                let mut text = String::new();
+                let mut blocks = Vec::with_capacity(parts.len());
+                for part in parts {
+                    match part {
+                        OpenAIContentPart::Text { text: t } => {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(&t);
+                        }
+                        OpenAIContentPart::ImageUrl { image_url } => {
+                            blocks.push(image_url_to_block(&image_url));
+                        }
+                        OpenAIContentPart::InputAudio { input_audio } => {
+                            blocks.push(input_audio_to_block(&input_audio));
+                        }
+                    }
+                }
+                (text, blocks)
+            }
+        }
+    }
+
+    /// Borrowed view of the text payload, when present.
+    #[must_use]
+    pub const fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(s) => Some(s.as_str()),
+            Self::Parts(_) => None,
+        }
+    }
+}
+
+/// One typed element inside the multimodal `content` array.
+///
+/// The tag is OpenAI's `type` field — `"text"`, `"image_url"`, or
+/// `"input_audio"`. Unknown tags fail deserialisation with a clear
+/// serde error; the HTTP layer turns that into a `400 invalid_request`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OpenAIContentPart {
+    /// `{"type": "text", "text": "..."}` — concatenated onto the
+    /// user prompt.
+    Text {
+        /// The text fragment.
+        text: String,
+    },
+    /// `{"type": "image_url", "image_url": {"url": "..."}}` — becomes
+    /// a [`Block::Image`]. The `url` is either an `http(s)://` URL,
+    /// a `data:image/<mime>;base64,...` data URI, or a `file://`
+    /// path; we map the first form to [`ImageData::Url`] and the data
+    /// URI to [`ImageData::Inline`].
+    ImageUrl {
+        /// The nested object holding the URL.
+        image_url: OpenAIImageUrl,
+    },
+    /// `{"type": "input_audio", "input_audio": {"data": "<b64>",
+    /// "format": "wav"}}` — becomes a [`Block::Audio`]. The `data`
+    /// field is required; the `format` field defaults to `"wav"` and
+    /// is mapped to a MIME via [`audio_format_to_mime`].
+    InputAudio {
+        /// The nested object holding the base64 + format.
+        input_audio: OpenAIInputAudio,
+    },
+}
+
+/// `image_url` nested object inside an [`OpenAIContentPart::ImageUrl`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAIImageUrl {
+    /// Either an `http(s)://` URL, a `data:image/<mime>;base64,...`
+    /// data URI, or a `file://` path.
+    pub url: String,
+    /// Optional detail hint (`"low"` / `"high"` / `"auto"`). Accepted
+    /// and ignored by Stratum — the underlying vision provider picks
+    /// its own resolution policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// `input_audio` nested object inside an
+/// [`OpenAIContentPart::InputAudio`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAIInputAudio {
+    /// Base64-encoded audio bytes (no `data:` URI prefix; OpenAI's
+    /// `input_audio` field is bare base64).
+    pub data: String,
+    /// Format hint — `"wav"`, `"mp3"`, `"flac"`, `"ogg"`. Mapped to
+    /// a MIME by [`audio_format_to_mime`]. Defaults to `"wav"` when
+    /// the caller omits the field.
+    #[serde(default = "default_audio_format")]
+    pub format: String,
+}
+
+fn default_audio_format() -> String {
+    "wav".to_string()
+}
+
+/// Map OpenAI's `format` short-tag to a MIME string.
+#[must_use]
+pub fn audio_format_to_mime(format: &str) -> &'static str {
+    match format.to_ascii_lowercase().as_str() {
+        "mp3" => "audio/mpeg",
+        "flac" => "audio/flac",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "m4a" | "mp4" => "audio/mp4",
+        // Default + explicit "wav" both land here.
+        _ => "audio/wav",
+    }
+}
+
+fn image_url_to_block(iu: &OpenAIImageUrl) -> Block {
+    // `data:image/<mime>;base64,<b64>` — extract MIME and payload,
+    // count the decoded byte length without a runtime base64 dep by
+    // estimating from the encoded length (3 bytes per 4 chars, minus
+    // padding). The estimate is fine for the provider-side budget
+    // check; exact byte counts come from a real decode later.
+    if let Some(rest) = iu.url.strip_prefix("data:") {
+        if let Some((mime_part, payload)) = rest.split_once(',') {
+            // An empty payload is malformed (the comma is present but
+            // no base64 follows); fall through to the URL form so the
+            // caller gets a sane error rather than a zero-byte image.
+            if !payload.is_empty() {
+                let mime = mime_part
+                    .split(';')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("image/png")
+                    .to_string();
+                let encoded_len = payload.len();
+                // O(1) padding count instead of scanning the whole
+                // payload backwards — valid base64 has 0/1/2 trailing
+                // `=` chars only.
+                let pad: usize = if payload.ends_with("==") {
+                    2
+                } else {
+                    usize::from(payload.ends_with('='))
+                };
+                let bytes_est = encoded_len
+                    .saturating_mul(3)
+                    .saturating_div(4)
+                    .saturating_sub(pad);
+                let bytes_u32 = u32::try_from(bytes_est).unwrap_or(u32::MAX);
+                return Block::Image {
+                    mime,
+                    data: ImageData::Inline {
+                        base64: payload.to_string(),
+                        bytes: bytes_u32,
+                    },
+                    alt: None,
+                };
+            }
+        }
+    }
+    // Fallback: plain URL reference. MIME is unknown — providers that
+    // care can sniff it from the URL extension.
+    let mime = mime_from_url(&iu.url, "image/").unwrap_or_else(|| "image/jpeg".to_string());
+    Block::Image {
+        mime,
+        data: ImageData::Url {
+            url: iu.url.clone(),
+        },
+        alt: None,
+    }
+}
+
+fn input_audio_to_block(ia: &OpenAIInputAudio) -> Block {
+    let mime = audio_format_to_mime(&ia.format).to_string();
+    let encoded_len = ia.data.len();
+    let pad = ia.data.chars().rev().take_while(|c| *c == '=').count();
+    let bytes_est = encoded_len
+        .saturating_mul(3)
+        .saturating_div(4)
+        .saturating_sub(pad);
+    let bytes_u32 = u32::try_from(bytes_est).unwrap_or(u32::MAX);
+    Block::Audio {
+        mime,
+        data: AudioData::Inline {
+            base64: ia.data.clone(),
+            bytes: bytes_u32,
+        },
+        transcript: None,
+    }
+}
+
+fn mime_from_url(url: &str, prefix: &str) -> Option<String> {
+    let ext = url
+        .rsplit_once('.')
+        .map(|(_, e)| e.split(&['?', '#'][..]).next().unwrap_or(e))
+        .map(str::to_ascii_lowercase)?;
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => return None,
+    };
+    if mime.starts_with(prefix) {
+        Some(mime.to_string())
+    } else {
+        None
+    }
 }
 
 /// OpenAI Chat Completions request body (subset used by the daemon).
@@ -270,14 +542,25 @@ impl From<OpenAIChatRequest> for TurnContext {
         // before it (regardless of role) becomes the `history` vector.
         let mut history = Vec::with_capacity(req.messages.len().saturating_sub(1));
         let mut user_prompt = String::new();
+        let mut attachments: Vec<Block> = Vec::new();
         let last_user_idx = req
             .messages
             .iter()
             .rposition(|m| m.role == "user")
             .unwrap_or_else(|| req.messages.len().saturating_sub(1));
         for (i, msg) in req.messages.into_iter().enumerate() {
+            // Flatten multimodal `content` into (text, attachment-blocks).
+            // For string-shaped content the blocks vector is empty; for
+            // array-shaped content the image_url / input_audio parts
+            // become Block::Image / Block::Audio entries.
+            let (text, mut parts_blocks) = msg.content.flatten();
             if i == last_user_idx {
-                user_prompt = msg.content;
+                user_prompt = text;
+                // Only the trailing user turn's attachments ride into
+                // the current TurnContext. Earlier-turn attachments
+                // live on the history string (multimodal history not
+                // yet modelled on ChatHistoryTurn).
+                attachments.append(&mut parts_blocks);
                 continue;
             }
             // Preserve `system` distinctly — providers that branch on
@@ -291,7 +574,7 @@ impl From<OpenAIChatRequest> for TurnContext {
             };
             history.push(ChatHistoryTurn {
                 role: role.to_string(),
-                content: msg.content,
+                content: text,
             });
         }
         Self {
@@ -300,11 +583,12 @@ impl From<OpenAIChatRequest> for TurnContext {
             turn_id: TurnId(0),
             started_at: SystemTime::now(),
             history,
-            // OpenAI's wire shape doesn't model attachments yet; the
-            // multimodal scaffold's TurnContext.attachments field is
-            // populated by the chat surface, not by this HTTP path.
-            // BackendApi attachments wire-protocol lands in Phase B.
-            attachments: Vec::new(),
+            // Multimodal attachments on the trailing user turn ride
+            // into the runtime via TurnContext.attachments. The
+            // EchoProvider tolerates these as no-ops; the
+            // LlamaCppProvider routes them when the `vision` feature
+            // is enabled.
+            attachments,
         }
     }
 }
@@ -336,7 +620,7 @@ impl From<TurnResult> for OpenAIChatResponse {
                 index: 0,
                 message: OpenAIChatMessage {
                     role: "assistant".to_string(),
-                    content,
+                    content: OpenAIMessageContent::Text(content),
                     name: None,
                 },
                 finish_reason,
@@ -553,14 +837,29 @@ fn handle_request(
 }
 
 fn handle_chat_completions(mut req: tiny_http::Request, factory: &LoopFactory) {
-    // Read body.
+    // Cap request body at 20 MiB to bound the memory cost of a
+    // multimodal request that ships base64 image payloads inline.
+    // `.take(MAX + 1)` lets us tell "exactly at the cap" from
+    // "exceeded the cap" so a truncated body becomes 400 instead of
+    // silently corrupted.
+    const MAX_BODY_BYTES: u64 = 20 * 1024 * 1024;
     let mut body = String::new();
-    if let Err(e) = req.as_reader().read_to_string(&mut body) {
+    let mut limited = std::io::Read::take(req.as_reader(), MAX_BODY_BYTES + 1);
+    if let Err(e) = std::io::Read::read_to_string(&mut limited, &mut body) {
         respond_error_owned(
             req,
             400,
             "invalid_request",
             &format!("body read failed: {e}"),
+        );
+        return;
+    }
+    if body.len() as u64 > MAX_BODY_BYTES {
+        respond_error_owned(
+            req,
+            400,
+            "invalid_request",
+            "request body exceeds 20 MiB cap",
         );
         return;
     }
@@ -676,9 +975,15 @@ fn respond_stream(req: tiny_http::Request, agent: AgentLoop, ctx: TurnContext, m
     };
     push_sse(&mut sse, &first);
 
-    // Drain text deltas until the worker finishes.
+    // Drain text deltas until the worker drops `chunk_tx`. The worker
+    // sends every block on `chunk_tx` BEFORE sending `done_tx`, so
+    // breaking on the chunk-channel `Disconnected` is the
+    // race-free signal that there are no more chunks coming. Breaking
+    // earlier (e.g. on a `done_rx.try_recv` win during a `Timeout`
+    // tick) lost chunks that the worker had emitted in the same
+    // scheduling quantum as its final `done_tx.send`.
     loop {
-        match chunk_rx.recv_timeout(Duration::from_millis(200)) {
+        match chunk_rx.recv() {
             Ok(Block::Text { text }) => {
                 let chunk = OpenAIStreamChunk {
                     id: id.clone(),
@@ -696,38 +1001,16 @@ fn respond_stream(req: tiny_http::Request, agent: AgentLoop, ctx: TurnContext, m
                 };
                 push_sse(&mut sse, &chunk);
             }
-            Ok(_) => {} // ignore non-text blocks for now.
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if done_rx.try_recv().is_ok() {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(_) => {}      // ignore non-text blocks for now.
+            Err(_) => break, // chunk_tx dropped → worker finished.
         }
     }
 
-    // Drain any remaining buffered chunks.
-    while let Ok(b) = chunk_rx.try_recv() {
-        if let Block::Text { text } = b {
-            let chunk = OpenAIStreamChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created,
-                model: model.clone(),
-                choices: vec![OpenAIStreamChoice {
-                    index: 0,
-                    delta: OpenAIDelta {
-                        role: None,
-                        content: Some(text),
-                    },
-                    finish_reason: None,
-                }],
-            };
-            push_sse(&mut sse, &chunk);
-        }
-    }
-
-    let result = done_rx.recv_timeout(Duration::from_secs(60));
+    // After the chunk channel closed, the worker has already sent its
+    // TurnResult on `done_tx`. `try_recv` is sufficient and makes the
+    // invariant visible — falling back to a long `recv_timeout` would
+    // imply we expect to wait, which we don't.
+    let result = done_rx.try_recv();
     let finish = match &result {
         Ok(r) => finish_reason_for(&r.outcome).to_string(),
         Err(_) => "error".to_string(),
@@ -871,7 +1154,7 @@ mod tests {
     fn user_msg(s: &str) -> OpenAIChatMessage {
         OpenAIChatMessage {
             role: "user".to_string(),
-            content: s.to_string(),
+            content: OpenAIMessageContent::Text(s.to_string()),
             name: None,
         }
     }
@@ -883,7 +1166,7 @@ mod tests {
             messages: vec![
                 OpenAIChatMessage {
                     role: "system".to_string(),
-                    content: "be terse".to_string(),
+                    content: OpenAIMessageContent::Text("be terse".to_string()),
                     name: None,
                 },
                 user_msg("hello"),
@@ -914,7 +1197,7 @@ mod tests {
         assert_eq!(resp.object, "chat.completion");
         assert_eq!(resp.choices.len(), 1);
         assert_eq!(resp.choices[0].message.role, "assistant");
-        assert_eq!(resp.choices[0].message.content, "hi there");
+        assert_eq!(resp.choices[0].message.content.as_text(), Some("hi there"));
         assert_eq!(resp.choices[0].finish_reason, "stop");
     }
 
@@ -1241,7 +1524,7 @@ mod tests {
         assert_eq!(resp.usage.completion_tokens, 3);
         assert_eq!(resp.usage.total_tokens, 10);
         assert_eq!(resp.choices[0].finish_reason, "stop");
-        assert_eq!(resp.choices[0].message.content, "ok");
+        assert_eq!(resp.choices[0].message.content.as_text(), Some("ok"));
     }
 
     #[test]
@@ -1281,7 +1564,7 @@ mod tests {
                 user_msg("hi"),
                 OpenAIChatMessage {
                     role: "assistant".to_string(),
-                    content: "hello back".to_string(),
+                    content: OpenAIMessageContent::Text("hello back".to_string()),
                     name: None,
                 },
                 user_msg("how are you"),
@@ -1295,6 +1578,195 @@ mod tests {
         assert_eq!(ctx.history[1].role, "assistant");
     }
 
+    // ---------- Multimodal `content` array ----------------------------------
+
+    #[test]
+    fn message_content_deserialises_plain_string_into_text_variant() {
+        let raw = r#""hello""#;
+        let parsed: OpenAIMessageContent = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.as_text(), Some("hello"));
+        let (text, blocks) = parsed.flatten();
+        assert_eq!(text, "hello");
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn message_content_deserialises_parts_array_into_parts_variant() {
+        let raw = r#"[{"type":"text","text":"hi"}]"#;
+        let parsed: OpenAIMessageContent = serde_json::from_str(raw).unwrap();
+        assert!(matches!(parsed, OpenAIMessageContent::Parts(ref ps) if ps.len() == 1));
+        let (text, blocks) = parsed.flatten();
+        assert_eq!(text, "hi");
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn parts_text_segments_concatenate_with_newline_separator() {
+        let raw = r#"[
+            {"type":"text","text":"first"},
+            {"type":"text","text":"second"}
+        ]"#;
+        let parsed: OpenAIMessageContent = serde_json::from_str(raw).unwrap();
+        let (text, blocks) = parsed.flatten();
+        assert_eq!(text, "first\nsecond");
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn parts_image_url_part_becomes_block_image_url_variant() {
+        let raw = r#"[
+            {"type":"text","text":"see this"},
+            {"type":"image_url","image_url":{"url":"https://example.com/x.png"}}
+        ]"#;
+        let parsed: OpenAIMessageContent = serde_json::from_str(raw).unwrap();
+        let (text, blocks) = parsed.flatten();
+        assert_eq!(text, "see this");
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0],
+            Block::Image { mime, data: ImageData::Url { url }, .. }
+                if mime == "image/png" && url == "https://example.com/x.png"
+        ));
+    }
+
+    #[test]
+    fn parts_image_url_data_uri_becomes_block_image_inline_variant() {
+        // The base64 payload `AAAA` decodes to 3 zero bytes; the
+        // estimate from the encoded-length / pad calculation should
+        // land on `3`. (We don't pull base64 into the runtime for
+        // exact decoding — the estimate is accurate within ±2 bytes.)
+        let raw = r#"[
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+        ]"#;
+        let parsed: OpenAIMessageContent = serde_json::from_str(raw).unwrap();
+        let (text, blocks) = parsed.flatten();
+        assert!(text.is_empty());
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0],
+            Block::Image {
+                mime,
+                data: ImageData::Inline { base64, bytes },
+                ..
+            } if mime == "image/png" && base64 == "AAAA" && *bytes == 3
+        ));
+    }
+
+    #[test]
+    fn parts_input_audio_becomes_block_audio_inline_variant() {
+        let raw = r#"[
+            {"type":"text","text":"transcribe"},
+            {"type":"input_audio","input_audio":{"data":"AAAAAAAAAAA=","format":"wav"}}
+        ]"#;
+        let parsed: OpenAIMessageContent = serde_json::from_str(raw).unwrap();
+        let (text, blocks) = parsed.flatten();
+        assert_eq!(text, "transcribe");
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0],
+            Block::Audio { mime, data: AudioData::Inline { .. }, .. }
+                if mime == "audio/wav"
+        ));
+    }
+
+    #[test]
+    fn input_audio_defaults_to_wav_format_when_missing() {
+        let raw = r#"[
+            {"type":"input_audio","input_audio":{"data":"AAAA"}}
+        ]"#;
+        let parsed: OpenAIMessageContent = serde_json::from_str(raw).unwrap();
+        let (_, blocks) = parsed.flatten();
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0],
+            Block::Audio { mime, .. } if mime == "audio/wav"
+        ));
+    }
+
+    #[test]
+    fn audio_format_to_mime_covers_known_formats() {
+        assert_eq!(audio_format_to_mime("mp3"), "audio/mpeg");
+        assert_eq!(audio_format_to_mime("MP3"), "audio/mpeg");
+        assert_eq!(audio_format_to_mime("flac"), "audio/flac");
+        assert_eq!(audio_format_to_mime("ogg"), "audio/ogg");
+        assert_eq!(audio_format_to_mime("opus"), "audio/ogg");
+        assert_eq!(audio_format_to_mime("wav"), "audio/wav");
+        assert_eq!(audio_format_to_mime("m4a"), "audio/mp4");
+        // Unknown formats fall back to wav (most permissive).
+        assert_eq!(audio_format_to_mime("xyz"), "audio/wav");
+    }
+
+    #[test]
+    fn multimodal_request_extracts_attachments_into_turn_context() {
+        // The whole point of Phase 5 + 6 wiring: a multimodal request
+        // body must produce a TurnContext with both a flattened text
+        // prompt AND populated attachments.
+        let json = r#"{
+            "model": "echo",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+                    ]
+                }
+            ]
+        }"#;
+        let req: OpenAIChatRequest = serde_json::from_str(json).unwrap();
+        let ctx: TurnContext = req.into();
+        assert_eq!(ctx.user_prompt, "describe");
+        assert_eq!(ctx.attachments.len(), 1);
+        assert!(matches!(
+            &ctx.attachments[0],
+            Block::Image { mime, .. } if mime == "image/png"
+        ));
+    }
+
+    #[test]
+    fn multimodal_request_with_string_content_has_empty_attachments() {
+        // Pin that the string-content variant still produces an empty
+        // attachments vector — the multimodal path is opt-in.
+        let json = r#"{
+            "model": "echo",
+            "messages": [{"role": "user", "content": "plain text"}]
+        }"#;
+        let req: OpenAIChatRequest = serde_json::from_str(json).unwrap();
+        let ctx: TurnContext = req.into();
+        assert_eq!(ctx.user_prompt, "plain text");
+        assert!(ctx.attachments.is_empty());
+    }
+
+    #[test]
+    fn response_message_serialises_content_as_plain_string() {
+        // Our response path always emits the `Text` variant —
+        // serde untagged means it should round-trip as a bare
+        // string on the wire (not an array), so older clients
+        // that pre-date the multimodal extension still parse
+        // assistant responses without complaint.
+        let msg = OpenAIChatMessage {
+            role: "assistant".to_string(),
+            content: OpenAIMessageContent::Text("hello".to_string()),
+            name: None,
+        };
+        let s = serde_json::to_string(&msg).unwrap();
+        assert!(
+            s.contains("\"content\":\"hello\""),
+            "expected bare string, got {s}"
+        );
+    }
+
+    #[test]
+    fn unknown_content_part_type_fails_deserialisation() {
+        // Defence-in-depth: an unknown `type` tag must NOT silently
+        // deserialise to a "default" variant. serde's tagged enum
+        // rejects the input; the HTTP layer turns the resulting
+        // serde error into a `400 invalid_request`.
+        let raw = r#"[{"type":"video","video":{"url":"x"}}]"#;
+        let parsed: Result<OpenAIMessageContent, _> = serde_json::from_str(raw);
+        assert!(parsed.is_err(), "should have rejected unknown type");
+    }
+
     #[test]
     fn unknown_role_messages_are_dropped() {
         // Any role outside {user, assistant, system} is silently
@@ -1304,7 +1776,7 @@ mod tests {
             messages: vec![
                 OpenAIChatMessage {
                     role: "function".to_string(),
-                    content: "tool-call payload".to_string(),
+                    content: OpenAIMessageContent::Text("tool-call payload".to_string()),
                     name: None,
                 },
                 user_msg("hi"),

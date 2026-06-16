@@ -3146,7 +3146,16 @@ impl ChatState {
         // context. Attachments are spent on a single user turn — they
         // do not persist into the next one. See `pending_attachments`
         // on `ChatState`.
-        let attachments = std::mem::take(&mut self.pending_attachments);
+        //
+        // Audio attachments staged by `/audio <path>` are *also* spent
+        // here: `self.last_turn_attachments` already holds the drained
+        // Block::Audio (assigned a few lines up), so we extend the
+        // outgoing context with a clone. The image queue is consumed
+        // by move; the audio queue is mirrored so the user-facing
+        // `last_turn_attachments()` accessor still surfaces it after
+        // the turn returns.
+        let mut attachments = std::mem::take(&mut self.pending_attachments);
+        attachments.extend(self.last_turn_attachments.iter().cloned());
         let ctx = TurnContext {
             user_prompt: prompt.clone(),
             model: ModelId::from("echo"),
@@ -7903,5 +7912,202 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::env::set_current_dir(&self.prev);
         }
+    }
+
+    // ---------- Phase 5 + 6 end-to-end seam tests ---------------------------
+    //
+    // These exercise the full TUI-side seam for `/image <png>` and
+    // `/audio <wav>`: a palette command stages the attachment, the
+    // next `submit_with_prompt` drains it into a `TurnContext`, and
+    // the backend (a CapturingBackend that records every TurnContext
+    // it sees) confirms that the attachment + transcript prefix
+    // arrive unchanged.
+    //
+    // These tests run against the EchoProvider seam (no
+    // `provider-llama-cpp` / `vision` feature required) so they
+    // compile and pass under default features.
+
+    #[test]
+    fn image_palette_command_then_submit_routes_attachment_to_backend() {
+        // End-to-end seam check for the `/image <png>` path:
+        //   1. The palette command stages a Block::Image.
+        //   2. `submit_with_prompt` drains `pending_attachments` into
+        //      `TurnContext.attachments`.
+        //   3. The CapturingBackend snapshots the TurnContext and we
+        //      confirm exactly one image attachment with the right
+        //      MIME landed there.
+        let backend = CapturingBackend::new();
+        let chat_backend: Arc<dyn ChatBackend> = backend.clone();
+        let mut s = ChatState::with_backend(chat_backend);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = write_tiny_png(tmp.path(), "phase5-image.png");
+        let cmd = format!("/image {}", path.display());
+        let outcome = s.execute_palette_command(&cmd);
+        assert!(
+            matches!(outcome, PaletteOutcome::Acknowledged { .. }),
+            "expected acknowledged for /image, got {outcome:?}"
+        );
+
+        s.submit_with_prompt("what is in this picture");
+
+        // pending_attachments was drained on submit.
+        assert_eq!(s.pending_attachment_count(), 0);
+        // Backend saw exactly one image attachment.
+        let seen = backend.last_attachments();
+        assert_eq!(
+            seen.len(),
+            1,
+            "backend should see 1 image attachment, got {seen:?}"
+        );
+        assert!(
+            matches!(&seen[0], Block::Image { mime, .. } if mime == "image/png"),
+            "wrong attachment shape: {:?}",
+            seen[0]
+        );
+    }
+
+    #[test]
+    fn audio_palette_command_then_submit_routes_attachment_and_transcript_prefix_to_backend() {
+        // End-to-end seam check for the `/audio <wav>` path. Two
+        // claims under test:
+        //
+        //   1. The backend's TurnContext.attachments carries exactly
+        //      one Block::Audio with the right MIME — proves the
+        //      audio attachment reaches the provider unchanged.
+        //   2. The transcript-prefix fence
+        //      ([AUDIO_TRANSCRIPT_BEGIN] ... [AUDIO_TRANSCRIPT_END])
+        //      is present in the backend-visible user_prompt — proves
+        //      the audio palette path properly augments the prompt
+        //      even when whisper.cpp is not installed (the common
+        //      CI case).
+        //
+        // We force a missing whisper binary so the test is
+        // deterministic on hosts that happen to have whisper on PATH.
+        let _lock = AUDIO_CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let prev = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(tmp.path()).expect("chdir");
+        let _guard = scopeguard_chdir(prev);
+
+        write_wav_fixture(tmp.path(), "voice.wav");
+
+        let backend = CapturingBackend::new();
+        let chat_backend: Arc<dyn ChatBackend> = backend.clone();
+        let mut s = ChatState::with_backend(chat_backend);
+        s.whisper = stratum_runtime::whisper::WhisperSubprocess::new()
+            .with_binary("stratum_no_such_whisper_phase5_e2e");
+
+        let outcome = s.execute_palette_command("/audio voice.wav");
+        assert!(
+            matches!(outcome, PaletteOutcome::Acknowledged { .. }),
+            "expected acknowledged for /audio, got {outcome:?}"
+        );
+
+        s.submit_with_prompt("what is in this clip");
+
+        // staged_audio drained.
+        assert!(s.staged_audio().is_none());
+
+        // Backend saw exactly one audio attachment.
+        let seen = backend.last_attachments();
+        assert_eq!(
+            seen.len(),
+            1,
+            "backend should see 1 audio attachment, got {seen:?}"
+        );
+        assert!(
+            matches!(&seen[0], Block::Audio { mime, .. } if mime == "audio/wav"),
+            "wrong attachment shape: {:?}",
+            seen[0]
+        );
+
+        // The transcript-prefix fence reached the backend prompt.
+        // Pull the TurnContext snapshot out of the CapturingBackend
+        // directly so we can inspect the user_prompt verbatim. We
+        // clone the prompt out of the lock and drop the guard before
+        // running assertions so clippy's significant_drop_tightening
+        // lint is satisfied.
+        let captured_prompt = {
+            let guard = backend
+                .last_ctx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .as_ref()
+                .expect("backend saw a turn")
+                .user_prompt
+                .clone()
+        };
+        assert!(
+            captured_prompt.contains("AUDIO_TRANSCRIPT_BEGIN"),
+            "missing fence in backend prompt: {captured_prompt}",
+        );
+        assert!(
+            captured_prompt.contains("AUDIO_TRANSCRIPT_END"),
+            "missing fence end in backend prompt: {captured_prompt}",
+        );
+        // The user-typed body must still be there alongside the fence.
+        assert!(
+            captured_prompt.contains("what is in this clip"),
+            "missing user-typed body in backend prompt: {captured_prompt}",
+        );
+    }
+
+    #[test]
+    fn image_and_audio_in_same_turn_both_reach_backend() {
+        // Stress the multimodal pipe with BOTH an image and an audio
+        // attachment queued for the same submit. The backend's
+        // TurnContext.attachments must carry both blocks in a stable
+        // order: pending_attachments (image) first, then the audio.
+        let _lock = AUDIO_CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let prev = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(tmp.path()).expect("chdir");
+        let _guard = scopeguard_chdir(prev);
+
+        let png = write_tiny_png(tmp.path(), "frame.png");
+        write_wav_fixture(tmp.path(), "voice.wav");
+
+        let backend = CapturingBackend::new();
+        let chat_backend: Arc<dyn ChatBackend> = backend.clone();
+        let mut s = ChatState::with_backend(chat_backend);
+        s.whisper = stratum_runtime::whisper::WhisperSubprocess::new()
+            .with_binary("stratum_no_such_whisper_phase5_combo");
+
+        let img_cmd = format!("/image {}", png.display());
+        assert!(matches!(
+            s.execute_palette_command(&img_cmd),
+            PaletteOutcome::Acknowledged { .. }
+        ));
+        assert!(matches!(
+            s.execute_palette_command("/audio voice.wav"),
+            PaletteOutcome::Acknowledged { .. }
+        ));
+
+        s.submit_with_prompt("combined multimodal turn");
+
+        let seen = backend.last_attachments();
+        assert_eq!(
+            seen.len(),
+            2,
+            "backend should see both attachments, got {seen:?}"
+        );
+        // Order: image first (pending_attachments drains into the
+        // outgoing vector before the audio mirror appends).
+        assert!(
+            matches!(&seen[0], Block::Image { mime, .. } if mime == "image/png"),
+            "first attachment should be the image: {:?}",
+            seen[0]
+        );
+        assert!(
+            matches!(&seen[1], Block::Audio { mime, .. } if mime == "audio/wav"),
+            "second attachment should be the audio: {:?}",
+            seen[1]
+        );
     }
 }
