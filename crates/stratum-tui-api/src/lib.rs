@@ -95,6 +95,11 @@ pub struct BackendRequest {
     /// erroring; the user is responsible for picking a vision-capable
     /// model. Empty for plain text-only turns.
     ///
+    /// Note: the "MUST silently drop" rule is enforced **by convention
+    /// in each backend implementation** (see `EchoProvider` and
+    /// `LlamaCppProvider` in `stratum-runtime` for the canonical
+    /// pattern). This crate does not interpose a runtime filter.
+    ///
     /// `#[serde(default)]` + `skip_serializing_if = "Vec::is_empty"`
     /// keep the wire format backwards-compatible with pre-Phase-5
     /// clients that don't know about attachments: an old client
