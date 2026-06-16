@@ -1006,16 +1006,17 @@ fn respond_stream(req: tiny_http::Request, agent: AgentLoop, ctx: TurnContext, m
         }
     }
 
-    // After the chunk channel closed, the worker has already sent its
-    // TurnResult on `done_tx`. `try_recv` is sufficient and makes the
-    // invariant visible — falling back to a long `recv_timeout` would
-    // imply we expect to wait, which we don't.
+    // After the chunk channel closed, the worker is between dropping
+    // `chunk_tx` and sending on `done_tx`. Joining first guarantees
+    // the worker's `done_tx.send(result)` has completed (it's
+    // sequenced before the thread returns, which is what `join`
+    // observes), so `try_recv` is then guaranteed to find the result.
+    let _ = worker.join();
     let result = done_rx.try_recv();
     let finish = match &result {
         Ok(r) => finish_reason_for(&r.outcome).to_string(),
         Err(_) => "error".to_string(),
     };
-    let _ = worker.join();
     let terminal = OpenAIStreamChunk {
         id,
         object: "chat.completion.chunk".to_string(),
