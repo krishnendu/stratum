@@ -28,6 +28,10 @@ path = "src/bin/bench_floor.rs"
 name = "bench-history"
 path = "src/bin/bench_history.rs"
 
+[[bin]]
+name = "run-phase7-compare"
+path = "src/bin/run_phase7_compare.rs"
+
 [lints]
 workspace = true
 
