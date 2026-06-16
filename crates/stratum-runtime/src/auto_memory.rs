@@ -514,14 +514,33 @@ mod tests {
         assert_eq!(a.len(), 16);
     }
 
+    /// Process-wide guard for the three tests that read or mutate
+    /// `STRATUM_AUTO_MEMORY`. `cargo test` runs in parallel, and the
+    /// env-mutating test would race with the two that only read the
+    /// var unless they all serialize through this mutex.
+    fn env_test_guard() -> &'static std::sync::Mutex<()> {
+        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GUARD.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     #[test]
     fn auto_memory_enabled_default_is_true() {
+        let _g = env_test_guard().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var("STRATUM_AUTO_MEMORY").ok();
+        std::env::remove_var("STRATUM_AUTO_MEMORY");
         let tmp = TempDir::new().unwrap();
-        assert!(auto_memory_enabled(Some(tmp.path())));
+        let result = auto_memory_enabled(Some(tmp.path()));
+        if let Some(v) = prior {
+            std::env::set_var("STRATUM_AUTO_MEMORY", v);
+        }
+        assert!(result);
     }
 
     #[test]
     fn auto_memory_enabled_respects_config() {
+        let _g = env_test_guard().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var("STRATUM_AUTO_MEMORY").ok();
+        std::env::remove_var("STRATUM_AUTO_MEMORY");
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".stratum")).unwrap();
         std::fs::write(
@@ -529,19 +548,25 @@ mod tests {
             "[memory]\nauto = false\n",
         )
         .unwrap();
-        assert!(!auto_memory_enabled(Some(tmp.path())));
+        let result = auto_memory_enabled(Some(tmp.path()));
+        if let Some(v) = prior {
+            std::env::set_var("STRATUM_AUTO_MEMORY", v);
+        }
+        assert!(!result);
     }
 
     #[test]
     fn auto_memory_disabled_via_env() {
+        let _g = env_test_guard().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Save / restore so test order doesn't matter.
         let prior = std::env::var("STRATUM_AUTO_MEMORY").ok();
         std::env::set_var("STRATUM_AUTO_MEMORY", "0");
-        assert!(!auto_memory_enabled(None));
+        let result = auto_memory_enabled(None);
         match prior {
             Some(v) => std::env::set_var("STRATUM_AUTO_MEMORY", v),
             None => std::env::remove_var("STRATUM_AUTO_MEMORY"),
         }
+        assert!(!result);
     }
 
     #[test]

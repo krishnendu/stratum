@@ -20,7 +20,7 @@ When a new carve-out is added it MUST be appended here in the same PR. The PR de
 | `crates/stratum-tui/**` | Entire crate | Workspace-internal crate (`publish = false`) housing the chat renderer + palette + theme + brand that moved out of `stratum-cli`. The previous CLI-resident `chat::run` and `chat::event_loop` were already carved out as TTY-bound (see two rows above); the same paths move with the file, so the exclusion moves too. Other items inside the crate are exercised through the CLI's integration tests. Excluded via `cargo llvm-cov --workspace --exclude stratum-tui`. |
 | `crates/stratum-backend-local/**` | Entire crate | Workspace-internal adapter crate. The translation layer between `AgentLoop` blocks and `BackendApi::BackendEvent` is exercised by integration tests against the CLI; covering it as its own crate boundary would require a duplicate test surface that's not yet built. Excluded via `cargo llvm-cov --workspace --exclude stratum-backend-local`. |
 
-## Why 98 instead of 100
+## Why 96 instead of 100
 
 Two classes of carve-out:
 
