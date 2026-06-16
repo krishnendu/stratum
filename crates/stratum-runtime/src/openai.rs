@@ -1902,9 +1902,13 @@ mod tests {
             url: "data:image/png;base64,".to_string(),
             detail: None,
         });
-        assert!(matches!(block, Block::Image {
-            data: ImageData::Url { .. }, ..
-        }));
+        assert!(matches!(
+            block,
+            Block::Image {
+                data: ImageData::Url { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1914,9 +1918,13 @@ mod tests {
             url: "data:notreallybase64".to_string(),
             detail: None,
         });
-        assert!(matches!(block, Block::Image {
-            data: ImageData::Url { .. }, ..
-        }));
+        assert!(matches!(
+            block,
+            Block::Image {
+                data: ImageData::Url { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1945,9 +1953,7 @@ mod tests {
 
     #[test]
     fn model_list_from_catalog_with_entries_yields_one_row_per_slug() {
-        use crate::model_catalog::{
-            ArtifactRef, ModelEntry, ModelTask, ModelTier,
-        };
+        use crate::model_catalog::{ArtifactRef, ModelEntry, ModelTask, ModelTier};
         let mut cat = ModelCatalog::new();
         let artifact = ArtifactRef::new(
             "https://example.com/m.gguf".to_string(),
@@ -1960,7 +1966,7 @@ mod tests {
             family: "llama".to_string(),
             display_name: "Foo".to_string(),
             tier: ModelTier::Low,
-            task: [ModelTask::Chat].iter().copied().collect(),
+            task: std::iter::once(ModelTask::Chat).collect(),
             size_mib: 100,
             quantization: "Q4_K_M".to_string(),
             artifact,
@@ -2312,8 +2318,11 @@ mod tests {
         let addr = handle.bound_address().to_string();
         let mut s = TcpStream::connect(&addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        s.write_all(format!("GET /v1/models HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes())
-            .unwrap();
+        s.write_all(
+            format!("GET /v1/models HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
         let mut r = BufReader::new(s);
         let mut status_line = String::new();
         r.read_line(&mut status_line).unwrap();
@@ -2369,10 +2378,7 @@ mod tests {
         let _ = r.read_to_string(&mut body);
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(v["error"]["type"], "not_found");
-        assert!(v["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("GET"));
+        assert!(v["error"]["message"].as_str().unwrap_or("").contains("GET"));
         let _ = handle.stop();
     }
 
@@ -2429,9 +2435,7 @@ mod tests {
         // Wire a catalog with one entry through the HTTP path so the
         // /v1/models response renders a populated `data` array on the
         // real socket. Pin both the list shape and entry shape.
-        use crate::model_catalog::{
-            ArtifactRef, ModelEntry, ModelTask, ModelTier,
-        };
+        use crate::model_catalog::{ArtifactRef, ModelEntry, ModelTask, ModelTier};
         let mut cat = ModelCatalog::new();
         let artifact = ArtifactRef::new(
             "https://example.com/m.gguf".to_string(),
@@ -2444,7 +2448,7 @@ mod tests {
             family: "qwen".to_string(),
             display_name: "Bar".to_string(),
             tier: ModelTier::High,
-            task: [ModelTask::Code].iter().copied().collect(),
+            task: std::iter::once(ModelTask::Code).collect(),
             size_mib: 200,
             quantization: "Q5_K_M".to_string(),
             artifact,
@@ -2456,8 +2460,9 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             request_timeout: Duration::from_secs(2),
         };
-        let handle =
-            OpenAIServer::new(cfg, factory_for_echo("x"), Arc::new(cat)).start().unwrap();
+        let handle = OpenAIServer::new(cfg, factory_for_echo("x"), Arc::new(cat))
+            .start()
+            .unwrap();
         let addr = handle.bound_address().to_string();
         let (code, body) = post(&addr, "/v1/models", "");
         assert_eq!(code, 200);
@@ -2932,7 +2937,7 @@ mod tests {
             text: "x".to_string(),
         }]);
         let s = serde_json::to_string(&c).unwrap();
-        assert!(s.starts_with("["));
+        assert!(s.starts_with('['));
     }
 
     #[test]
@@ -2960,15 +2965,9 @@ mod tests {
     fn finish_reason_for_const_helper_full_set() {
         let outcomes = [
             (TurnOutcome::Success, "stop"),
-            (
-                TurnOutcome::BudgetExceeded { kind: "x".into() },
-                "length",
-            ),
+            (TurnOutcome::BudgetExceeded { kind: "x".into() }, "length"),
             (TurnOutcome::UserAbort, "error"),
-            (
-                TurnOutcome::ModelError { code: "c".into() },
-                "error",
-            ),
+            (TurnOutcome::ModelError { code: "c".into() }, "error"),
         ];
         for (o, expected) in outcomes {
             assert_eq!(finish_reason_for(&o), expected);
@@ -3101,10 +3100,7 @@ mod tests {
             events_emitted: Vec::new(),
         };
         let resp: OpenAIChatResponse = result.into();
-        assert_eq!(
-            resp.choices[0].message.content.as_text(),
-            Some("")
-        );
+        assert_eq!(resp.choices[0].message.content.as_text(), Some(""));
         assert_eq!(resp.usage.prompt_tokens, 0);
         assert_eq!(resp.usage.total_tokens, 0);
     }
@@ -3169,9 +3165,7 @@ mod tests {
         // The bridge clones the factory per call so concurrent requests
         // get independent AgentLoops. Pin that two successive calls both
         // succeed with the same inner factory.
-        let inner = Arc::new(
-            AgentFactory::new().with_provider(Arc::new(EchoProvider::new("hi"))),
-        );
+        let inner = Arc::new(AgentFactory::new().with_provider(Arc::new(EchoProvider::new("hi"))));
         let lf = loop_factory_from_agent_factory(inner);
         assert!((lf)().is_ok());
         assert!((lf)().is_ok());
