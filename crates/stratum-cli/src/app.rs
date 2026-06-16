@@ -4151,6 +4151,13 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
             }
         };
         let bound = handle.bound_address().to_string();
+        // Build the shutdown flag and install the SIGINT/SIGTERM handler
+        // *before* emitting the startup line. Otherwise a supervisor (or
+        // an integration test) that reads the startup line and immediately
+        // delivers SIGTERM can race past the unprotected window and kill
+        // the child with the default signal disposition.
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        install_shutdown_signals(shutdown_flag.clone());
         if args.json {
             let rendered = serde_json::to_string(&ServeStartupReport {
                 bound: &bound,
@@ -4169,7 +4176,6 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
             return ExitCode::from(74);
         }
         let _ = out.flush();
-        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Some(ms) = args.stop_after_ms {
             let flag = shutdown_flag.clone();
             let _ = std::thread::Builder::new()
@@ -4179,12 +4185,6 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 });
         }
-        // Wire SIGINT/SIGTERM/Ctrl-Break to the same flag so an
-        // interactive Ctrl-C (or a supervisor's SIGTERM) shuts the
-        // acceptor down cleanly. Install failure is non-fatal and is
-        // logged inside the helper — `--stop-after-ms` still works as
-        // the explicit shutdown surface.
-        install_shutdown_signals(shutdown_flag.clone());
         while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -4219,6 +4219,11 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
     };
 
     let bound = handle.bound_address().to_string();
+    // Build the shutdown flag and install the SIGINT/SIGTERM handler
+    // *before* emitting the startup line — see the openai branch above
+    // for the race-condition rationale.
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    install_shutdown_signals(shutdown_flag.clone());
     if args.json {
         #[allow(
             clippy::expect_used,
@@ -4244,7 +4249,6 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
     // the bound address) see the startup line before we start polling.
     let _ = out.flush();
 
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
     if let Some(ms) = args.stop_after_ms {
         let flag = shutdown_flag.clone();
         let _ = thread::Builder::new()
@@ -4254,11 +4258,6 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
                 flag.store(true, Ordering::Relaxed);
             });
     }
-    // Wire SIGINT/SIGTERM/Ctrl-Break to the same flag so an
-    // interactive Ctrl-C (or a supervisor's SIGTERM) flips it just like
-    // the in-protocol `stop` method does. Install failure is logged
-    // inside the helper; the in-protocol surface still works.
-    install_shutdown_signals(shutdown_flag.clone());
 
     // Poll for either the stopwatch fire or the handler's own
     // shutdown_requested flag (set by the in-protocol `stop` method). Tick
