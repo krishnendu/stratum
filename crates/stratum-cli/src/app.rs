@@ -20,12 +20,13 @@ use stratum_runtime::{
     EventEmitter, EventRecord, GenerateRequest, GpuBackend, HandoffPolicy, HardwareProbe,
     InstalledToml, IntentRouter, LoadFailure, LoadedModel, ManifestError, McpServerConfig,
     McpServerSet, McpTransport, MemoryEventSink, MemoryGate, ModelCatalog, ModelEntry,
-    ModelInstaller, ModelSlug, ModelTask, ModelTier, OsTag, ParallelResult, Paths, PlatformTag,
-    Provider, ProviderResolveError, ProviderResolver, ReleaseChannel, ReleaseVersion, RequestId,
-    RoleResult, SandboxReport, ServeBind, ServeConfig, ServeHandler, ServeServer, SessionId,
-    SkipReason, SuggestedRole, TelemetryConfig, TelemetryEventKind, TelemetryPayload, Tier,
-    Transcript, TranscriptBlock, TranscriptStore, TranscriptTurn, TurnContext, TurnId, TurnOutcome,
-    UpdateChannel, UpdateDecision, UpdateManifest, DEFAULT_CATALOG_MAX_BYTES, DEFAULT_MARGIN_MIB,
+    ModelInstaller, ModelSlug, ModelTask, ModelTier, OpenAIServer, OpenAIServerConfig, OsTag,
+    ParallelResult, Paths, PlatformTag, Provider, ProviderResolveError, ProviderResolver,
+    ReleaseChannel, ReleaseVersion, RequestId, RoleResult, SandboxReport, ServeBind, ServeConfig,
+    ServeHandler, ServeServer, SessionId, SkipReason, SuggestedRole, TelemetryConfig,
+    TelemetryEventKind, TelemetryPayload, Tier, Transcript, TranscriptBlock, TranscriptStore,
+    TranscriptTurn, TurnContext, TurnId, TurnOutcome, UpdateChannel, UpdateDecision,
+    UpdateManifest, DEFAULT_CATALOG_MAX_BYTES, DEFAULT_MARGIN_MIB,
 };
 use stratum_types::{Block, ErrorCode, MemEstimate, ModelId};
 use time::format_description::well_known::Rfc3339;
@@ -387,6 +388,12 @@ struct ServeArgs {
     /// address. Without this flag, a prose line is printed instead.
     #[arg(long)]
     json: bool,
+    /// Expose an OpenAI-compatible HTTP surface
+    /// (`POST /v1/chat/completions`, `POST /v1/models`, CORS) on the
+    /// loopback TCP port instead of the JSON-RPC line protocol. The
+    /// default JSON-RPC surface is unchanged.
+    #[arg(long)]
+    openai: bool,
 }
 
 /// Subcommands under `stratum eval`.
@@ -4025,6 +4032,10 @@ fn resolve_serve_provider(
 /// broader runtime signal policy. The current shutdown surface is the
 /// `--stop-after-ms` watchdog plus the in-protocol `stop` method, which is
 /// enough to exercise the wiring in tests.
+#[allow(
+    clippy::too_many_lines,
+    reason = "serve composes transcript store, provider resolution, OpenAI vs JSON-RPC dispatch, watchdog, and graceful shutdown — splitting fragments the call site"
+)]
 fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -4075,6 +4086,80 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
     };
     let factory = Arc::new(factory);
     let events = Arc::new(EventEmitter::new(Arc::new(MemoryEventSink::new())));
+
+    // --openai surface: bind tiny_http on the loopback TCP port and
+    // expose `/v1/chat/completions` + `/v1/models`. Unix-socket transport
+    // is not supported by the HTTP surface (browsers can't dial it).
+    if args.openai {
+        let port = args.tcp_port.unwrap_or(0);
+        let bind_str = format!("127.0.0.1:{port}");
+        let socket: std::net::SocketAddr = match bind_str.parse() {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 invalid bind {bind_str}: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        // `factory` is reused after this branch when the openai flag is
+        // off; explicitly clone the Arc here to avoid moving it.
+        let factory_for_openai = Arc::clone(&factory);
+        let lf = stratum_runtime::loop_factory_from_agent_factory(factory_for_openai);
+        let cat = Arc::new(stratum_runtime::ModelCatalog::new());
+        let cfg = OpenAIServerConfig {
+            bind: socket,
+            request_timeout: Duration::from_millis(args.request_timeout_ms),
+        };
+        let srv = OpenAIServer::new(cfg, lf, cat);
+        let handle = match srv.start() {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = writeln!(err, "STRAT-E1001 openai serve start failed: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let bound = handle.bound_address().to_string();
+        if args.json {
+            let rendered = serde_json::to_string(&ServeStartupReport {
+                bound: &bound,
+                provider: &provider_label,
+            })
+            .unwrap_or_else(|_| "{}".to_string());
+            if writeln!(out, "{rendered}").is_err() {
+                return ExitCode::from(74);
+            }
+        } else if writeln!(
+            out,
+            "stratum serve (openai): provider={provider_label}, listening on http://{bound}"
+        )
+        .is_err()
+        {
+            return ExitCode::from(74);
+        }
+        let _ = out.flush();
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(ms) = args.stop_after_ms {
+            let flag = shutdown_flag.clone();
+            let _ = std::thread::Builder::new()
+                .name("stratum-openai-stopwatch".to_string())
+                .spawn(move || {
+                    std::thread::sleep(Duration::from_millis(ms));
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+        }
+        // Known gap: without `--stop-after-ms` this loop runs until
+        // the user kills the process from outside (SIGINT/SIGKILL).
+        // Wiring an in-process Ctrl-C handler requires a new dep
+        // (signal-hook / ctrlc); deferred until the unified daemon
+        // shutdown story lands.
+        while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if handle.stop().is_err() {
+            let _ = writeln!(err, "STRAT-E1001 openai serve acceptor thread panicked");
+            return ExitCode::from(70);
+        }
+        return ExitCode::SUCCESS;
+    }
 
     let handler = Arc::new(AgentServeHandler::new(
         factory,
