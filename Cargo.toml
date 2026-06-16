@@ -112,6 +112,11 @@ cpal            = "0.16"
 # `stratum-runtime::mic::save_wav` to dump the 16 kHz mono buffer to
 # disk in the format whisper.cpp wants.
 hound           = "3"
+# rodio — minimal portable audio playback. Used by `stratum-tui::chat`
+# for Phase 5 voice-out: playing the WAV that `PiperSubprocess::synthesize`
+# returns through the OS default audio out. `default-features = false`
+# trims encoder/format support to just the `wav` reader piper emits.
+rodio           = { version = "0.21", default-features = false, features = ["wav", "playback"] }
 
 [profile.release]
 lto             = "thin"

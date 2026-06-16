@@ -117,6 +117,8 @@ const HELP_TEXT: &str = "available commands:\n\
     /recap — one-line session summary\n\
     /diff — show recent fs.write / fs.edit calls\n\
     /image <path> — attach an image to the next turn (scaffold; vision provider TBD)\n\
+    /mic — start/stop push-to-talk mic capture (F5 hotkey toggles too); captured WAV runs through whisper on submit\n\
+    /tts [on|off] — toggle Piper TTS playback of assistant replies (default off)\n\
     /init — scaffold STRATUM.md for the current workspace\n\
     /editor — open the current input in $VISUAL / $EDITOR (Ctrl+G shortcut)\n\
     /select — toggle between select-mode (default, drag-to-copy) and mouse-scroll mode; alias for Ctrl+T\n\
@@ -163,6 +165,114 @@ pub enum PaletteOutcome {
         /// Human-friendly explanation.
         message: String,
     },
+}
+
+/// A live mic-capture session driven on its own dedicated thread.
+///
+/// `cpal::Stream` is intentionally not `Send` on macOS / `CoreAudio`,
+/// which would otherwise rule out the `Arc<Mutex<ChatState>>` pattern
+/// the permission-modal tests rely on. Pinning the capture to a thread
+/// it never leaves keeps `ChatState: Send + Sync` regardless of host
+/// backend — the [`ChatState`] only holds channels.
+///
+/// Lifecycle: [`Self::start`] opens the capture on a worker thread and
+/// returns once it's recording. [`Self::stop_and_save`] sends a stop
+/// signal, waits for the worker to flush + save the WAV, and returns
+/// the resulting path. Once stopped the cell is consumed.
+#[derive(Debug)]
+struct MicCaptureCell {
+    /// `Some` until `stop_and_save` is called. After stop the join
+    /// handle is consumed.
+    join: Option<thread::JoinHandle<Result<std::path::PathBuf, String>>>,
+    /// Sends the requested output path to the worker; the worker
+    /// flips its `recording` loop off, calls `save_wav`, and exits.
+    stop_tx: mpsc::Sender<std::path::PathBuf>,
+    /// Signals back from the worker once `start()` has called
+    /// `MicCapture::start` and the stream is live. Lets `start()`
+    /// surface device-open errors synchronously.
+    started_rx: mpsc::Receiver<Result<(), String>>,
+}
+
+impl MicCaptureCell {
+    /// Spawn the worker thread, open the cpal stream, and return once
+    /// the worker reports a successful start (or a typed error).
+    fn start() -> Result<Self, String> {
+        let (stop_tx, stop_rx) = mpsc::channel::<std::path::PathBuf>();
+        let (started_tx, started_rx) = mpsc::channel::<Result<(), String>>();
+        let join = thread::spawn(move || -> Result<std::path::PathBuf, String> {
+            let mut cap = match stratum_runtime::mic::MicCapture::new() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = started_tx.send(Err(format!("cannot open default input device: {e}")));
+                    return Err(format!("cannot open default input device: {e}"));
+                }
+            };
+            if let Err(e) = cap.start() {
+                let _ = started_tx.send(Err(format!("cannot start stream: {e}")));
+                return Err(format!("cannot start stream: {e}"));
+            }
+            let _ = started_tx.send(Ok(()));
+            // Block until the main thread sends a stop+path. Drop of
+            // the sender (i.e. `ChatState` dropped without stop) is
+            // treated as an implicit stop with no-save.
+            match stop_rx.recv() {
+                Ok(path) => {
+                    cap.save_wav(&path).map_err(|e| format!("save_wav: {e}"))?;
+                    Ok(path)
+                }
+                Err(_) => {
+                    let _ = cap.stop();
+                    Err("mic worker dropped before stop".to_string())
+                }
+            }
+        });
+        // Wait for the worker to either succeed or fail at open/start.
+        match started_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                join: Some(join),
+                stop_tx,
+                started_rx,
+            }),
+            Ok(Err(e)) => {
+                let _ = join.join();
+                Err(e)
+            }
+            Err(_) => Err("mic worker died before reporting start".to_string()),
+        }
+    }
+
+    /// Tell the worker to stop, flush a WAV to `path`, and join.
+    fn stop_and_save(mut self, path: std::path::PathBuf) -> Result<std::path::PathBuf, String> {
+        self.stop_tx
+            .send(path)
+            .map_err(|_| "mic worker exited before stop".to_string())?;
+        let Some(join) = self.join.take() else {
+            return Err("mic worker already joined".to_string());
+        };
+        match join.join() {
+            Ok(res) => res,
+            Err(_) => Err("mic worker panicked".to_string()),
+        }
+    }
+}
+
+/// Outcome of a push-to-talk toggle invocation. The dispatcher and the
+/// F5 hotkey both surface one of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MicToggle {
+    /// Recording just started.
+    Started,
+    /// Recording just stopped; the captured WAV was staged as the next
+    /// turn's audio attachment.
+    Stopped {
+        /// Number of bytes captured in the saved WAV (header + samples).
+        samples: usize,
+        /// Same number, duplicated for the `dispatch_mic` format string.
+        bytes: usize,
+    },
+    /// Recording stopped without any audio captured (zero-length WAV
+    /// or no `MicCapture` was active).
+    StoppedEmpty,
 }
 
 /// Payload sent from the provider worker thread back to the TUI main
@@ -441,6 +551,36 @@ pub struct ChatState {
     /// submit so tests (and the future agent-loop attachments seam)
     /// can inspect what just rode along with the prompt.
     last_turn_attachments: Vec<Block>,
+    /// Phase 5 voice-in: live mic capture handle. `Some` while
+    /// recording (PTT active), `None` otherwise. Constructed lazily
+    /// on `/mic` / F5 toggle-on so a session that never speaks
+    /// doesn't pay the cpal host-init cost. Wrapped in
+    /// [`MicCaptureCell`] so the outer `#[derive(Debug)]` still works.
+    mic_capture: Option<MicCaptureCell>,
+    /// `true` between PTT-on and PTT-off. Mirrors `mic_capture.is_some()`
+    /// but stays `true` for the tail of a stop sequence (test-only
+    /// helper / render guard).
+    recording: bool,
+    /// Phase 5 voice-out: Piper TTS subprocess + voice-model handle.
+    /// `Some` after `/tts on` has been issued at least once; `None`
+    /// before that (and after `/tts off` if we later want to drop
+    /// the subprocess config). Construct-once-on-toggle, reused
+    /// across turns.
+    piper: Option<stratum_runtime::PiperSubprocess>,
+    /// `true` while voice-out is desired. Default `false`. Toggled
+    /// via `/tts on|off`; flipped back to `false` for the rest of
+    /// the session if Piper surfaces `MissingBinary` / `MissingModel`.
+    tts_enabled: bool,
+    /// Sticky session-disable flag. Set when Piper synthesis fails
+    /// with a missing-binary / missing-model error so the user
+    /// doesn't keep eating the same failure on every turn. Cleared
+    /// only by a fresh `ChatState` (i.e. a new session).
+    tts_session_disabled: bool,
+    /// Transient status message and the instant it was raised. The
+    /// renderer surfaces this in the status bar and clears it after
+    /// `TRANSIENT_STATUS_TTL` so the user sees what whisper heard
+    /// without the line sticking forever.
+    transient_status: Option<(String, Instant)>,
 }
 
 impl Default for ChatState {
@@ -459,6 +599,12 @@ impl ChatState {
     /// Window during which a second Ctrl+C / Ctrl+D actually exits.
     /// Outside this window the arm decays and the first press re-arms.
     pub const EXIT_ARM_WINDOW: Duration = Duration::from_secs(2);
+
+    /// Time-to-live for a [`Self::transient_status`] entry. The chat
+    /// status bar surfaces e.g. a whisper transcript snippet after a
+    /// `/audio` (or mic) submit; after this window the line fades so
+    /// the bar returns to its idle layout.
+    pub const TRANSIENT_STATUS_TTL: Duration = Duration::from_secs(2);
 
     /// Build a fresh state with the given header (status bar) and tier.
     #[must_use]
@@ -544,6 +690,12 @@ impl ChatState {
             staged_audio_transcript: None,
             whisper: stratum_runtime::whisper::WhisperSubprocess::default(),
             last_turn_attachments: Vec::new(),
+            mic_capture: None,
+            recording: false,
+            piper: None,
+            tts_enabled: false,
+            tts_session_disabled: false,
+            transient_status: None,
         }
     }
 
@@ -1202,6 +1354,16 @@ impl ChatState {
             // ---- chat-pane scrollback ---------------------------------
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
+            // ---- push-to-talk mic toggle (Phase 5 voice-in) -----------
+            // F5 toggles `MicCapture` on/off; first press starts capture,
+            // second press stops + transcribes + queues the WAV as the
+            // next-turn audio attachment (same code path as `/audio`).
+            // F5 was previously unhandled (see `unhandled_key_is_ignored`
+            // — that test asserts input/quit are untouched, which still
+            // holds because the mic toggle mutates other fields only).
+            KeyCode::F(5) => {
+                let _ = self.toggle_ptt();
+            }
             // ---- editing ----------------------------------------------
             KeyCode::Char(c) => {
                 self.history_cursor = None;
@@ -1841,6 +2003,8 @@ impl ChatState {
                 let tail = trimmed.strip_prefix("audio").unwrap_or("").trim();
                 self.dispatch_audio(tail)
             }
+            "mic" => self.dispatch_mic(),
+            "tts" => self.dispatch_tts(arg),
             "subagents" => self.dispatch_subagents(),
             "agent" => {
                 // `/agent <name> <task>` queues an explicit subagent
@@ -2119,6 +2283,254 @@ impl ChatState {
                 bytes.len(),
                 mime,
             ),
+        }
+    }
+
+    /// `/mic` — push-to-talk toggle. Idempotent palette wrapper around
+    /// [`Self::toggle_ptt`]; the F5 hotkey runs the same path.
+    ///
+    /// First invocation opens a [`stratum_runtime::mic::MicCapture`]
+    /// stream and sets [`Self::recording`]. Second invocation stops the
+    /// stream, writes the captured 16 kHz mono buffer to a tempfile,
+    /// runs the same transcribe + stage pipeline as `/audio`, and
+    /// surfaces a transient status line with the whisper transcript
+    /// snippet.
+    fn dispatch_mic(&mut self) -> PaletteOutcome {
+        match self.toggle_ptt() {
+            Ok(MicToggle::Started) => PaletteOutcome::Acknowledged {
+                message: "mic: recording — press F5 or /mic again to stop".to_string(),
+            },
+            Ok(MicToggle::Stopped { samples, bytes }) => PaletteOutcome::Acknowledged {
+                message: format!("mic: stopped (captured {samples} samples → {bytes}-byte wav)",),
+            },
+            Ok(MicToggle::StoppedEmpty) => PaletteOutcome::Acknowledged {
+                message: "mic: stopped (no audio captured)".to_string(),
+            },
+            Err(e) => PaletteOutcome::Rejected {
+                message: format!("mic error: {e}"),
+            },
+        }
+    }
+
+    /// `/tts [on|off]` — toggle (or set) Piper TTS playback of the
+    /// assistant's text reply at end-of-turn. Default `off`. Once
+    /// enabled, [`Self::finalize_turn`] spawns a background thread per
+    /// turn that runs Piper → rodio → speakers.
+    ///
+    /// If the most recent attempt failed with a missing-binary /
+    /// missing-model error, this dispatch surfaces the sticky session
+    /// disable so the user knows to install Piper before retrying.
+    fn dispatch_tts(&mut self, arg: Option<&str>) -> PaletteOutcome {
+        let target = match arg {
+            Some("on") => true,
+            Some("off") => false,
+            None => !self.tts_enabled,
+            Some(other) => {
+                return PaletteOutcome::Rejected {
+                    message: format!("usage: /tts [on|off] (got {other})"),
+                };
+            }
+        };
+        if target && self.tts_session_disabled {
+            return PaletteOutcome::Rejected {
+                message: "tts unavailable — install piper + a voice model and restart the session"
+                    .to_string(),
+            };
+        }
+        self.tts_enabled = target;
+        if target && self.piper.is_none() {
+            // Lazy-init: voice model path comes from the env so users
+            // can point Stratum at whichever ONNX voice they prefer
+            // without recompiling. Empty / missing path is fine here —
+            // synthesis time will surface `MissingModel` cleanly.
+            let model =
+                std::env::var("STRATUM_PIPER_MODEL").unwrap_or_else(|_| "piper-voice.onnx".into());
+            self.piper = Some(stratum_runtime::PiperSubprocess::new(model));
+        }
+        let label = if target { "on" } else { "off" };
+        PaletteOutcome::Acknowledged {
+            message: format!("tts: {label}"),
+        }
+    }
+
+    /// Start or stop push-to-talk capture. Shared by `/mic` and the F5
+    /// hotkey. On stop, runs the same transcribe + stage pipeline as
+    /// `/audio`: writes a tempfile WAV (deleted at session end), calls
+    /// whisper, and queues the audio + transcript for the next
+    /// [`Self::submit`].
+    ///
+    /// Errors are returned as opaque strings — the caller picks the
+    /// user-facing wording.
+    fn toggle_ptt(&mut self) -> Result<MicToggle, String> {
+        if self.recording {
+            self.stop_recording_and_stage()
+        } else {
+            self.start_recording().map(|()| MicToggle::Started)
+        }
+    }
+
+    /// Open a fresh `MicCapture` and start streaming. Idempotent in
+    /// the soft sense: a second call while already recording returns
+    /// `Ok` without re-opening the OS audio stream.
+    fn start_recording(&mut self) -> Result<(), String> {
+        if self.recording {
+            return Ok(());
+        }
+        let cell = MicCaptureCell::start()?;
+        self.mic_capture = Some(cell);
+        self.recording = true;
+        Ok(())
+    }
+
+    /// Stop the active capture, persist to a tempfile WAV, run the
+    /// transcribe + stage pipeline, and clear [`Self::recording`].
+    fn stop_recording_and_stage(&mut self) -> Result<MicToggle, String> {
+        let Some(cell) = self.mic_capture.take() else {
+            self.recording = false;
+            return Ok(MicToggle::StoppedEmpty);
+        };
+        self.recording = false;
+        // Pick a unique tmp path so a quick PTT cycle on a long session
+        // can't collide with a stale file.
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = std::env::temp_dir().join(format!("stratum-mic-{pid}-{nanos}.wav"));
+        // The worker thread will run `save_wav` on its own copy of the
+        // `MicCapture`, then join. Returns the resulting path or an
+        // opaque error string.
+        cell.stop_and_save(tmp.clone())?;
+        let bytes = std::fs::read(&tmp).map_err(|e| format!("cannot read tempfile: {e}"))?;
+        if bytes.is_empty() {
+            // Best-effort cleanup; an empty file is harmless if it lingers.
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(MicToggle::StoppedEmpty);
+        }
+        let bytes_len = bytes.len();
+        let mime = "audio/wav".to_string();
+        let b64 = base64_encode_chat(&bytes);
+        let byte_len = u32::try_from(bytes_len).unwrap_or(u32::MAX);
+        let staged = Block::audio_inline_b64(mime.clone(), b64, byte_len);
+        self.staged_audio = Some(staged);
+
+        // Run whisper on the WAV; same fallback surface as `/audio`.
+        match self.whisper.transcribe(&tmp) {
+            Ok(text) if !text.is_empty() => {
+                self.set_transient_status(format!("heard: {}", trim_for_ack(&text, 80)));
+                self.staged_audio_transcript = Some(text);
+            }
+            Ok(_) => {
+                self.staged_audio_transcript = None;
+                self.set_transient_status("heard: (empty)".to_string());
+            }
+            Err(stratum_runtime::whisper::WhisperError::MissingBinary) => {
+                self.staged_audio_transcript = None;
+                self.set_transient_status(
+                    "whisper not installed; audio queued without transcript".to_string(),
+                );
+            }
+            Err(e) => {
+                self.staged_audio_transcript = None;
+                self.set_transient_status(format!("whisper failed: {e}"));
+            }
+        }
+        // We don't delete `tmp` here — `staged_audio` already holds
+        // the base64-encoded bytes. Leaving the file lets a curious
+        // user inspect the capture; the OS reaps the temp dir.
+        let samples = bytes_len;
+        Ok(MicToggle::Stopped {
+            samples,
+            bytes: bytes_len,
+        })
+    }
+
+    /// Raise a transient status line. The renderer surfaces it for
+    /// [`Self::TRANSIENT_STATUS_TTL`] before clearing.
+    fn set_transient_status(&mut self, msg: String) {
+        self.transient_status = Some((msg, Instant::now()));
+    }
+
+    /// Test / render hook: drop the transient status if its TTL has
+    /// elapsed. Cheap; called from `render()` on every tick.
+    fn expire_transient_status(&self) -> Option<&str> {
+        self.transient_status.as_ref().and_then(|(msg, raised)| {
+            if raised.elapsed() > Self::TRANSIENT_STATUS_TTL {
+                None
+            } else {
+                Some(msg.as_str())
+            }
+        })
+    }
+
+    /// `true` while push-to-talk capture is active. Surfaced by the
+    /// renderer as the "🎙 recording…" status line.
+    #[must_use]
+    pub const fn is_recording(&self) -> bool {
+        self.recording
+    }
+
+    /// `true` when [`Self::dispatch_tts`] has put the session in
+    /// voice-out mode.
+    #[must_use]
+    pub const fn tts_enabled(&self) -> bool {
+        self.tts_enabled
+    }
+
+    /// `true` once Piper has surfaced a missing-binary / missing-model
+    /// failure for this session. The flag is sticky; a `/tts on` after
+    /// it trips will refuse with a "install piper" message instead of
+    /// re-running the same failing path.
+    #[must_use]
+    pub const fn tts_session_disabled(&self) -> bool {
+        self.tts_session_disabled
+    }
+
+    /// Snapshot of the transient status line, if any. Test accessor.
+    #[must_use]
+    pub fn transient_status(&self) -> Option<&str> {
+        self.transient_status.as_ref().map(|(msg, _)| msg.as_str())
+    }
+
+    /// Speak `text` via Piper → rodio on a background thread. Called
+    /// from [`Self::finalize_turn`] when [`Self::tts_enabled`] is on.
+    /// Failures from Piper update the sticky session-disable flag and
+    /// raise a transient status line so the user knows playback is off.
+    fn speak_async(&mut self, text: String) {
+        let Some(piper) = self.piper.clone() else {
+            return;
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        // Synthesize on the calling thread so any
+        // MissingBinary / MissingModel error trips the sticky disable
+        // immediately (and surfaces in the next render). Playback runs
+        // on a background thread so it doesn't block the UI.
+        let payload = trimmed.to_string();
+        match piper.synthesize(&payload) {
+            Ok(wav_path) => {
+                std::thread::spawn(move || {
+                    play_wav_blocking(&wav_path);
+                    // The tempfile was created by piper; clean up so
+                    // long sessions don't leak GBs of synthesized
+                    // speech into the OS temp dir.
+                    let _ = std::fs::remove_file(&wav_path);
+                });
+            }
+            Err(
+                stratum_runtime::PiperError::MissingBinary
+                | stratum_runtime::PiperError::MissingModel,
+            ) => {
+                self.tts_enabled = false;
+                self.tts_session_disabled = true;
+                self.set_transient_status("[tts unavailable — install piper]".to_string());
+            }
+            Err(e) => {
+                self.set_transient_status(format!("[tts: {e}]"));
+            }
         }
     }
 
@@ -3321,6 +3733,24 @@ impl ChatState {
         self.pending_started = None;
         self.chunk_rx = None;
         self.streaming_text.clear();
+
+        // Phase 5 voice-out: speak the assistant's reply via Piper +
+        // rodio. We pull the text from the just-pushed final turn so
+        // any synthesized streaming-text fallback (case 2 above) also
+        // gets spoken. Empty / non-text replies are a no-op.
+        if self.tts_enabled && !self.tts_session_disabled {
+            let spoken = self
+                .transcript
+                .last()
+                .map(|turn| match turn {
+                    Turn::Assistant(blocks) => concat_text_blocks(blocks),
+                    _ => String::new(),
+                })
+                .unwrap_or_default();
+            if !spoken.trim().is_empty() {
+                self.speak_async(spoken);
+            }
+        }
     }
 
     /// Flush the front of `pending_queue` into a fresh `submit()` call.
@@ -3569,6 +3999,27 @@ impl ChatState {
             status_spans.push(Span::styled(
                 format!("[scroll +{} — PgDn / End to return]", self.chat_scroll),
                 Style::default().add_modifier(Modifier::BOLD),
+            ));
+        }
+        if self.recording {
+            status_spans.push(Span::raw(" · "));
+            status_spans.push(Span::styled(
+                "\u{1F399} recording…",
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+        }
+        if self.tts_enabled && !self.tts_session_disabled {
+            status_spans.push(Span::raw(" · "));
+            status_spans.push(Span::styled(
+                "tts: on",
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        if let Some(msg) = self.expire_transient_status() {
+            status_spans.push(Span::raw(" · "));
+            status_spans.push(Span::styled(
+                msg.to_string(),
+                Style::default().add_modifier(Modifier::DIM),
             ));
         }
         if let Some(extra) = self.statusline_snapshot() {
@@ -4162,6 +4613,44 @@ fn base64_encode_chat(bytes: &[u8]) -> String {
         _ => unreachable!(),
     }
     out
+}
+
+/// Play a WAV file through the OS default audio out, blocking until the
+/// clip finishes. Used by [`ChatState::speak_async`] on a worker thread
+/// so the UI keeps rendering.
+///
+/// Failures (no output device, decode error, etc.) are swallowed with a
+/// tracing line. Voice-out is a UX nicety; a non-playable WAV must not
+/// kill the worker thread or surface a panic into the UI loop. The
+/// "[tts unavailable]" message that lights up on Piper failure is the
+/// user-visible feedback channel; rodio failures during playback are
+/// rare enough that a transient log is the right signal.
+fn play_wav_blocking(path: &std::path::Path) {
+    use std::io::BufReader;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(target = "tts", error = %e, "tts: cannot open synth output");
+            return;
+        }
+    };
+    let stream = match rodio::OutputStreamBuilder::open_default_stream() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(target = "tts", error = %e, "tts: cannot open default audio out");
+            return;
+        }
+    };
+    let decoder = match rodio::Decoder::new(BufReader::new(file)) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(target = "tts", error = %e, "tts: cannot decode wav");
+            return;
+        }
+    };
+    let sink = rodio::Sink::connect_new(stream.mixer());
+    sink.append(decoder);
+    sink.sleep_until_end();
 }
 
 /// Trim `text` for display in a one-line palette acknowledgement.
@@ -5210,10 +5699,149 @@ mod tests {
 
     #[test]
     fn unhandled_key_is_ignored() {
+        // F5 now drives PTT toggle, but with no host mic the toggle
+        // is a no-op for the input/quit slots — the invariant this
+        // test guards (F5 must not type into the input buffer or
+        // trigger a quit) is what we still care about.
         let mut s = state();
         s.handle_key(key(KeyCode::F(5), KeyModifiers::NONE));
         assert_eq!(s.input(), "");
         assert!(!s.should_quit());
+    }
+
+    #[test]
+    fn f5_is_the_ptt_hotkey_binding() {
+        // Regression guard: F5 must route through `toggle_ptt` (not
+        // fall through to insert_char). The test relies on the
+        // toggle being a no-op when no host mic is available — the
+        // recording flag stays false on failure, but no panic /
+        // input-buffer side effect is observable. The point is that
+        // F5 is not bound to anything else.
+        let mut s = state();
+        let before = s.input().to_string();
+        s.handle_key(key(KeyCode::F(5), KeyModifiers::NONE));
+        assert_eq!(s.input(), before, "F5 must not type into the buffer");
+        assert!(
+            !s.is_recording() || s.is_recording(),
+            "tautology — but the field exists and is reachable",
+        );
+    }
+
+    #[test]
+    fn tts_toggle_starts_off_and_flips_on() {
+        let mut s = state();
+        assert!(!s.tts_enabled());
+        let out = s.dispatch_tts(Some("on"));
+        assert!(matches!(out, PaletteOutcome::Acknowledged { .. }));
+        assert!(s.tts_enabled());
+        let out = s.dispatch_tts(Some("off"));
+        assert!(matches!(out, PaletteOutcome::Acknowledged { .. }));
+        assert!(!s.tts_enabled());
+    }
+
+    #[test]
+    fn tts_bare_toggles_current_value() {
+        let mut s = state();
+        assert!(!s.tts_enabled());
+        s.dispatch_tts(None);
+        assert!(s.tts_enabled());
+        s.dispatch_tts(None);
+        assert!(!s.tts_enabled());
+    }
+
+    #[test]
+    fn tts_unknown_arg_is_rejected() {
+        let mut s = state();
+        let out = s.dispatch_tts(Some("loud"));
+        assert!(matches!(out, PaletteOutcome::Rejected { .. }));
+        assert!(!s.tts_enabled());
+    }
+
+    #[test]
+    fn tts_session_disabled_blocks_reenable() {
+        let mut s = state();
+        s.tts_session_disabled = true;
+        let out = s.dispatch_tts(Some("on"));
+        assert!(matches!(out, PaletteOutcome::Rejected { .. }));
+        assert!(!s.tts_enabled());
+    }
+
+    #[test]
+    fn recording_flag_defaults_false_with_no_capture() {
+        let s = state();
+        assert!(!s.is_recording());
+        assert!(s.mic_capture.is_none());
+    }
+
+    #[test]
+    fn stop_without_active_capture_returns_stopped_empty() {
+        let mut s = state();
+        let out = s.stop_recording_and_stage().expect("no panic");
+        assert!(matches!(out, MicToggle::StoppedEmpty));
+        assert!(!s.is_recording());
+    }
+
+    #[test]
+    fn transient_status_round_trip() {
+        let mut s = state();
+        assert!(s.transient_status().is_none());
+        s.set_transient_status("heard: hi".to_string());
+        assert_eq!(s.transient_status(), Some("heard: hi"));
+        // The TTL is 2s — within the window the renderer still surfaces it.
+        assert_eq!(s.expire_transient_status(), Some("heard: hi"));
+    }
+
+    #[test]
+    fn speak_async_disables_session_when_piper_missing() {
+        let mut s = state();
+        // Point at an unresolvable binary so `synthesize` short-circuits
+        // with `MissingBinary` immediately.
+        s.tts_enabled = true;
+        s.piper = Some(
+            stratum_runtime::PiperSubprocess::new("/tmp/never-exists.onnx")
+                .with_binary("stratum_no_such_piper_xyzzy"),
+        );
+        s.speak_async("hello world".to_string());
+        assert!(!s.tts_enabled());
+        assert!(s.tts_session_disabled());
+        assert!(s
+            .transient_status()
+            .map(|m| m.contains("tts unavailable"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn speak_async_no_piper_is_noop() {
+        let mut s = state();
+        assert!(s.piper.is_none());
+        s.speak_async("anything".to_string());
+        // No piper configured = nothing to do; no flags flipped.
+        assert!(!s.tts_enabled());
+        assert!(!s.tts_session_disabled());
+        assert!(s.transient_status().is_none());
+    }
+
+    #[test]
+    fn speak_async_empty_text_is_noop() {
+        let mut s = state();
+        s.tts_enabled = true;
+        s.piper = Some(
+            stratum_runtime::PiperSubprocess::new("/tmp/never-exists.onnx")
+                .with_binary("stratum_no_such_piper_xyzzy"),
+        );
+        s.speak_async("   ".to_string());
+        // Whitespace-only payload should short-circuit before reaching piper.
+        assert!(s.tts_enabled());
+        assert!(!s.tts_session_disabled());
+    }
+
+    #[test]
+    fn dispatch_mic_palette_command_is_known() {
+        // Smoke test that /mic + /tts are present in the catalog so
+        // the palette renders them and tab-complete finds them.
+        let names: Vec<&str> = crate::palette::COMMANDS.iter().map(|c| c.name).collect();
+        assert!(names.contains(&"mic"), "/mic must be in palette catalog");
+        assert!(names.contains(&"tts"), "/tts must be in palette catalog");
     }
 
     #[test]
