@@ -1794,6 +1794,7 @@ fn models_add(
         artifact,
         license: args.license.clone(),
         homepage: args.homepage.clone(),
+        vision_mmproj: None,
     };
     catalog.insert(entry.clone());
 

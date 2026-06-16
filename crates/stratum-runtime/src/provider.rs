@@ -72,16 +72,12 @@ pub struct GenerateRequest {
     /// every knob unset and the provider uses its own defaults.
     #[serde(default)]
     pub sampler: SamplerParams,
-    /// Multimodal attachments for THIS turn. Only `Block::Image` and
-    /// `Block::Audio` variants are meaningful here — other variants are
-    /// ignored by every provider. Text-only providers MUST tolerate a
-    /// populated `attachments` field (typically by ignoring it with a
-    /// debug log); the upcoming vision-head provider will consume the
-    /// list and feed bytes through `--mmproj`.
-    //
-    // TODO(plan/05): wire <vision-model> — the actual provider that
-    // turns these bytes into model input still has to land. Until
-    // then, every shipped provider drops attachments on the floor.
+    /// Multimodal attachments accompanying this turn — typically
+    /// `Block::Image` payloads queued by `/image <path>` in the chat
+    /// surface. Empty for plain text-only turns. Providers that don't
+    /// understand multimodal input drop the list (with a debug log) —
+    /// see `LlamaCppProvider` for the vision-routing path that wires
+    /// these blocks through llama.cpp's `mtmd` (mmproj) head.
     #[serde(default)]
     pub attachments: Vec<Block>,
 }
@@ -320,5 +316,149 @@ mod tests {
         let p = EchoProvider::new("a:");
         let q = p.clone();
         assert_eq!(*p.prefix, *q.prefix);
+    }
+
+    // ---- Attachments forwarding -----------------------------------
+    //
+    // These tests pin the Phase 5 seam: the caller queues a
+    // `Block::Image` on `GenerateRequest.attachments`, and the provider
+    // sees exactly what was queued. Without this contract the chat
+    // surface's `/image <path>` palette command silently drops the
+    // user's image at the provider boundary.
+
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct CapturingProvider {
+        seen: Mutex<Vec<GenerateRequest>>,
+    }
+
+    impl Provider for CapturingProvider {
+        #[allow(
+            clippy::unnecessary_literal_bound,
+            reason = "trait signature returns &str so impls returning borrowed strings (e.g. NamedEcho) compile too"
+        )]
+        fn id(&self) -> &str {
+            "capturing"
+        }
+        fn capabilities(&self) -> &'static [stratum_types::Capability] {
+            const CAPS: &[stratum_types::Capability] = &[stratum_types::Capability::Generate];
+            CAPS
+        }
+        fn generate(&self, request: &GenerateRequest, _cancel: &CancelToken) -> Vec<Block> {
+            self.seen.lock().unwrap().push(request.clone());
+            // Echo a marker block so callers can distinguish "saw the
+            // request" from "request was dropped on the floor".
+            vec![Block::Text {
+                text: format!("captured {} attachments", request.attachments.len()),
+            }]
+        }
+    }
+
+    fn img(b64: &str) -> Block {
+        let bytes = u32::try_from(b64.len()).unwrap_or(u32::MAX);
+        Block::image_inline_b64("image/png", b64, bytes)
+    }
+
+    #[test]
+    fn attachments_default_is_empty_vec() {
+        let r = req("hi", 1);
+        assert!(
+            r.attachments.is_empty(),
+            "attachments must default to empty"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "test fixture; holding the lock through the asserts is intentional"
+    )]
+    fn attachments_field_forwards_to_provider() {
+        let provider = CapturingProvider::default();
+        let mut r = req("describe this", 1);
+        r.attachments.push(img("AAAA"));
+        let _ = provider.generate(&r, &CancelToken::new());
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "provider must see exactly one request");
+        assert_eq!(
+            seen[0].attachments.len(),
+            1,
+            "provider must see the queued attachment"
+        );
+        assert!(
+            seen[0].attachments[0].is_image(),
+            "the forwarded attachment must still be an image block"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "test fixture; holding the lock through the asserts is intentional"
+    )]
+    fn attachments_field_preserves_order_and_count() {
+        let provider = CapturingProvider::default();
+        let mut r = req("compare these", 1);
+        r.attachments.push(img("AAAA"));
+        r.attachments.push(img("BBBB"));
+        r.attachments.push(img("CCCC"));
+        let _ = provider.generate(&r, &CancelToken::new());
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen[0].attachments.len(), 3);
+        // Spot-check order by reading the base64 payload back out.
+        for (i, expected) in ["AAAA", "BBBB", "CCCC"].iter().enumerate() {
+            let Block::Image {
+                data: stratum_types::ImageData::Inline { base64, .. },
+                ..
+            } = &seen[0].attachments[i]
+            else {
+                panic!("expected inline image at index {i}");
+            };
+            assert_eq!(
+                base64, expected,
+                "attachment ordering must survive forwarding"
+            );
+        }
+    }
+
+    #[test]
+    fn attachments_serde_roundtrip_preserves_image() {
+        let mut r = req("describe", 1);
+        r.attachments.push(img("AAAA"));
+        let s = serde_json::to_string(&r).unwrap();
+        let back: GenerateRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, back, "GenerateRequest with attachments must roundtrip");
+    }
+
+    #[test]
+    fn attachments_serde_default_when_field_absent() {
+        // Wire-compatible with the pre-Phase-5 shape: requests serialized
+        // before attachments existed must still parse, with attachments
+        // defaulting to empty.
+        let json = r#"{
+            "model": "echo",
+            "prompt": "hi",
+            "max_blocks": 1,
+            "system_override": null,
+            "history": [],
+            "sampler": {}
+        }"#;
+        let r: GenerateRequest = serde_json::from_str(json).unwrap();
+        assert!(r.attachments.is_empty());
+    }
+
+    #[test]
+    fn echo_provider_tolerates_populated_attachments() {
+        // Echo doesn't understand multimodal input but must not panic
+        // when handed an attachment list — it should still emit the
+        // text blocks the rest of the pipeline expects.
+        let p = EchoProvider::new("");
+        let mut r = req("hello", 5);
+        r.attachments.push(img("AAAA"));
+        let blocks = p.generate(&r, &CancelToken::new());
+        // First block is the first word of the prompt; the request
+        // didn't get dropped.
+        assert!(matches!(blocks[0], Block::Text { ref text } if text == "hello"));
     }
 }
