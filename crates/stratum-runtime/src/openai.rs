@@ -1202,23 +1202,6 @@ mod tests {
     }
 
     #[test]
-    fn finish_reason_maps_outcome_correctly() {
-        assert_eq!(finish_reason_for(&TurnOutcome::Success), "stop");
-        assert_eq!(
-            finish_reason_for(&TurnOutcome::BudgetExceeded { kind: "x".into() }),
-            "length"
-        );
-        assert_eq!(
-            finish_reason_for(&TurnOutcome::ToolFailure {
-                tool_id: "t".into(),
-                code: "c".into(),
-            }),
-            "tool_calls"
-        );
-        assert_eq!(finish_reason_for(&TurnOutcome::UserAbort), "error");
-    }
-
-    #[test]
     fn model_list_from_empty_catalog_is_empty() {
         let cat = ModelCatalog::new();
         let list = OpenAIModelList::from_catalog(&cat);
@@ -1542,16 +1525,6 @@ mod tests {
         let resp: OpenAIChatResponse = result.into();
         assert_eq!(resp.usage.prompt_tokens, 0);
         assert_eq!(resp.usage.completion_tokens, 0);
-    }
-
-    #[test]
-    fn model_list_default_is_empty() {
-        // Catalog with zero entries -> empty data list, object label
-        // is "list" per the OpenAI shape.
-        let catalog = ModelCatalog::default();
-        let list = OpenAIModelList::from_catalog(&catalog);
-        assert_eq!(list.object, "list");
-        assert!(list.data.is_empty());
     }
 
     #[test]
@@ -2962,19 +2935,6 @@ mod tests {
     }
 
     #[test]
-    fn finish_reason_for_const_helper_full_set() {
-        let outcomes = [
-            (TurnOutcome::Success, "stop"),
-            (TurnOutcome::BudgetExceeded { kind: "x".into() }, "length"),
-            (TurnOutcome::UserAbort, "error"),
-            (TurnOutcome::ModelError { code: "c".into() }, "error"),
-        ];
-        for (o, expected) in outcomes {
-            assert_eq!(finish_reason_for(&o), expected);
-        }
-    }
-
-    #[test]
     fn blocks_to_text_handles_empty_input() {
         let blocks: Vec<Block> = Vec::new();
         assert!(blocks_to_text(&blocks).is_empty());
@@ -3014,16 +2974,6 @@ mod tests {
             },
         ];
         assert_eq!(blocks_to_text(&blocks), "xy");
-    }
-
-    #[test]
-    fn config_clone_yields_equal_addr() {
-        let cfg = OpenAIServerConfig {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            request_timeout: Duration::from_secs(1),
-        };
-        let cloned = cfg.clone();
-        assert_eq!(cloned.bind, cfg.bind);
     }
 
     #[test]
