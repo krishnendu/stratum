@@ -17,30 +17,30 @@ class Stratum < Formula
   desc "Stratum — your local model crew. Local-first chat with an LLM agent"
   homepage "https://github.com/krishnendu/stratum"
   license any_of: ["Apache-2.0", "MIT"]
-  version "0.2.9"
+  version "0.2.10"
 
   conflicts_with "stratum-llama-cpp",
     because: "both install a `stratum` binary; pick the prebuilt or the LLM-enabled build"
 
   on_macos do
     on_arm do
-      url "https://github.com/krishnendu/stratum/releases/download/v0.2.9/stratum-v0.2.9-aarch64-apple-darwin.tar.gz"
-      sha256 "4e1d685f4378c0c862395c7ae8393ec7e56846d5d7767adf913d25142949fa60"
+      url "https://github.com/krishnendu/stratum/releases/download/v0.2.10/stratum-v0.2.10-aarch64-apple-darwin.tar.gz"
+      sha256 "c2b9859eb9692c0aa68c87e92f3e3f89e75db5c39cf2939cc3569b1f50c6c151"
     end
     on_intel do
-      url "https://github.com/krishnendu/stratum/releases/download/v0.2.9/stratum-v0.2.9-x86_64-apple-darwin.tar.gz"
-      sha256 "50c669b67a5fe6ad842375d31642e2f91b4dc57edc1bb7737cb52ef33249641d"
+      url "https://github.com/krishnendu/stratum/releases/download/v0.2.10/stratum-v0.2.10-x86_64-apple-darwin.tar.gz"
+      sha256 "8431389e7150fdb7609ebff3fd217b8864aeaf1fcd81f36c76d7028d6864e016"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/krishnendu/stratum/releases/download/v0.2.9/stratum-v0.2.9-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "b73eb17122c8a8b0215bb6c519e2d4da8d8c1557998dfe0c573a89c2c78365f8"
+      url "https://github.com/krishnendu/stratum/releases/download/v0.2.10/stratum-v0.2.10-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "5641ad304373fde0ae0368624bc3f7d133983dc030f5a3443f950af3c5351185"
     end
     on_intel do
-      url "https://github.com/krishnendu/stratum/releases/download/v0.2.9/stratum-v0.2.9-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "c0b6d14102fc50e278e27f2b2f60947429f0fef9ff17eb8a0c5fcaf5a16c9f44"
+      url "https://github.com/krishnendu/stratum/releases/download/v0.2.10/stratum-v0.2.10-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "fa00eb0f424d2a3b344786fdd20dd8e771ddaa7a464d338b2cb44b88d376f340"
     end
   end
 
