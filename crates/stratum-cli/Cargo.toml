@@ -45,8 +45,14 @@ ureq                = { workspace = true }
 toml_edit           = { workspace = true, features = ["serde"] }
 tar                 = { workspace = true }
 flate2              = { workspace = true }
+ctrlc               = { workspace = true }
 
 [dev-dependencies]
 serde_json          = { workspace = true }
 tempfile            = { workspace = true }
 toml_edit           = { workspace = true, features = ["serde"] }
+# Used only by the `serve_exits_cleanly_on_sigterm` integration test to
+# send SIGTERM to the spawned child without shelling out to `kill`
+# (which may not be on PATH in minimal CI images).
+[target.'cfg(unix)'.dev-dependencies]
+libc                = "0.2"

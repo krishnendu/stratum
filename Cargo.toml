@@ -99,6 +99,10 @@ notify          = { version = "6", default-features = false, features = ["macos_
 # Synchronous HTTP server for the `stratum serve --openai` egress path.
 # Kept sync to match the rest of the runtime — no tokio in the request path.
 tiny_http       = { version = "0.12", default-features = false }
+# Cross-platform SIGINT/SIGTERM/Ctrl-Break handler. The serve daemons
+# poll an AtomicBool shutdown flag; this crate flips it from the OS
+# signal without dragging tokio into the request path.
+ctrlc           = { version = "3", default-features = false, features = ["termination"] }
 
 [profile.release]
 lto             = "thin"
