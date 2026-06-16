@@ -2051,6 +2051,34 @@ impl ChatState {
                 message: format!("path escapes workspace: {path_str}"),
             };
         }
+        // Canonicalize against cwd so a relative symlink that points
+        // outside the workspace (e.g. `audio -> /etc/shadow`) gets
+        // caught here too. Mirrors `FsReadToolDispatcher`'s policy.
+        let cwd = match std::env::current_dir() {
+            Ok(c) => c,
+            Err(e) => {
+                return PaletteOutcome::Rejected {
+                    message: format!("cannot resolve cwd: {e}"),
+                };
+            }
+        };
+        let canonical_cwd = cwd.canonicalize().unwrap_or(cwd.clone());
+        let canonical_target = match cwd.join(p).canonicalize() {
+            Ok(c) => c,
+            Err(e) => {
+                return PaletteOutcome::Rejected {
+                    message: format!("cannot canonicalize {path_str}: {e}"),
+                };
+            }
+        };
+        if !canonical_target.starts_with(&canonical_cwd) {
+            return PaletteOutcome::Rejected {
+                message: format!(
+                    "path escapes workspace via symlink: {path_str} -> {}",
+                    canonical_target.display()
+                ),
+            };
+        }
         let bytes = match std::fs::read(p) {
             Ok(b) => b,
             Err(e) => {
@@ -3080,10 +3108,19 @@ impl ChatState {
         let drained_audio = self.staged_audio.take();
         let drained_transcript = self.staged_audio_transcript.take();
         if drained_audio.is_some() {
+            // Fence the transcript in BEGIN/END markers + cap length at
+            // 8 KiB so a long whisper transcript can't blow the prompt
+            // budget AND a transcript that itself contains
+            // `[transcript: ...]` or instruction-like text can't be
+            // confused with operator-level context. The fence labels
+            // are distinctive enough that a downstream provider can
+            // tell user content from transcript content if it cares.
+            const TRANSCRIPT_CHAR_CAP: usize = 8 * 1024;
             let prefix = if let Some(text) = drained_transcript.as_deref() {
-                format!("[transcript: {text}]\n\n")
+                let trimmed: String = text.chars().take(TRANSCRIPT_CHAR_CAP).collect();
+                format!("[AUDIO_TRANSCRIPT_BEGIN]\n{trimmed}\n[AUDIO_TRANSCRIPT_END]\n\n")
             } else {
-                "[audio transcript unavailable — install whisper.cpp]\n\n".to_string()
+                "[AUDIO_TRANSCRIPT_BEGIN]\n(unavailable — install whisper.cpp)\n[AUDIO_TRANSCRIPT_END]\n\n".to_string()
             };
             prompt = format!("{prefix}{prompt}");
         }
@@ -7771,8 +7808,15 @@ mod tests {
                 _ => None,
             })
             .expect("user turn");
+        // Reviewer feedback: the prefix now uses fenced
+        // AUDIO_TRANSCRIPT_BEGIN/END markers + "(unavailable — install
+        // whisper.cpp)" body so injection can't masquerade as instructions.
         assert!(
-            user_turn.contains("audio transcript unavailable"),
+            user_turn.contains("AUDIO_TRANSCRIPT_BEGIN"),
+            "got: {user_turn}",
+        );
+        assert!(
+            user_turn.contains("unavailable") && user_turn.contains("install whisper.cpp"),
             "got: {user_turn}",
         );
         assert!(
