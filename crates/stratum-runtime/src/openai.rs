@@ -948,9 +948,13 @@ fn respond_stream(req: tiny_http::Request, agent: AgentLoop, ctx: TurnContext, m
 
     let (chunk_tx, chunk_rx) = mpsc::channel::<Block>();
     let (done_tx, done_rx) = mpsc::channel::<TurnResult>();
+    // Keep a clone of the cancel token alive on this thread so we can
+    // signal the LLM worker when the HTTP client disconnects (see the
+    // `cancel.cancel()` call after `req.respond` returns below).
     let cancel = CancelToken::new();
+    let cancel_for_worker = cancel.clone();
     let llm_worker = thread::spawn(move || {
-        let result = agent.run_turn_streaming(ctx, &cancel, chunk_tx);
+        let result = agent.run_turn_streaming(ctx, &cancel_for_worker, chunk_tx);
         let _ = done_tx.send(result);
     });
 
@@ -1040,6 +1044,12 @@ fn respond_stream(req: tiny_http::Request, agent: AgentLoop, ctx: TurnContext, m
     // tiny_http (see `choose_transfer_encoding` in tiny_http 0.12).
     let response = Response::new(StatusCode(200), vec![sse_header()], reader, None, None);
     let _ = req.respond(with_cors(response));
+    // If the client disconnected mid-stream, `req.respond` returned with
+    // an IO error; either way, signal the LLM worker so it stops as soon
+    // as the next cancel poll fires. Without this the worker (and the
+    // formatter joined on it) would run to completion against a
+    // disconnected client, holding provider/CPU/GPU resources.
+    cancel.cancel();
     let _ = formatter.join();
 }
 
@@ -1473,11 +1483,16 @@ mod tests {
         // `Transfer-Encoding: chunked` so each `data: {...}\n\n` event
         // flushes to wire as it lands. A buffered response would set
         // Content-Length instead and defeat the streaming UX.
-        let handle = start_server("hi");
+        //
+        // Multi-word user prompt + multi-word echo prefix produces
+        // multiple `Block::Text` deltas, exercising the formatter
+        // loop more than once (catches refactor regressions that
+        // collapse multi-event streams into a single buffered chunk).
+        let handle = start_server("echo:");
         let addr = handle.bound_address().to_string();
         let body = serde_json::json!({
             "model": "echo",
-            "messages": [{"role":"user","content":"hi"}],
+            "messages": [{"role":"user","content":"alpha beta gamma"}],
             "stream": true
         })
         .to_string();
@@ -1497,6 +1512,17 @@ mod tests {
         assert!(resp_body.contains("data: "));
         assert!(resp_body.contains("[DONE]"));
         assert!(resp_body.contains("chat.completion.chunk"));
+        // Multi-delta proof: every `Block::Text` produces one `data: ...`
+        // line carrying `"content":"<word>"`. With the 3-word prompt we
+        // expect at least 3 content deltas, plus the role-only delta,
+        // plus the terminal `finish_reason` chunk, plus `[DONE]` — total
+        // SSE events ≥ 5. A regression that re-buffered would collapse
+        // these into a single payload, which the assertion below catches.
+        let delta_count = resp_body.matches("\"content\"").count();
+        assert!(
+            delta_count >= 3,
+            "expected ≥3 content deltas from a 3-word echo, got {delta_count}\nbody:\n{resp_body}"
+        );
         let _ = handle.stop();
     }
 
