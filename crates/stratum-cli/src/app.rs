@@ -4146,6 +4146,11 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 });
         }
+        // Known gap: without `--stop-after-ms` this loop runs until
+        // the user kills the process from outside (SIGINT/SIGKILL).
+        // Wiring an in-process Ctrl-C handler requires a new dep
+        // (signal-hook / ctrlc); deferred until the unified daemon
+        // shutdown story lands.
         while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(100));
         }

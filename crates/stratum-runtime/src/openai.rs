@@ -83,7 +83,7 @@ pub struct OpenAIChatMessage {
 }
 
 /// OpenAI Chat Completions request body (subset used by the daemon).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct OpenAIChatRequest {
     /// Model identifier — passed straight through to the
     /// [`crate::provider::Provider`].
@@ -108,6 +108,27 @@ pub struct OpenAIChatRequest {
     /// Nucleus-sampling probability mass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    /// Number of completions. Accepted for client-shape compatibility
+    /// but silently treated as `1` — Stratum's `run_turn` is one
+    /// completion per call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    /// Stop sequences. Accepted for client-shape compatibility but
+    /// not yet forwarded to the sampler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<serde_json::Value>,
+    /// Presence penalty. Accepted for client-shape compatibility but
+    /// not yet forwarded to the sampler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    /// Frequency penalty. Accepted for client-shape compatibility but
+    /// not yet forwarded to the sampler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    /// End-user identifier. Accepted and ignored (Stratum runs
+    /// loopback by default; no rate-limit grouping needed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 /// OpenAI Chat Completions response — non-stream path.
@@ -259,10 +280,13 @@ impl From<OpenAIChatRequest> for TurnContext {
                 user_prompt = msg.content;
                 continue;
             }
+            // Preserve `system` distinctly — providers that branch on
+            // role (e.g. anything wrapping a chat template) must not
+            // see it coerced to `user`.
             let role = match msg.role.as_str() {
                 "user" => "user",
                 "assistant" => "assistant",
-                "system" => "user",
+                "system" => "system",
                 _ => continue,
             };
             history.push(ChatHistoryTurn {
@@ -600,6 +624,17 @@ fn respond_non_stream(
     let _ = req.respond(with_cors(response));
 }
 
+/// SSE response for `stream: true`.
+///
+/// **Known limitation**: `tiny_http` does not expose a streaming write
+/// API, so we accumulate every `data: {chunk}` line into a single
+/// buffered body and send one HTTP response. Clients see the full
+/// SSE event sequence delivered atomically when the turn completes
+/// — there is no progressive token rendering. The protocol shape is
+/// still correct (SSE lines + `data: [DONE]` footer) so OpenAI-shaped
+/// clients work end-to-end; only the latency-to-first-token gain
+/// from real streaming is missing. True chunked transfer + per-block
+/// cancellation lands when we swap the HTTP layer.
 fn respond_stream(req: tiny_http::Request, agent: AgentLoop, ctx: TurnContext, model_label: &str) {
     let id = format!("chatcmpl-{}", ctx.turn_id.0);
     let created = unix_now_secs();
@@ -750,10 +785,15 @@ fn respond_error_owned(req: tiny_http::Request, status: u16, ty: &str, msg: &str
 }
 
 fn error_body(ty: &str, message: &str) -> String {
+    // The OpenAI error shape carries `type`, `message`, AND `code`;
+    // Python-SDK callers key on `error.code` for retry classification.
+    // We mirror `code` to `type` since we don't yet emit a more
+    // specific machine-readable code than the type label.
     serde_json::json!({
         "error": {
             "type": ty,
             "message": message,
+            "code": ty,
         }
     })
     .to_string()
@@ -848,14 +888,13 @@ mod tests {
                 },
                 user_msg("hello"),
             ],
-            stream: false,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
+            ..OpenAIChatRequest::default()
         };
         let ctx: TurnContext = req.into();
         assert_eq!(ctx.user_prompt, "hello");
         assert_eq!(ctx.history.len(), 1);
+        // System role preserved distinctly — not coerced to user.
+        assert_eq!(ctx.history[0].role, "system");
         assert_eq!(ctx.history[0].content, "be terse");
     }
 
@@ -909,10 +948,7 @@ mod tests {
         let req = OpenAIChatRequest {
             model: "echo".to_string(),
             messages: vec![user_msg("hi")],
-            stream: false,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
+            ..OpenAIChatRequest::default()
         };
         let ctx: TurnContext = req.into();
         assert_eq!(ctx.user_prompt, "hi");
@@ -1094,5 +1130,189 @@ mod tests {
             .to_ascii_lowercase()
             .contains("access-control-allow-origin"));
         let _ = handle.stop();
+    }
+
+    #[test]
+    fn error_body_includes_code_field() {
+        // Python SDK + many other clients key on `error.code` for
+        // retry classification — the field must be present even when
+        // it just mirrors the type label.
+        let body = error_body("invalid_request", "missing model");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["type"].as_str(), Some("invalid_request"));
+        assert_eq!(v["error"]["message"].as_str(), Some("missing model"));
+        assert_eq!(v["error"]["code"].as_str(), Some("invalid_request"));
+    }
+
+    #[test]
+    fn request_accepts_unknown_wire_fields() {
+        // Real OpenAI clients send n / stop / presence_penalty /
+        // frequency_penalty / user on every call. Stratum accepts
+        // them at the wire (so deserialise doesn't 400) and ignores
+        // them inside the conversion path. This test pins that the
+        // wire shape parses the full set.
+        let json = r#"{
+            "model": "echo",
+            "messages": [{"role": "user", "content": "hi"}],
+            "n": 1,
+            "stop": ["\n"],
+            "presence_penalty": 0.5,
+            "frequency_penalty": 0.0,
+            "user": "abc-123"
+        }"#;
+        let req: OpenAIChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.n, Some(1));
+        assert!(req.stop.is_some());
+        assert_eq!(req.presence_penalty, Some(0.5));
+        assert_eq!(req.frequency_penalty, Some(0.0));
+        assert_eq!(req.user.as_deref(), Some("abc-123"));
+        // And the From conversion still works regardless.
+        let ctx: TurnContext = req.into();
+        assert_eq!(ctx.user_prompt, "hi");
+    }
+
+    #[test]
+    fn finish_reason_maps_every_turn_outcome() {
+        // The four-arm match in `finish_reason_for` is the only piece
+        // of code that names every TurnOutcome variant — make sure
+        // each lands on the documented OpenAI label.
+        assert_eq!(finish_reason_for(&TurnOutcome::Success), "stop");
+        assert_eq!(
+            finish_reason_for(&TurnOutcome::BudgetExceeded {
+                kind: "tokens".to_string()
+            }),
+            "length"
+        );
+        assert_eq!(
+            finish_reason_for(&TurnOutcome::ToolFailure {
+                tool_id: "x".to_string(),
+                code: "STRAT-E5006".to_string()
+            }),
+            "tool_calls"
+        );
+        assert_eq!(
+            finish_reason_for(&TurnOutcome::ModelError {
+                code: "STRAT-E3007".to_string()
+            }),
+            "error"
+        );
+        assert_eq!(finish_reason_for(&TurnOutcome::UserAbort), "error");
+    }
+
+    #[test]
+    fn blocks_to_text_collapses_text_blocks_skips_other_variants() {
+        let blocks = vec![
+            Block::Text {
+                text: "hello ".to_string(),
+            },
+            Block::Usage {
+                prompt: 3,
+                completion: 1,
+            },
+            Block::Text {
+                text: "world".to_string(),
+            },
+        ];
+        assert_eq!(blocks_to_text(&blocks), "hello world");
+    }
+
+    #[test]
+    fn turn_result_into_response_inherits_usage_block_when_present() {
+        use crate::observability::TurnId;
+        let result = TurnResult {
+            turn_id: TurnId(42),
+            outcome: TurnOutcome::Success,
+            blocks: vec![
+                Block::Text {
+                    text: "ok".to_string(),
+                },
+                Block::Usage {
+                    prompt: 7,
+                    completion: 3,
+                },
+            ],
+            transitions: Vec::new(),
+            events_emitted: Vec::new(),
+        };
+        let resp: OpenAIChatResponse = result.into();
+        assert_eq!(resp.id, "chatcmpl-42");
+        assert_eq!(resp.object, "chat.completion");
+        assert_eq!(resp.usage.prompt_tokens, 7);
+        assert_eq!(resp.usage.completion_tokens, 3);
+        assert_eq!(resp.usage.total_tokens, 10);
+        assert_eq!(resp.choices[0].finish_reason, "stop");
+        assert_eq!(resp.choices[0].message.content, "ok");
+    }
+
+    #[test]
+    fn turn_result_into_response_zero_usage_when_no_usage_block() {
+        use crate::observability::TurnId;
+        let result = TurnResult {
+            turn_id: TurnId(1),
+            outcome: TurnOutcome::Success,
+            blocks: vec![Block::Text {
+                text: "x".to_string(),
+            }],
+            transitions: Vec::new(),
+            events_emitted: Vec::new(),
+        };
+        let resp: OpenAIChatResponse = result.into();
+        assert_eq!(resp.usage.prompt_tokens, 0);
+        assert_eq!(resp.usage.completion_tokens, 0);
+    }
+
+    #[test]
+    fn model_list_default_is_empty() {
+        // Catalog with zero entries -> empty data list, object label
+        // is "list" per the OpenAI shape.
+        let catalog = ModelCatalog::default();
+        let list = OpenAIModelList::from_catalog(&catalog);
+        assert_eq!(list.object, "list");
+        assert!(list.data.is_empty());
+    }
+
+    #[test]
+    fn assistant_role_messages_appear_in_history() {
+        // The role-coerce switch handles user / assistant / system —
+        // the assistant case used to be untested.
+        let req = OpenAIChatRequest {
+            model: "echo".to_string(),
+            messages: vec![
+                user_msg("hi"),
+                OpenAIChatMessage {
+                    role: "assistant".to_string(),
+                    content: "hello back".to_string(),
+                    name: None,
+                },
+                user_msg("how are you"),
+            ],
+            ..OpenAIChatRequest::default()
+        };
+        let ctx: TurnContext = req.into();
+        assert_eq!(ctx.user_prompt, "how are you");
+        assert_eq!(ctx.history.len(), 2);
+        assert_eq!(ctx.history[0].role, "user");
+        assert_eq!(ctx.history[1].role, "assistant");
+    }
+
+    #[test]
+    fn unknown_role_messages_are_dropped() {
+        // Any role outside {user, assistant, system} is silently
+        // discarded so a malformed client can't inject foreign turns.
+        let req = OpenAIChatRequest {
+            model: "echo".to_string(),
+            messages: vec![
+                OpenAIChatMessage {
+                    role: "function".to_string(),
+                    content: "tool-call payload".to_string(),
+                    name: None,
+                },
+                user_msg("hi"),
+            ],
+            ..OpenAIChatRequest::default()
+        };
+        let ctx: TurnContext = req.into();
+        assert!(ctx.history.is_empty());
+        assert_eq!(ctx.user_prompt, "hi");
     }
 }
