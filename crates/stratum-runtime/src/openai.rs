@@ -3783,4 +3783,86 @@ mod tests {
         assert!(resp_body.contains("echoed"));
         let _ = handle.stop();
     }
+
+    #[test]
+    fn handle_list_models_works_when_using_default_live_probe() {
+        // Companion to the chat-completion no-override test: verify
+        // the GET /v1/models route also works when no probe override
+        // is installed (LiveRamProbe is the default in the test
+        // dispatcher's `else` arm).
+        use std::io::{BufRead, BufReader, Read as _, Write};
+        use std::net::TcpStream;
+        let cfg = OpenAIServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            request_timeout: Duration::from_secs(2),
+        };
+        let handle = OpenAIServer::new(cfg, factory_for_echo("ok"), Arc::new(ModelCatalog::new()))
+            .start()
+            .expect("start");
+        let addr = handle.bound_address().to_string();
+        let mut s = TcpStream::connect(&addr).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let req = format!("GET /v1/models HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).unwrap();
+        s.flush().unwrap();
+        let mut r = BufReader::new(s);
+        let mut status_line = String::new();
+        r.read_line(&mut status_line).unwrap();
+        assert!(status_line.contains("200"), "got {status_line}");
+        let mut sink = String::new();
+        let _ = r.read_to_string(&mut sink);
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn handle_request_with_no_probe_override_routes_through_live_probe() {
+        // When `OpenAIServer::with_probe` is *not* called, the test
+        // dispatcher falls through to `LiveRamProbe`. Exercise that
+        // arm by spinning up a server with the default config and an
+        // empty catalog (memory check is a no-op for unknown models),
+        // then issuing a 200-able request.
+        let cfg = OpenAIServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            request_timeout: Duration::from_secs(2),
+        };
+        let handle = OpenAIServer::new(cfg, factory_for_echo("ok"), Arc::new(ModelCatalog::new()))
+            .start()
+            .expect("start");
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "unknown-model",
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": false
+        })
+        .to_string();
+        let (code, _h, resp_body) = post_capture_headers(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 200);
+        assert!(resp_body.contains("ok"));
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn live_ram_probe_reads_hardware_probe_value() {
+        // Exercise the production probe path so the `LiveRamProbe`
+        // impl isn't dead code at coverage time. The exact value
+        // depends on the host, but any non-broken probe returns
+        // *some* value reachable from `HardwareProbe::run()`. The
+        // assertion below pins the type-level invariant (call
+        // succeeds, returns u64) — a stronger numeric assertion
+        // would race with concurrent allocations on the CI host.
+        let live = LiveRamProbe;
+        let got = live.available_mib();
+        // Cross-check: the probe must round-trip through the same
+        // upstream call within a small tolerance. The exact value
+        // depends on the host's free memory and shifts moment-to-
+        // moment with allocator activity, so we just bound the delta
+        // at 4 GiB — wide enough to be flake-free under cargo test
+        // load, tight enough to catch an impl that returns garbage.
+        let expected = u64::from(HardwareProbe::run().ram_available_mib);
+        let delta = got.max(expected) - got.min(expected);
+        assert!(
+            delta <= 4 * 1_024,
+            "delta={delta} got={got} expected={expected}"
+        );
+    }
 }
