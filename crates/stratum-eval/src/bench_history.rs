@@ -112,6 +112,14 @@ pub fn append_history(
     Ok(entry)
 }
 
+// Single-writer assumption: `O_APPEND + write_all` is only atomic for
+// payloads ≤ `PIPE_BUF` (4096 bytes on Linux). A serialized
+// `BenchHistoryEntry` can exceed that with enough suites, so concurrent
+// writers would interleave bytes mid-line. The CI workflow guarantees
+// only one writer at a time via a global `concurrency: bench-floor`
+// group (see `.github/workflows/bench-floor.yml`). If this function
+// is ever called outside that workflow, wrap it in an OS file lock
+// (e.g. `fs2::flock`).
 fn append_jsonl_line(path: &Path, entry: &BenchHistoryEntry) -> Result<(), BenchHistoryError> {
     use std::io::Write;
     let mut line =

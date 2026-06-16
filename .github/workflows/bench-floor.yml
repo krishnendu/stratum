@@ -25,7 +25,10 @@ permissions:
   contents: write
 
 concurrency:
-  group: bench-floor-${{ github.ref }}
+  # Workflow-global group (NOT ref-scoped) so two simultaneous runs
+  # — e.g. one cron + one manual dispatch on a different ref — queue
+  # rather than race on the JSONL append in bench-history.
+  group: bench-floor
   cancel-in-progress: false
 
 jobs:
@@ -85,5 +88,7 @@ jobs:
             exit 0
           fi
           git add .github/bench-history
-          git commit -m "chore(bench): nightly floor result $(date -u +%Y-%m-%d)"
+          # `[skip ci]` so the auto-commit doesn't trigger sibling
+          # workflows that watch `push: branches: [main]`.
+          git commit -m "chore(bench): nightly floor result $(date -u +%Y-%m-%d) [skip ci]"
           git push origin HEAD:main

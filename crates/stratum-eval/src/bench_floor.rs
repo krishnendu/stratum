@@ -482,5 +482,14 @@ mod tests {
         let s = &res.suites[0];
         assert_eq!(s.suite_name, "baseline");
         assert!(s.total > 0);
+        // EchoProvider mirrors the prompt verbatim and every baseline
+        // case's expected_substrings is a subset of its prompt — so the
+        // floor must hit 100%. A regression in run_suite that silently
+        // failed cases would be invisible without this assertion.
+        assert_eq!(
+            s.passed, s.total,
+            "baseline must be 100% on the EchoProvider floor; got {}/{}",
+            s.passed, s.total
+        );
     }
 }
