@@ -2574,6 +2574,7 @@ dependencies = [
  "stratum-types",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

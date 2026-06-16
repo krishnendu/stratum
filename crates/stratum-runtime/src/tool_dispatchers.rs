@@ -1889,10 +1889,11 @@ fn sniff_audio_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"OggS") {
         return Some("audio/ogg");
     }
-    // MP3: either ID3v2 ("ID3") or a raw MPEG frame sync. The most
-    // common frame headers in the wild are 0xFFFB / 0xFFFA / 0xFFF3 /
-    // 0xFFF2 — sniff the high-bit-set sync plus the MPEG-1 layer-III
-    // marker in the second nibble.
+    // MP3: either ID3v2 ("ID3") or a raw MPEG frame sync. The mask
+    // `(bytes[1] & 0xE0) == 0xE0` matches any MPEG audio sync frame
+    // (MPEG-1/2/2.5, layers I/II/III), not just MPEG-1 layer-III
+    // (0xFFFB / 0xFFFA / 0xFFF3 / 0xFFF2). Used as a heuristic — false
+    // positives degrade to audio/mpeg rather than crashing.
     if bytes.starts_with(b"ID3") {
         return Some("audio/mpeg");
     }
