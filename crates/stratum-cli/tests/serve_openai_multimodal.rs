@@ -42,13 +42,42 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_stratum"))
+}
+
+/// Read a single line from a piped child stdout with a hard timeout.
+///
+/// `std`'s pipe-backed `ChildStdout` has no `set_read_timeout` analogue
+/// (`File`/pipe descriptors don't surface `SO_RCVTIMEO`), so a buggy
+/// daemon that emits an error on stderr but never writes to stdout
+/// would otherwise hang the test runner until the CI watchdog kills
+/// it. We hand the stdout off to a worker thread that does the actual
+/// `read_line`, then wait on a bounded `recv_timeout`. The worker
+/// returns the `BufReader` back so the caller can keep streaming.
+fn read_line_with_timeout(
+    stdout: ChildStdout,
+    timeout: Duration,
+) -> (BufReader<ChildStdout>, String) {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let res = reader.read_line(&mut line);
+        let _ = tx.send((reader, line, res));
+    });
+    let (reader, line, res) = rx
+        .recv_timeout(timeout)
+        .expect("child stdout read_line timed out");
+    res.expect("read startup line");
+    (reader, line)
 }
 
 /// Parse the bound address from a `--json` startup line. Returns the
@@ -85,11 +114,10 @@ fn spawn_openai_daemon(tmp: &TempDir, stop_after_ms: u64) -> (Child, String) {
 
     // Pull the startup JSON off stdout immediately so the child doesn't
     // block on a full pipe and so the bound address is known before we
-    // try to dial.
+    // try to dial. The 10 s ceiling guards against a daemon that fails
+    // before printing — see `read_line_with_timeout`.
     let stdout = child.stdout.take().expect("child stdout");
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read startup line");
+    let (_reader, line) = read_line_with_timeout(stdout, Duration::from_secs(10));
     let bound = bound_from_json(&line);
     (child, bound)
 }
@@ -334,5 +362,54 @@ fn openai_multimodal_array_with_only_text_part_round_trips() {
     assert!(
         assistant_text.contains("lone-text-part"),
         "echo missed the single-element text array: {assistant_text}"
+    );
+}
+
+#[test]
+fn openai_multimodal_request_with_unknown_part_type_returns_400() {
+    // The unit test in `openai.rs` covers serde-side rejection of
+    // unknown `type` discriminants on `content` parts. This test pins
+    // the HTTP-layer behaviour end-to-end: a live daemon must surface
+    // the rejection as `400 invalid_request`, not silently drop the
+    // unknown variant or 500 on a panic.
+    let tmp = TempDir::new().unwrap();
+    let (mut child, bound) = spawn_openai_daemon(&tmp, 8_000);
+    wait_for_accept(&bound, Instant::now() + Duration::from_secs(3));
+
+    // `video` is not a supported part type. The Phase 5 wire schema
+    // only knows `text` / `image_url` / `input_audio`.
+    let body = serde_json::json!({
+        "model": "echo",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video", "video_url": "https://example.invalid/clip.mp4"}
+                ]
+            }
+        ],
+        "stream": false
+    })
+    .to_string();
+
+    let (code, resp_body) = post_json(&bound, "/v1/chat/completions", &body);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(code, 400, "expected 400, got {code}: {resp_body}");
+    let v: serde_json::Value =
+        serde_json::from_str(&resp_body).expect("400 body must still be valid JSON");
+    // OpenAI clients key on `error.code` for retry classification;
+    // pin both `type` and `code` to `invalid_request` as documented in
+    // the `error_body_includes_code_field` unit test.
+    assert_eq!(
+        v["error"]["code"].as_str(),
+        Some("invalid_request"),
+        "error.code must be invalid_request: {resp_body}"
+    );
+    assert_eq!(
+        v["error"]["type"].as_str(),
+        Some("invalid_request"),
+        "error.type must be invalid_request: {resp_body}"
     );
 }
