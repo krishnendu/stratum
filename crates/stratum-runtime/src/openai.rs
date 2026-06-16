@@ -269,27 +269,39 @@ fn image_url_to_block(iu: &OpenAIImageUrl) -> Block {
     // check; exact byte counts come from a real decode later.
     if let Some(rest) = iu.url.strip_prefix("data:") {
         if let Some((mime_part, payload)) = rest.split_once(',') {
-            let mime = mime_part
-                .split(';')
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("image/png")
-                .to_string();
-            let encoded_len = payload.len();
-            let pad = payload.chars().rev().take_while(|c| *c == '=').count();
-            let bytes_est = encoded_len
-                .saturating_mul(3)
-                .saturating_div(4)
-                .saturating_sub(pad);
-            let bytes_u32 = u32::try_from(bytes_est).unwrap_or(u32::MAX);
-            return Block::Image {
-                mime,
-                data: ImageData::Inline {
-                    base64: payload.to_string(),
-                    bytes: bytes_u32,
-                },
-                alt: None,
-            };
+            // An empty payload is malformed (the comma is present but
+            // no base64 follows); fall through to the URL form so the
+            // caller gets a sane error rather than a zero-byte image.
+            if !payload.is_empty() {
+                let mime = mime_part
+                    .split(';')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("image/png")
+                    .to_string();
+                let encoded_len = payload.len();
+                // O(1) padding count instead of scanning the whole
+                // payload backwards — valid base64 has 0/1/2 trailing
+                // `=` chars only.
+                let pad: usize = if payload.ends_with("==") {
+                    2
+                } else {
+                    usize::from(payload.ends_with('='))
+                };
+                let bytes_est = encoded_len
+                    .saturating_mul(3)
+                    .saturating_div(4)
+                    .saturating_sub(pad);
+                let bytes_u32 = u32::try_from(bytes_est).unwrap_or(u32::MAX);
+                return Block::Image {
+                    mime,
+                    data: ImageData::Inline {
+                        base64: payload.to_string(),
+                        bytes: bytes_u32,
+                    },
+                    alt: None,
+                };
+            }
         }
     }
     // Fallback: plain URL reference. MIME is unknown — providers that
@@ -825,14 +837,29 @@ fn handle_request(
 }
 
 fn handle_chat_completions(mut req: tiny_http::Request, factory: &LoopFactory) {
-    // Read body.
+    // Cap request body at 20 MiB to bound the memory cost of a
+    // multimodal request that ships base64 image payloads inline.
+    // `.take(MAX + 1)` lets us tell "exactly at the cap" from
+    // "exceeded the cap" so a truncated body becomes 400 instead of
+    // silently corrupted.
+    const MAX_BODY_BYTES: u64 = 20 * 1024 * 1024;
     let mut body = String::new();
-    if let Err(e) = req.as_reader().read_to_string(&mut body) {
+    let mut limited = std::io::Read::take(req.as_reader(), MAX_BODY_BYTES + 1);
+    if let Err(e) = std::io::Read::read_to_string(&mut limited, &mut body) {
         respond_error_owned(
             req,
             400,
             "invalid_request",
             &format!("body read failed: {e}"),
+        );
+        return;
+    }
+    if body.len() as u64 > MAX_BODY_BYTES {
+        respond_error_owned(
+            req,
+            400,
+            "invalid_request",
+            "request body exceeds 20 MiB cap",
         );
         return;
     }
@@ -948,9 +975,15 @@ fn respond_stream(req: tiny_http::Request, agent: AgentLoop, ctx: TurnContext, m
     };
     push_sse(&mut sse, &first);
 
-    // Drain text deltas until the worker finishes.
+    // Drain text deltas until the worker drops `chunk_tx`. The worker
+    // sends every block on `chunk_tx` BEFORE sending `done_tx`, so
+    // breaking on the chunk-channel `Disconnected` is the
+    // race-free signal that there are no more chunks coming. Breaking
+    // earlier (e.g. on a `done_rx.try_recv` win during a `Timeout`
+    // tick) lost chunks that the worker had emitted in the same
+    // scheduling quantum as its final `done_tx.send`.
     loop {
-        match chunk_rx.recv_timeout(Duration::from_millis(200)) {
+        match chunk_rx.recv() {
             Ok(Block::Text { text }) => {
                 let chunk = OpenAIStreamChunk {
                     id: id.clone(),
@@ -968,38 +1001,16 @@ fn respond_stream(req: tiny_http::Request, agent: AgentLoop, ctx: TurnContext, m
                 };
                 push_sse(&mut sse, &chunk);
             }
-            Ok(_) => {} // ignore non-text blocks for now.
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if done_rx.try_recv().is_ok() {
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(_) => {}      // ignore non-text blocks for now.
+            Err(_) => break, // chunk_tx dropped → worker finished.
         }
     }
 
-    // Drain any remaining buffered chunks.
-    while let Ok(b) = chunk_rx.try_recv() {
-        if let Block::Text { text } = b {
-            let chunk = OpenAIStreamChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created,
-                model: model.clone(),
-                choices: vec![OpenAIStreamChoice {
-                    index: 0,
-                    delta: OpenAIDelta {
-                        role: None,
-                        content: Some(text),
-                    },
-                    finish_reason: None,
-                }],
-            };
-            push_sse(&mut sse, &chunk);
-        }
-    }
-
-    let result = done_rx.recv_timeout(Duration::from_secs(60));
+    // After the chunk channel closed, the worker has already sent its
+    // TurnResult on `done_tx`. `try_recv` is sufficient and makes the
+    // invariant visible — falling back to a long `recv_timeout` would
+    // imply we expect to wait, which we don't.
+    let result = done_rx.try_recv();
     let finish = match &result {
         Ok(r) => finish_reason_for(&r.outcome).to_string(),
         Err(_) => "error".to_string(),
