@@ -26,6 +26,7 @@
     reason = "this is a CLI binary; user-facing output is allowed"
 )]
 
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -63,33 +64,43 @@ struct Args {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    run(&args, &mut io::stdout(), &mut io::stderr())
+}
+
+fn run<O: Write, E: Write>(args: &Args, stdout: &mut O, stderr: &mut E) -> ExitCode {
     let report = match build_and_run(&args.target, &args.model) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("run-phase7-compare: {e}");
+            let _ = writeln!(stderr, "run-phase7-compare: {e}");
             return ExitCode::from(70);
         }
     };
 
     if let Some(path) = &args.out {
         if let Err(e) = write_report(&report, path) {
-            eprintln!("run-phase7-compare: write failed: {e}");
+            let _ = writeln!(stderr, "run-phase7-compare: write failed: {e}");
             return ExitCode::from(74);
         }
     }
 
     if args.markdown {
         let md = render_markdown_table(&report);
-        print!("{md}");
+        if let Err(e) = stdout.write_all(md.as_bytes()) {
+            let _ = writeln!(stderr, "run-phase7-compare: write failed: {e}");
+            return ExitCode::from(74);
+        }
     } else {
         let rendered = match serde_json::to_string_pretty(&report) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("run-phase7-compare: serialize failed: {e}");
+                let _ = writeln!(stderr, "run-phase7-compare: serialize failed: {e}");
                 return ExitCode::from(74);
             }
         };
-        println!("{rendered}");
+        if let Err(e) = writeln!(stdout, "{rendered}") {
+            let _ = writeln!(stderr, "run-phase7-compare: write failed: {e}");
+            return ExitCode::from(74);
+        }
     }
     ExitCode::SUCCESS
 }
@@ -102,4 +113,98 @@ fn build_and_run(target: &str, model: &str) -> Result<Phase7CompareReport, Phase
         target,
         &phase7_tasks(),
     ))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn default_args() -> Args {
+        Args {
+            target: "stratum".into(),
+            model: "echo".into(),
+            out: None,
+            markdown: false,
+        }
+    }
+
+    #[test]
+    fn build_and_run_echo_returns_five_tasks() {
+        let r = build_and_run("stratum", "echo").unwrap();
+        assert_eq!(r.tasks.len(), 5);
+        assert_eq!(r.target, "stratum");
+        assert_eq!(r.model, "echo");
+    }
+
+    #[test]
+    fn run_json_prints_to_stdout_and_returns_success() {
+        let args = default_args();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run(&args, &mut out, &mut err);
+        assert_eq!(code, ExitCode::SUCCESS);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("\"schema_version\""));
+        assert!(s.contains("\"target\": \"stratum\""));
+        assert!(err.is_empty(), "stderr should be empty on success");
+    }
+
+    #[test]
+    fn run_markdown_prints_table_to_stdout() {
+        let args = Args {
+            markdown: true,
+            ..default_args()
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run(&args, &mut out, &mut err);
+        assert_eq!(code, ExitCode::SUCCESS);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("Summary:"));
+        assert!(s.contains("| task |"));
+    }
+
+    #[test]
+    fn run_writes_json_when_out_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("report.json");
+        let args = Args {
+            out: Some(out_path.clone()),
+            ..default_args()
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run(&args, &mut out, &mut err);
+        assert_eq!(code, ExitCode::SUCCESS);
+        let raw = std::fs::read(&out_path).unwrap();
+        let back: Phase7CompareReport = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(back.tasks.len(), 5);
+    }
+
+    #[test]
+    fn run_returns_74_when_out_path_is_invalid() {
+        // Path with no file_name component (`..`) is rejected by write_report.
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("..");
+        let args = Args {
+            out: Some(bad),
+            ..default_args()
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run(&args, &mut out, &mut err);
+        assert_eq!(code, ExitCode::from(74));
+        let e = std::str::from_utf8(&err).unwrap();
+        assert!(e.contains("write failed"));
+    }
+
+    #[test]
+    fn args_parse_uses_defaults() {
+        let parsed = Args::try_parse_from(["run-phase7-compare"]).unwrap();
+        assert_eq!(parsed.target, "stratum");
+        assert_eq!(parsed.model, "echo");
+        assert!(parsed.out.is_none());
+        assert!(!parsed.markdown);
+    }
 }
