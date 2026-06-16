@@ -47,7 +47,6 @@
     clippy::option_if_let_else
 )]
 
-use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -925,129 +924,170 @@ fn respond_non_stream(
 
 /// SSE response for `stream: true`.
 ///
-/// **Known limitation**: `tiny_http` does not expose a streaming write
-/// API, so we accumulate every `data: {chunk}` line into a single
-/// buffered body and send one HTTP response. Clients see the full
-/// SSE event sequence delivered atomically when the turn completes
-/// — there is no progressive token rendering. The protocol shape is
-/// still correct (SSE lines + `data: [DONE]` footer) so OpenAI-shaped
-/// clients work end-to-end; only the latency-to-first-token gain
-/// from real streaming is missing. True chunked transfer + per-block
-/// cancellation lands when we swap the HTTP layer.
+/// Real chunked-transfer streaming: each `data: {chunk}\n\n` event is
+/// pushed to the response body as soon as it lands, so OpenAI-shaped
+/// clients see progressive token delivery rather than a single buffered
+/// response at end-of-turn.
+///
+/// Threading:
+/// * **LLM worker** runs `agent.run_turn_streaming(...)`, posting
+///   `Block::Text` deltas to `chunk_rx`.
+/// * **Formatter thread** drains `chunk_rx`, serialises each delta to
+///   an SSE event, and pushes the bytes onto `body_tx`. After the LLM
+///   worker finishes it also pushes the terminal `finish_reason` chunk
+///   and `data: [DONE]\n\n`, then drops `body_tx` to signal EOF.
+/// * **Dispatcher thread** (this function) hands `body_rx` to
+///   `tiny_http` via a [`StreamingSseReader`] adapter. With
+///   `data_length: None`, `tiny_http` selects `Transfer-Encoding:
+///   chunked` and drives `io::copy` on the reader, so each unblocked
+///   `Read::read` produces one HTTP chunk on the wire.
 fn respond_stream(req: tiny_http::Request, agent: AgentLoop, ctx: TurnContext, model_label: &str) {
     let id = format!("chatcmpl-{}", ctx.turn_id.0);
     let created = unix_now_secs();
     let model = model_label.to_string();
 
-    // Run the agent on a worker thread so we can drain chunks as they
-    // arrive. The receiver collects Block::Text deltas and we emit
-    // one SSE chunk per delta.
     let (chunk_tx, chunk_rx) = mpsc::channel::<Block>();
     let (done_tx, done_rx) = mpsc::channel::<TurnResult>();
     let cancel = CancelToken::new();
-    let worker = thread::spawn(move || {
+    let llm_worker = thread::spawn(move || {
         let result = agent.run_turn_streaming(ctx, &cancel, chunk_tx);
         let _ = done_tx.send(result);
     });
 
-    // Build the SSE body in memory. tiny_http's sync API doesn't
-    // expose a chunked writer hook, so we accumulate the events and
-    // emit a single response body. This still produces the exact
-    // wire format clients expect — `data: {...}\n\n` lines — and
-    // keeps the dispatcher sync. Real chunked streaming lands when
-    // the runtime grows an HTTP/1.1 hand-off API.
-    let mut sse = String::new();
-    // First chunk emits the `role: "assistant"` delta per the
-    // OpenAI streaming protocol.
-    let first = OpenAIStreamChunk {
-        id: id.clone(),
-        object: "chat.completion.chunk".to_string(),
-        created,
-        model: model.clone(),
-        choices: vec![OpenAIStreamChoice {
-            index: 0,
-            delta: OpenAIDelta {
-                role: Some("assistant".to_string()),
-                content: None,
-            },
-            finish_reason: None,
-        }],
-    };
-    push_sse(&mut sse, &first);
+    // Body channel — bytes per SSE event. Bounded by `mpsc`'s default
+    // unbounded queue; per-event payloads are small (one delta = one
+    // JSON line) so memory pressure is negligible.
+    let (body_tx, body_rx) = mpsc::channel::<Vec<u8>>();
 
-    // Drain text deltas until the worker drops `chunk_tx`. The worker
-    // sends every block on `chunk_tx` BEFORE sending `done_tx`, so
-    // breaking on the chunk-channel `Disconnected` is the
-    // race-free signal that there are no more chunks coming. Breaking
-    // earlier (e.g. on a `done_rx.try_recv` win during a `Timeout`
-    // tick) lost chunks that the worker had emitted in the same
-    // scheduling quantum as its final `done_tx.send`.
-    loop {
-        match chunk_rx.recv() {
-            Ok(Block::Text { text }) => {
-                let chunk = OpenAIStreamChunk {
-                    id: id.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created,
-                    model: model.clone(),
-                    choices: vec![OpenAIStreamChoice {
-                        index: 0,
-                        delta: OpenAIDelta {
-                            role: None,
-                            content: Some(text),
-                        },
-                        finish_reason: None,
-                    }],
-                };
-                push_sse(&mut sse, &chunk);
+    let id_for_fmt = id;
+    let model_for_fmt = model;
+    let formatter = thread::spawn(move || {
+        // First chunk emits the `role: "assistant"` delta per the
+        // OpenAI streaming protocol.
+        let first = OpenAIStreamChunk {
+            id: id_for_fmt.clone(),
+            object: "chat.completion.chunk".to_string(),
+            created,
+            model: model_for_fmt.clone(),
+            choices: vec![OpenAIStreamChoice {
+                index: 0,
+                delta: OpenAIDelta {
+                    role: Some("assistant".to_string()),
+                    content: None,
+                },
+                finish_reason: None,
+            }],
+        };
+        let _ = body_tx.send(sse_event_bytes(&first));
+
+        // Drain text deltas until the LLM worker drops `chunk_tx`.
+        // Same race ordering as before: every block is sent on
+        // `chunk_tx` BEFORE the worker's final `done_tx.send`, so
+        // `Disconnected` on `chunk_rx` is the only race-free signal
+        // that all blocks have been observed.
+        loop {
+            match chunk_rx.recv() {
+                Ok(Block::Text { text }) => {
+                    let chunk = OpenAIStreamChunk {
+                        id: id_for_fmt.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        created,
+                        model: model_for_fmt.clone(),
+                        choices: vec![OpenAIStreamChoice {
+                            index: 0,
+                            delta: OpenAIDelta {
+                                role: None,
+                                content: Some(text),
+                            },
+                            finish_reason: None,
+                        }],
+                    };
+                    let _ = body_tx.send(sse_event_bytes(&chunk));
+                }
+                Ok(_) => {}      // ignore non-text blocks for now.
+                Err(_) => break, // chunk_tx dropped → worker finished.
             }
-            Ok(_) => {}      // ignore non-text blocks for now.
-            Err(_) => break, // chunk_tx dropped → worker finished.
         }
-    }
 
-    // After the chunk channel closed, the worker is between dropping
-    // `chunk_tx` and sending on `done_tx`. Joining first guarantees
-    // the worker's `done_tx.send(result)` has completed (it's
-    // sequenced before the thread returns, which is what `join`
-    // observes), so `try_recv` is then guaranteed to find the result.
-    let _ = worker.join();
-    let result = done_rx.try_recv();
-    let finish = match &result {
-        Ok(r) => finish_reason_for(&r.outcome).to_string(),
-        Err(_) => "error".to_string(),
-    };
-    let terminal = OpenAIStreamChunk {
-        id,
-        object: "chat.completion.chunk".to_string(),
-        created,
-        model,
-        choices: vec![OpenAIStreamChoice {
-            index: 0,
-            delta: OpenAIDelta::default(),
-            finish_reason: Some(finish),
-        }],
-    };
-    push_sse(&mut sse, &terminal);
-    sse.push_str("data: [DONE]\n\n");
+        // Joining the worker guarantees its `done_tx.send(result)` has
+        // completed (sequenced before thread return), so `try_recv` is
+        // then guaranteed to find the result.
+        let _ = llm_worker.join();
+        let result = done_rx.try_recv();
+        let finish = match &result {
+            Ok(r) => finish_reason_for(&r.outcome).to_string(),
+            Err(_) => "error".to_string(),
+        };
+        let terminal = OpenAIStreamChunk {
+            id: id_for_fmt,
+            object: "chat.completion.chunk".to_string(),
+            created,
+            model: model_for_fmt,
+            choices: vec![OpenAIStreamChoice {
+                index: 0,
+                delta: OpenAIDelta::default(),
+                finish_reason: Some(finish),
+            }],
+        };
+        let _ = body_tx.send(sse_event_bytes(&terminal));
+        let _ = body_tx.send(b"data: [DONE]\n\n".to_vec());
+        // body_tx drops here → EOF on body_rx → io::copy returns →
+        // tiny_http finalises the chunked stream.
+    });
 
-    let body_bytes = sse.into_bytes();
-    let len = body_bytes.len();
-    let response = Response::new(
-        StatusCode(200),
-        vec![sse_header()],
-        Cursor::new(body_bytes),
-        Some(len),
-        None,
-    );
+    let reader = StreamingSseReader::new(body_rx);
+    // `data_length: None` triggers `Transfer-Encoding: chunked` in
+    // tiny_http (see `choose_transfer_encoding` in tiny_http 0.12).
+    let response = Response::new(StatusCode(200), vec![sse_header()], reader, None, None);
     let _ = req.respond(with_cors(response));
+    let _ = formatter.join();
 }
 
-fn push_sse(out: &mut String, chunk: &OpenAIStreamChunk) {
+/// Serialise a single [`OpenAIStreamChunk`] to its SSE wire bytes:
+/// `data: <json>\n\n`. Returns an empty vec only if serde fails, which
+/// is unreachable for the primitive-only `OpenAIStreamChunk` shape but
+/// kept as a non-panicking fallback.
+fn sse_event_bytes(chunk: &OpenAIStreamChunk) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
     if let Ok(json) = serde_json::to_string(chunk) {
-        out.push_str("data: ");
-        out.push_str(&json);
-        out.push_str("\n\n");
+        out.extend_from_slice(b"data: ");
+        out.extend_from_slice(json.as_bytes());
+        out.extend_from_slice(b"\n\n");
+    }
+    out
+}
+
+/// Blocking `Read` adapter over an `mpsc::Receiver<Vec<u8>>` that
+/// turns each pushed event into one or more HTTP chunks. `read()`
+/// blocks until the next event arrives; when the sender is dropped,
+/// `read()` returns `Ok(0)` (EOF) and `tiny_http` finalises the
+/// chunked transfer with the trailing zero-length chunk.
+struct StreamingSseReader {
+    rx: mpsc::Receiver<Vec<u8>>,
+    leftover: Vec<u8>,
+}
+
+impl StreamingSseReader {
+    const fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            rx,
+            leftover: Vec::new(),
+        }
+    }
+}
+
+impl std::io::Read for StreamingSseReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.leftover.is_empty() {
+            match self.rx.recv() {
+                Ok(bytes) => self.leftover = bytes,
+                Err(_) => return Ok(0), // disconnected → EOF
+            }
+        }
+        let n = std::cmp::min(buf.len(), self.leftover.len());
+        buf[..n].copy_from_slice(&self.leftover[..n]);
+        self.leftover.drain(..n);
+        Ok(n)
     }
 }
 
@@ -1347,6 +1387,116 @@ mod tests {
         assert_eq!(code, 404);
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(v["error"]["type"], "not_found");
+        let _ = handle.stop();
+    }
+
+    /// Variant of `post` that returns the raw response headers as a
+    /// single string in addition to the decoded body. Used by streaming
+    /// tests that need to assert wire-level details (e.g.
+    /// `Transfer-Encoding: chunked`).
+    fn post_with_headers(addr: &str, path: &str, body: &str) -> (u16, String, String) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpStream;
+        let mut s = TcpStream::connect(addr).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        s.flush().unwrap();
+        let mut r = BufReader::new(s);
+        let mut status_line = String::new();
+        r.read_line(&mut status_line).unwrap();
+        let code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            headers.push_str(&line);
+        }
+        let mut body_buf = Vec::new();
+        let _ = r.read_to_end(&mut body_buf);
+        // If chunked, decode by stripping the size lines + trailing
+        // zero-length chunk. For SSE we only need the payload bytes.
+        let body_str = if headers
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
+            decode_chunked(&body_buf)
+        } else {
+            String::from_utf8_lossy(&body_buf).to_string()
+        };
+        (code, headers, body_str)
+    }
+
+    /// Decode an HTTP/1.1 chunked-transfer body into the concatenated
+    /// payload bytes (best-effort; assumes well-formed chunks from
+    /// tiny_http).
+    fn decode_chunked(raw: &[u8]) -> String {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < raw.len() {
+            // Read the size line (hex digits terminated by CRLF).
+            let mut size_end = i;
+            while size_end < raw.len() - 1
+                && !(raw[size_end] == b'\r' && raw[size_end + 1] == b'\n')
+            {
+                size_end += 1;
+            }
+            let size_str = std::str::from_utf8(&raw[i..size_end]).unwrap_or("0");
+            let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
+            i = size_end + 2; // skip CRLF
+            if size == 0 {
+                break;
+            }
+            if i + size > raw.len() {
+                break;
+            }
+            out.extend_from_slice(&raw[i..i + size]);
+            i += size + 2; // skip chunk + CRLF
+        }
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    #[test]
+    fn http_chat_completion_stream_uses_chunked_transfer_encoding() {
+        // Real-streaming contract: the SSE response MUST use
+        // `Transfer-Encoding: chunked` so each `data: {...}\n\n` event
+        // flushes to wire as it lands. A buffered response would set
+        // Content-Length instead and defeat the streaming UX.
+        let handle = start_server("hi");
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "echo",
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": true
+        })
+        .to_string();
+        let (code, headers, resp_body) = post_with_headers(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 200);
+        let lh = headers.to_ascii_lowercase();
+        assert!(
+            lh.contains("transfer-encoding: chunked"),
+            "expected chunked TE, headers were: {headers}"
+        );
+        assert!(
+            !lh.contains("content-length:"),
+            "chunked responses must not also set Content-Length (RFC 7230 §3.3.3)"
+        );
+        // Wire-level decode landed the same SSE event sequence the
+        // original buffered path emitted.
+        assert!(resp_body.contains("data: "));
+        assert!(resp_body.contains("[DONE]"));
+        assert!(resp_body.contains("chat.completion.chunk"));
         let _ = handle.stop();
     }
 
@@ -2111,7 +2261,7 @@ mod tests {
     }
 
     #[test]
-    fn push_sse_writes_data_prefixed_event_with_blank_line_terminator() {
+    fn sse_event_bytes_emits_data_prefix_and_blank_line_terminator() {
         // The SSE protocol requires `data: <json>\n\n` per event. Cover
         // the helper directly so a serialisation refactor can't silently
         // drop the prefix/footer.
@@ -2129,16 +2279,58 @@ mod tests {
                 finish_reason: None,
             }],
         };
-        let mut buf = String::new();
-        push_sse(&mut buf, &chunk);
-        assert!(buf.starts_with("data: "));
-        assert!(buf.ends_with("\n\n"));
+        let bytes = sse_event_bytes(&chunk);
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        assert!(text.starts_with("data: "));
+        assert!(text.ends_with("\n\n"));
         // Round-trip: the body between the prefix and the blank line is
         // valid JSON of an OpenAIStreamChunk.
-        let payload = &buf["data: ".len()..buf.len() - 2];
+        let payload = &text["data: ".len()..text.len() - 2];
         let parsed: OpenAIStreamChunk = serde_json::from_str(payload).unwrap();
         assert_eq!(parsed.id, "chatcmpl-1");
         assert_eq!(parsed.choices[0].delta.role.as_deref(), Some("assistant"));
+    }
+
+    #[test]
+    fn streaming_sse_reader_blocks_until_event_arrives_and_eofs_on_drop() {
+        use std::io::Read;
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let mut reader = StreamingSseReader::new(rx);
+
+        // Push one event, then drop the sender.
+        tx.send(b"data: hi\n\n".to_vec()).unwrap();
+        drop(tx);
+
+        // First read returns the event bytes.
+        let mut buf = [0u8; 64];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"data: hi\n\n");
+
+        // Next read returns EOF (Ok(0)) because the sender dropped.
+        let n2 = reader.read(&mut buf).unwrap();
+        assert_eq!(n2, 0);
+    }
+
+    #[test]
+    fn streaming_sse_reader_splits_event_across_short_buffer() {
+        use std::io::Read;
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let mut reader = StreamingSseReader::new(rx);
+        tx.send(b"abcdefgh".to_vec()).unwrap();
+        drop(tx);
+
+        // Buffer of length 3 forces three reads to drain the 8-byte event.
+        let mut buf = [0u8; 3];
+        assert_eq!(reader.read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf, b"abc");
+        assert_eq!(reader.read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf, b"def");
+        assert_eq!(reader.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"gh");
+        // EOF.
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
     }
 
     #[test]
