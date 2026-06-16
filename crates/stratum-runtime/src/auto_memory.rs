@@ -525,7 +525,9 @@ mod tests {
 
     #[test]
     fn auto_memory_enabled_default_is_true() {
-        let _g = env_test_guard().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = env_test_guard()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior = std::env::var("STRATUM_AUTO_MEMORY").ok();
         std::env::remove_var("STRATUM_AUTO_MEMORY");
         let tmp = TempDir::new().unwrap();
@@ -538,7 +540,9 @@ mod tests {
 
     #[test]
     fn auto_memory_enabled_respects_config() {
-        let _g = env_test_guard().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = env_test_guard()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior = std::env::var("STRATUM_AUTO_MEMORY").ok();
         std::env::remove_var("STRATUM_AUTO_MEMORY");
         let tmp = TempDir::new().unwrap();
@@ -557,7 +561,9 @@ mod tests {
 
     #[test]
     fn auto_memory_disabled_via_env() {
-        let _g = env_test_guard().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = env_test_guard()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Save / restore so test order doesn't matter.
         let prior = std::env::var("STRATUM_AUTO_MEMORY").ok();
         std::env::set_var("STRATUM_AUTO_MEMORY", "0");
