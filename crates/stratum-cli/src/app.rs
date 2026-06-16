@@ -347,10 +347,11 @@ struct ConfigUnsetArgs {
 /// `--stop-after-ms` is primarily a test affordance: when set, a watchdog
 /// thread stops the server after the specified wall-clock window. When
 /// unset, the daemon polls an `AtomicBool` shutdown flag on a 100 ms
-/// cadence and exits cleanly on the next tick after the flag flips
-/// (currently only via internal handler-driven shutdown; signal-driven
-/// `Ctrl+C` plumbing lands once the broader runtime signal-policy story
-/// is settled — pinned to avoid pulling in the `ctrlc` crate).
+/// cadence and exits cleanly on the next tick after any of:
+/// * the in-protocol `stop` JSON-RPC method fires the handler's own flag, or
+/// * a SIGINT / SIGTERM / Ctrl-Break wired via [`install_shutdown_signals`]
+///   flips the shared flag (so an interactive Ctrl-C or supervisor TERM
+///   shuts the acceptor down cleanly without a `kill -9`).
 #[derive(Debug, Args)]
 struct ServeArgs {
     /// Filesystem path of a Unix-domain socket to bind. Mutually
@@ -4019,6 +4020,36 @@ fn resolve_serve_provider(
     Ok((factory, format!("llama-cpp:{slug}")))
 }
 
+/// Installs a process-wide SIGINT/SIGTERM/Ctrl-Break handler that flips
+/// `shutdown_flag` on the first signal. Idempotent across both `serve`
+/// paths via a one-shot `OnceLock`: subsequent calls are no-ops, so a
+/// daemon that switches from JSON-RPC to `OpenAI` mode at runtime would
+/// still observe the original flag (only relevant in tests, since each
+/// process binds one mode).
+///
+/// Returns `Err` only on a true install failure (signal slot already
+/// occupied by a non-stratum handler from a hosting process). Treated as
+/// non-fatal by callers — the `--stop-after-ms` watchdog and the
+/// in-protocol `stop` method remain available as shutdown surfaces.
+fn install_shutdown_signals(
+    shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), ctrlc::Error> {
+    use std::sync::OnceLock;
+    static INSTALLED: OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> = OnceLock::new();
+    // First caller wins: stash the flag and register the handler. Later
+    // callers in the same process (test reruns; future multi-mode work)
+    // just observe the cached flag.
+    if INSTALLED.get().is_some() {
+        return Ok(());
+    }
+    let flag_for_handler = shutdown_flag.clone();
+    ctrlc::set_handler(move || {
+        flag_for_handler.store(true, std::sync::atomic::Ordering::Relaxed);
+    })?;
+    let _ = INSTALLED.set(shutdown_flag);
+    Ok(())
+}
+
 /// Implements `stratum serve`. Build the `AgentServeHandler` against an
 /// `EchoProvider`-backed [`AgentFactory`] (or, with `--model <slug>` and the
 /// `provider-llama-cpp` feature, a real `LlamaCppProvider`-backed factory)
@@ -4027,11 +4058,10 @@ fn resolve_serve_provider(
 /// `--stop-after-ms` elapses or the handler's internal shutdown flag flips
 /// (via a `stop` JSON-RPC method).
 ///
-/// The function intentionally avoids the `ctrlc` crate — graceful
-/// signal-driven shutdown is deferred to a follow-up that settles the
-/// broader runtime signal policy. The current shutdown surface is the
-/// `--stop-after-ms` watchdog plus the in-protocol `stop` method, which is
-/// enough to exercise the wiring in tests.
+/// Shutdown surface: the `--stop-after-ms` watchdog, the in-protocol
+/// `stop` method (JSON-RPC mode only), and a SIGINT/SIGTERM/Ctrl-Break
+/// handler installed by [`install_shutdown_signals`] that flips the
+/// shared shutdown flag on the first signal.
 #[allow(
     clippy::too_many_lines,
     reason = "serve composes transcript store, provider resolution, OpenAI vs JSON-RPC dispatch, watchdog, and graceful shutdown — splitting fragments the call site"
@@ -4146,11 +4176,13 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 });
         }
-        // Known gap: without `--stop-after-ms` this loop runs until
-        // the user kills the process from outside (SIGINT/SIGKILL).
-        // Wiring an in-process Ctrl-C handler requires a new dep
-        // (signal-hook / ctrlc); deferred until the unified daemon
-        // shutdown story lands.
+        // Wire SIGINT/SIGTERM/Ctrl-Break to the same flag so an
+        // interactive Ctrl-C (or a supervisor's SIGTERM) shuts the
+        // acceptor down cleanly. Install failure is non-fatal —
+        // `--stop-after-ms` still works as the explicit shutdown surface.
+        if let Err(e) = install_shutdown_signals(shutdown_flag.clone()) {
+            tracing::warn!(error = %e, "shutdown signal install failed; relying on --stop-after-ms");
+        }
         while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -4219,6 +4251,12 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
                 thread::sleep(Duration::from_millis(ms));
                 flag.store(true, Ordering::Relaxed);
             });
+    }
+    // Wire SIGINT/SIGTERM/Ctrl-Break to the same flag so an
+    // interactive Ctrl-C (or a supervisor's SIGTERM) flips it just like
+    // the in-protocol `stop` method does. Install failure is non-fatal.
+    if let Err(e) = install_shutdown_signals(shutdown_flag.clone()) {
+        tracing::warn!(error = %e, "shutdown signal install failed; relying on --stop-after-ms / `stop`");
     }
 
     // Poll for either the stopwatch fire or the handler's own

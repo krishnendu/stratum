@@ -274,3 +274,59 @@ fn serve_accepts_jsonrpc_ping_over_tcp() {
         String::from_utf8_lossy(&stderr_join.join().expect("join stderr"))
     );
 }
+
+/// On Unix, a SIGTERM delivered to a running `stratum serve` process
+/// should flip the shared shutdown flag (via the `ctrlc`-installed
+/// handler) and cause the daemon to exit cleanly — *not* via the
+/// `--stop-after-ms` watchdog, which is set to a long fallback (30 s)
+/// purely to keep this test from hanging if the signal wiring breaks.
+/// The assertion that the child exits in well under that window proves
+/// the signal was what brought it down.
+#[cfg(unix)]
+#[test]
+fn serve_exits_cleanly_on_sigterm() {
+    let tmp = TempDir::new().unwrap();
+    let mut child = bin()
+        .args([
+            "--storage-root",
+            tmp.path().to_str().unwrap(),
+            "serve",
+            "--tcp-port",
+            "0",
+            "--stop-after-ms",
+            "30000",
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn stratum");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    // Wait for the startup line so we know the signal handler has been
+    // installed (it installs immediately before the poll loop begins).
+    let _ = read_startup_line(stdout, Duration::from_secs(10), &mut child);
+
+    let pid = child.id();
+    let kill_status = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("invoke kill -TERM");
+    assert!(kill_status.success(), "kill -TERM failed");
+
+    // Wait for shutdown. The poll cadence is 100 ms; allow generous
+    // slack for slow CI but assert the exit happens well before the
+    // 30s watchdog would fire — if it doesn't, the signal handler is
+    // not wired correctly.
+    let start = Instant::now();
+    let status = child.wait().expect("wait on child");
+    let elapsed = start.elapsed();
+    assert!(
+        status.success(),
+        "child exit on SIGTERM not clean: {status:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "child took {elapsed:?} to exit on SIGTERM — signal handler likely not wired"
+    );
+}
