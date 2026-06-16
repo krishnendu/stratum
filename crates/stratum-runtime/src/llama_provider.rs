@@ -379,7 +379,7 @@ impl LlamaCppProvider {
             tracing::warn!(
                 target: "stratum::llama_provider::vision",
                 image_count,
-                "mmproj_path is set but the `vision` cargo feature is off;                  rebuild with `--features vision` to enable real routing"
+                "mmproj_path is set but the `vision` cargo feature is off; rebuild with `--features vision` to enable real routing"
             );
             Ok(false)
         }
@@ -445,9 +445,15 @@ impl LlamaCppProvider {
         tracing::info!(
             target: "stratum::llama_provider::vision",
             image_count,
-            "encoded images through mmproj (chunk-eval insertion deferred)"
+            "decoded images through mmproj bitmap path; chunk-eval insertion DEFERRED — image bytes are NOT injected into the model context"
         );
-        Ok(true)
+        // Even under `--features vision` the chunk-eval +
+        // KV-cache-insertion step isn't wired yet. Returning `Ok(true)`
+        // would tell `preflight_attachments` to proceed with the text
+        // decode as if the image had been seen — a silent soundness
+        // lie. Return `Ok(false)` so the caller surfaces a clear
+        // `Block::Cancelled` to the user instead.
+        Ok(false)
     }
 
     /// Sampling temperature actually used for a request. Honors any
@@ -1221,7 +1227,7 @@ impl LlamaCppProvider {
             Ok(true) => None,
             Ok(false) => Some(Block::Cancelled {
                 reason: format!(
-                    "STRAT-E05XX vision routing unavailable: {} image attachment(s)                      present but no mmproj sidecar configured (build with                      `--features vision` and set `LlamaCppProviderConfig::mmproj_path`)",
+                    "STRAT-E05XX vision routing unavailable: {} image attachment(s) present but no mmproj sidecar configured (build with `--features vision` and set `LlamaCppProviderConfig::mmproj_path`)",
                     req.attachments.iter().filter(|b| b.is_image()).count()
                 ),
             }),
@@ -1595,7 +1601,19 @@ fn decode_base64(s: &str) -> Result<Vec<u8>, String> {
         }
     }
     let cleaned: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let stripped: Vec<u8> = cleaned.iter().copied().take_while(|&b| b != b'=').collect();
+    // Strict RFC 4648: `=` padding may only appear at the very end of
+    // the input and only one or two of them. Reject interior `=` so a
+    // corrupted base64 stream cannot silently yield a truncated byte
+    // slice (which would feed partial image bytes into mmproj).
+    let pad_count = cleaned.iter().rev().take_while(|&&b| b == b'=').count();
+    if pad_count > 2 {
+        return Err("base64: more than 2 trailing padding chars".to_string());
+    }
+    let body_len = cleaned.len().saturating_sub(pad_count);
+    if cleaned[..body_len].iter().any(|&b| b == b'=') {
+        return Err("base64: `=` only valid as trailing padding".to_string());
+    }
+    let stripped: Vec<u8> = cleaned.into_iter().take(body_len).collect();
     let mut buf = Vec::with_capacity(stripped.len() * 3 / 4);
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
