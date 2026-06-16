@@ -36,6 +36,7 @@ pub const COMMANDS: &[Command] = &[
     Command { name: "active", help: "Show currently active model." },
     Command { name: "agent", help: "Delegate next turn to a subagent. Usage: /agent <name> <task>." },
     Command { name: "agents", help: "List registered roles (multi-agent mode only)." },
+    Command { name: "audio", help: "Stage an audio file as an attachment on the next turn (Phase 5). Usage: /audio <path>." },
     Command { name: "budget", help: "Show last turn metrics (tokens · ms · tok/s · turn id)." },
     Command { name: "cancel", help: "Cancel the in-flight turn." },
     Command { name: "clear", help: "Clear the chat transcript." },

@@ -423,6 +423,24 @@ pub struct ChatState {
     // provider lands, these bytes are forwarded but ignored downstream
     // (EchoProvider / LlamaCppProvider drop them with a log line).
     pending_attachments: Vec<Block>,
+    /// Audio attachment queued by `/audio <path>` for the next
+    /// [`Self::submit`] (Phase 5 v2). Drained when the next user turn
+    /// fires; rendered as `[audio: <mime>]` in the transcript so the
+    /// user can see what's staged.
+    staged_audio: Option<Block>,
+    /// Whisper-derived transcript paired with [`Self::staged_audio`].
+    /// `Some(text)` after a successful subprocess run; `None` when the
+    /// whisper binary is absent or the run failed. `submit()` prepends
+    /// the text (or an "unavailable" sentinel) to the user's prompt.
+    staged_audio_transcript: Option<String>,
+    /// Whisper subprocess shim used to transcribe staged audio.
+    /// Construct-once-on-state, reused across `/audio` invocations.
+    whisper: stratum_runtime::whisper::WhisperSubprocess,
+    /// Attachments handed to the most recent [`Self::submit`] call.
+    /// Currently populated by `/audio <path>`; cleared on the *next*
+    /// submit so tests (and the future agent-loop attachments seam)
+    /// can inspect what just rode along with the prompt.
+    last_turn_attachments: Vec<Block>,
 }
 
 impl Default for ChatState {
@@ -522,6 +540,10 @@ impl ChatState {
             created_at: SystemTime::now(),
             current_role: None,
             pending_attachments: Vec::new(),
+            staged_audio: None,
+            staged_audio_transcript: None,
+            whisper: stratum_runtime::whisper::WhisperSubprocess::default(),
+            last_turn_attachments: Vec::new(),
         }
     }
 
@@ -1046,6 +1068,27 @@ impl ChatState {
     #[cfg(test)]
     fn input(&self) -> &str {
         &self.input
+    }
+
+    /// Attachments staged onto the most recent [`Self::submit`] call.
+    /// Empty until a `/audio <path>` is queued and submitted.
+    #[must_use]
+    pub fn last_turn_attachments(&self) -> &[Block] {
+        &self.last_turn_attachments
+    }
+
+    /// Currently-staged audio attachment, if any. `Some(Block::Audio { … })`
+    /// after `/audio <path>`; `None` after the next [`Self::submit`].
+    #[must_use]
+    pub const fn staged_audio(&self) -> Option<&Block> {
+        self.staged_audio.as_ref()
+    }
+
+    /// Currently-staged audio transcript, if any. `Some(text)` only when
+    /// whisper.cpp was available AND produced non-empty output.
+    #[must_use]
+    pub fn staged_audio_transcript(&self) -> Option<&str> {
+        self.staged_audio_transcript.as_deref()
     }
 
     /// Apply a keyboard event.
@@ -1794,6 +1837,10 @@ impl ChatState {
                 message: HELP_TEXT.to_string(),
             },
             "agents" => self.dispatch_agents(),
+            "audio" => {
+                let tail = trimmed.strip_prefix("audio").unwrap_or("").trim();
+                self.dispatch_audio(tail)
+            }
             "subagents" => self.dispatch_subagents(),
             "agent" => {
                 // `/agent <name> <task>` queues an explicit subagent
@@ -1968,6 +2015,113 @@ impl ChatState {
     /// Render the `/agents` palette command output.
     ///
     /// Without an installed [`AgentHandoff`] (single-loop mode), reject with
+    /// `/audio <path>` — stage an audio file for the next turn.
+    ///
+    /// Phase 5 v2 (`plan/05-multimodal.md` §Voice In). Parses the path
+    /// (with optional double-quoted form so spaces survive), refuses
+    /// absolute paths and `..` traversal at the surface — the
+    /// `ReadAudioToolDispatcher` already canonicalises and rejects
+    /// escapes, but the chat surface catches obvious mistakes early so
+    /// the error message is human-readable. Reads the bytes, sniffs the
+    /// MIME via [`ReadAudioToolDispatcher`], stages a `Block::Audio`
+    /// attachment, and (best-effort) invokes
+    /// [`WhisperSubprocess::transcribe`] so the next [`Self::submit`]
+    /// can prepend `"[transcript: …]"` to the prompt.
+    ///
+    /// On whisper-missing the audio attachment still rides; only the
+    /// transcript prefix becomes the "[audio transcript unavailable —
+    /// install whisper.cpp]" sentinel. This is intentional: the user
+    /// can still ask the model to reason about the *fact* that audio
+    /// was attached even when the host can't transcribe.
+    fn dispatch_audio(&mut self, raw_arg: &str) -> PaletteOutcome {
+        let Some(path_str) = parse_audio_path_arg(raw_arg) else {
+            return PaletteOutcome::Rejected {
+                message: "usage: /audio <path>".to_string(),
+            };
+        };
+        // Surface-level guard against absolute paths and `..` traversal.
+        // The dispatcher does its own canonical check; this one keeps
+        // the error legible at the chat seam.
+        let p = std::path::Path::new(&path_str);
+        if p.is_absolute()
+            || p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return PaletteOutcome::Rejected {
+                message: format!("path escapes workspace: {path_str}"),
+            };
+        }
+        // Canonicalize against cwd so a relative symlink that points
+        // outside the workspace (e.g. `audio -> /etc/shadow`) gets
+        // caught here too. Mirrors `FsReadToolDispatcher`'s policy.
+        let cwd = match std::env::current_dir() {
+            Ok(c) => c,
+            Err(e) => {
+                return PaletteOutcome::Rejected {
+                    message: format!("cannot resolve cwd: {e}"),
+                };
+            }
+        };
+        let canonical_cwd = cwd.canonicalize().unwrap_or(cwd.clone());
+        let canonical_target = match cwd.join(p).canonicalize() {
+            Ok(c) => c,
+            Err(e) => {
+                return PaletteOutcome::Rejected {
+                    message: format!("cannot canonicalize {path_str}: {e}"),
+                };
+            }
+        };
+        if !canonical_target.starts_with(&canonical_cwd) {
+            return PaletteOutcome::Rejected {
+                message: format!(
+                    "path escapes workspace via symlink: {path_str} -> {}",
+                    canonical_target.display()
+                ),
+            };
+        }
+        let bytes = match std::fs::read(p) {
+            Ok(b) => b,
+            Err(e) => {
+                return PaletteOutcome::Rejected {
+                    message: format!("cannot read {path_str}: {e}"),
+                };
+            }
+        };
+        let mime = sniff_audio_mime_chat(p, &bytes);
+        let b64 = base64_encode_chat(&bytes);
+        let byte_len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        let staged = Block::audio_inline_b64(mime.clone(), b64, byte_len);
+        self.staged_audio = Some(staged);
+
+        let transcript_msg = match self.whisper.transcribe(p) {
+            Ok(text) if !text.is_empty() => {
+                self.staged_audio_transcript = Some(text.clone());
+                format!("transcript: {}", trim_for_ack(&text, 80))
+            }
+            Ok(_) => {
+                // Whisper ran but produced an empty body — treat as
+                // unavailable so the user-visible message is honest.
+                self.staged_audio_transcript = None;
+                "transcript: (empty)".to_string()
+            }
+            Err(stratum_runtime::whisper::WhisperError::MissingBinary) => {
+                self.staged_audio_transcript = None;
+                "whisper not installed; audio queued without transcript".to_string()
+            }
+            Err(e) => {
+                self.staged_audio_transcript = None;
+                format!("whisper failed: {e}; audio queued without transcript")
+            }
+        };
+        PaletteOutcome::Acknowledged {
+            message: format!(
+                "audio staged ({} bytes, {}); {transcript_msg}",
+                bytes.len(),
+                mime,
+            ),
+        }
+    }
+
     /// a pointer to `--agents-dir`. Otherwise enumerate the registered roles
     /// via [`AgentHandoff::roles`] and tag the current driver role.
     fn dispatch_agents(&self) -> PaletteOutcome {
@@ -2942,9 +3096,38 @@ impl ChatState {
                 return;
             }
         }
-        let prompt = std::mem::take(&mut self.input);
+        let mut prompt = std::mem::take(&mut self.input);
         self.caret = 0;
         self.record_input_history(&prompt);
+        // Phase 5 v2: drain any audio attachment + transcript queued by
+        // `/audio <path>` BEFORE the user-turn pushes, so the displayed
+        // prompt + the transcript-augmented prompt are the same string.
+        // The transcript prefix degrades to an "unavailable" sentinel
+        // when whisper failed, preserving the assistant's awareness
+        // that audio was attached even on hosts without whisper.cpp.
+        let drained_audio = self.staged_audio.take();
+        let drained_transcript = self.staged_audio_transcript.take();
+        if drained_audio.is_some() {
+            // Fence the transcript in BEGIN/END markers + cap length at
+            // 8 KiB so a long whisper transcript can't blow the prompt
+            // budget AND a transcript that itself contains
+            // `[transcript: ...]` or instruction-like text can't be
+            // confused with operator-level context. The fence labels
+            // are distinctive enough that a downstream provider can
+            // tell user content from transcript content if it cares.
+            const TRANSCRIPT_CHAR_CAP: usize = 8 * 1024;
+            let prefix = if let Some(text) = drained_transcript.as_deref() {
+                let trimmed: String = text.chars().take(TRANSCRIPT_CHAR_CAP).collect();
+                format!("[AUDIO_TRANSCRIPT_BEGIN]\n{trimmed}\n[AUDIO_TRANSCRIPT_END]\n\n")
+            } else {
+                "[AUDIO_TRANSCRIPT_BEGIN]\n(unavailable — install whisper.cpp)\n[AUDIO_TRANSCRIPT_END]\n\n".to_string()
+            };
+            prompt = format!("{prefix}{prompt}");
+        }
+        // Record the audio attachment on the per-turn `last_turn_attachments`
+        // accessor — tests inspect this directly; future providers will read
+        // it via a typed `attachments` field on `GenerateRequest`.
+        self.last_turn_attachments = drained_audio.into_iter().collect();
         // Optimistic user-message display: push the user turn BEFORE the
         // provider runs so the next render shows it immediately. The
         // assistant turn lands after `run_turn` returns below.
@@ -3861,6 +4044,121 @@ fn parse_role_label(s: &str) -> Option<SuggestedRole> {
         "researcher" => Some(SuggestedRole::Researcher),
         _ => None,
     }
+}
+
+/// Parse the `<path>` argument off a `/audio <path>` invocation.
+///
+/// Accepts a bare token (no spaces) or a double-quoted form so paths
+/// with spaces survive. Returns `None` on empty input, an unterminated
+/// quote, or a quoted token followed by trailing garbage.
+fn parse_audio_path_arg(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        // Find the closing quote and refuse anything beyond it.
+        let end = rest.find('"')?;
+        let (inner, tail) = rest.split_at(end);
+        let tail_after_quote = tail.get(1..).unwrap_or("");
+        if !tail_after_quote.trim().is_empty() {
+            return None;
+        }
+        if inner.is_empty() {
+            return None;
+        }
+        return Some(inner.to_string());
+    }
+    // Bare token — refuse if it contains whitespace.
+    if trimmed.split_whitespace().count() > 1 {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Surface-level MIME sniffer used by the chat seam.
+///
+/// Mirrors the runtime's `sniff_audio_mime` (kept private to the
+/// dispatchers module). Repeated rather than re-exported because the
+/// chat shim runs *before* the dispatcher and needs the same answer
+/// for the staged `Block::Audio`'s `mime` field.
+fn sniff_audio_mime_chat(path: &std::path::Path, bytes: &[u8]) -> String {
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return "audio/wav".to_string();
+    }
+    if bytes.starts_with(b"fLaC") {
+        return "audio/flac".to_string();
+    }
+    if bytes.starts_with(b"OggS") {
+        return "audio/ogg".to_string();
+    }
+    if bytes.starts_with(b"ID3") {
+        return "audio/mpeg".to_string();
+    }
+    if bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0 {
+        return "audio/mpeg".to_string();
+    }
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("wav") => "audio/wav".to_string(),
+        Some("mp3") => "audio/mpeg".to_string(),
+        Some("flac") => "audio/flac".to_string(),
+        Some("ogg" | "oga") => "audio/ogg".to_string(),
+        Some("opus") => "audio/opus".to_string(),
+        Some("m4a") => "audio/mp4".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
+
+/// Standard-alphabet base64 (matches the runtime's inline implementation).
+fn base64_encode_chat(bytes: &[u8]) -> String {
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut iter = bytes.chunks_exact(3);
+    for chunk in &mut iter {
+        let b0 = chunk[0];
+        let b1 = chunk[1];
+        let b2 = chunk[2];
+        out.push(ALPHA[(b0 >> 2) as usize] as char);
+        out.push(ALPHA[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(ALPHA[(((b1 & 0b1111) << 2) | (b2 >> 6)) as usize] as char);
+        out.push(ALPHA[(b2 & 0b11_1111) as usize] as char);
+    }
+    let rem = iter.remainder();
+    match rem.len() {
+        0 => {}
+        1 => {
+            let b0 = rem[0];
+            out.push(ALPHA[(b0 >> 2) as usize] as char);
+            out.push(ALPHA[((b0 & 0b11) << 4) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let b0 = rem[0];
+            let b1 = rem[1];
+            out.push(ALPHA[(b0 >> 2) as usize] as char);
+            out.push(ALPHA[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+            out.push(ALPHA[((b1 & 0b1111) << 2) as usize] as char);
+            out.push('=');
+        }
+        _ => unreachable!(),
+    }
+    out
+}
+
+/// Trim `text` for display in a one-line palette acknowledgement.
+fn trim_for_ack(text: &str, max_chars: usize) -> String {
+    let one_line = text.replace(['\n', '\r'], " ");
+    if one_line.chars().count() <= max_chars {
+        return one_line;
+    }
+    let head: String = one_line.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 /// Concatenate every [`Block::Text`] payload in `blocks` in order. Used by
@@ -7194,6 +7492,26 @@ mod tests {
         path
     }
 
+    // ---- /audio palette command (Phase 5) -----------------------------
+
+    /// Process-wide lock so the cwd-mutating /audio tests don't race
+    /// each other when cargo runs the suite with the default thread
+    /// pool. Acquired BEFORE the chdir guard so the guard's Drop
+    /// always runs before the lock is released.
+    static AUDIO_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn write_wav_fixture(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        // Synthetic RIFF/WAVE prefix — recognised by the sniffer.
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&[0u8; 4]);
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(&[0u8; 4]);
+        let path = dir.join(name);
+        std::fs::write(&path, &bytes).expect("write fixture");
+        path
+    }
+
     #[test]
     fn image_palette_command_with_no_arg_is_rejected() {
         let mut s = state();
@@ -7205,9 +7523,6 @@ mod tests {
     #[test]
     fn image_palette_command_with_missing_path_is_rejected() {
         let mut s = state();
-        // Use an obviously-nonexistent path inside a tempdir so the test
-        // is isolated from whatever happens to live at /no/such/file on
-        // the host.
         let tmp = tempfile::tempdir().expect("tempdir");
         let bogus = tmp.path().join("nope.png");
         let cmd = format!("/image {}", bogus.display());
@@ -7229,7 +7544,6 @@ mod tests {
         assert!(message.contains("image/png"), "message: {message}");
         assert!(message.contains(&path.display().to_string()));
         assert_eq!(s.pending_attachment_count(), 1);
-        // Verify the staged block shape.
         let blocks = s.pending_attachments();
         assert!(matches!(
             &blocks[0],
@@ -7238,6 +7552,40 @@ mod tests {
                 data: stratum_types::ImageData::Inline { .. },
                 ..
             } if mime == "image/png"
+        ));
+    }
+
+    #[test]
+    fn audio_palette_command_appears_in_catalog() {
+        assert!(crate::palette::COMMANDS.iter().any(|c| c.name == "audio"));
+    }
+
+    #[test]
+    fn audio_dispatch_stages_block_audio() {
+        let _lock = AUDIO_CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let prev = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(tmp.path()).expect("chdir");
+        let _guard = scopeguard_chdir(prev);
+
+        write_wav_fixture(tmp.path(), "voice.wav");
+        let mut s = state();
+        let outcome = s.execute_palette_command("/audio voice.wav");
+        match outcome {
+            PaletteOutcome::Acknowledged { message } => {
+                assert!(message.contains("audio staged"), "got: {message}");
+                assert!(message.contains("audio/wav"), "got: {message}");
+            }
+            PaletteOutcome::Rejected { message } => panic!("rejected: {message}"),
+        }
+        let staged = s
+            .staged_audio()
+            .expect("staged audio block present after /audio");
+        assert!(matches!(
+            staged,
+            Block::Audio { mime, .. } if mime == "audio/wav"
         ));
     }
 
@@ -7404,5 +7752,156 @@ mod tests {
             0,
             "attachments must drain on failure too — they belong to the user's turn, not to a retry"
         );
+    }
+    fn audio_dispatch_rejects_path_traversal() {
+        let mut s = state();
+        let outcome = s.execute_palette_command("/audio ../etc/passwd");
+        assert!(matches!(outcome, PaletteOutcome::Rejected { .. }));
+        assert!(s.staged_audio().is_none());
+    }
+
+    #[test]
+    fn audio_dispatch_rejects_missing_arg() {
+        let mut s = state();
+        let outcome = s.execute_palette_command("/audio");
+        assert!(
+            matches!(outcome, PaletteOutcome::Rejected { message } if message.contains("usage"))
+        );
+    }
+
+    #[test]
+    fn audio_then_submit_prepends_transcript_marker_and_records_attachment() {
+        // The whisper binary is virtually never on CI hosts, so we
+        // exercise the unavailable-sentinel branch and confirm both:
+        //   (1) the User turn carries the unavailable marker that
+        //       stands in for "[transcript: …]" on hosts with whisper,
+        //   (2) the per-turn attachments accessor surfaces the staged
+        //       Block::Audio for the future agent-loop seam.
+        let _lock = AUDIO_CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let prev = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(tmp.path()).expect("chdir");
+        let _guard = scopeguard_chdir(prev);
+
+        write_wav_fixture(tmp.path(), "voice.wav");
+        let mut s = state();
+        // Force a clearly-missing binary so the test is deterministic
+        // even on hosts that DO have whisper on PATH.
+        s.whisper = stratum_runtime::whisper::WhisperSubprocess::new()
+            .with_binary("stratum_no_such_whisper_xyzzy_test");
+        let outcome = s.execute_palette_command("/audio voice.wav");
+        assert!(matches!(outcome, PaletteOutcome::Acknowledged { .. }));
+        // Type a prompt.
+        for c in "summarize what I said".chars() {
+            s.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        // The user turn includes the unavailable sentinel and the
+        // typed text.
+        let user_turn = s
+            .transcript()
+            .iter()
+            .find_map(|t| match t {
+                Turn::User(text) => Some(text.clone()),
+                _ => None,
+            })
+            .expect("user turn");
+        // Reviewer feedback: the prefix now uses fenced
+        // AUDIO_TRANSCRIPT_BEGIN/END markers + "(unavailable — install
+        // whisper.cpp)" body so injection can't masquerade as instructions.
+        assert!(
+            user_turn.contains("AUDIO_TRANSCRIPT_BEGIN"),
+            "got: {user_turn}",
+        );
+        assert!(
+            user_turn.contains("unavailable") && user_turn.contains("install whisper.cpp"),
+            "got: {user_turn}",
+        );
+        assert!(
+            user_turn.contains("summarize what I said"),
+            "got: {user_turn}",
+        );
+        // The attachments accessor surfaces the staged Block::Audio.
+        let attachments = s.last_turn_attachments();
+        assert_eq!(attachments.len(), 1, "exactly one staged attachment");
+        assert!(matches!(&attachments[0], Block::Audio { mime, .. } if mime == "audio/wav"));
+        // After submit, staged_audio drained back to empty.
+        assert!(s.staged_audio().is_none());
+    }
+
+    #[test]
+    fn parse_audio_path_arg_handles_quoted_paths() {
+        assert_eq!(parse_audio_path_arg("voice.wav"), Some("voice.wav".into()));
+        assert_eq!(
+            parse_audio_path_arg("\"my clip.wav\""),
+            Some("my clip.wav".into()),
+        );
+        assert_eq!(parse_audio_path_arg(""), None);
+        assert_eq!(parse_audio_path_arg("  "), None);
+        assert_eq!(parse_audio_path_arg("a b c"), None);
+        assert_eq!(parse_audio_path_arg("\"unterminated"), None);
+        assert_eq!(parse_audio_path_arg("\"\""), None);
+        assert_eq!(parse_audio_path_arg("\"clip.wav\" trailing"), None);
+    }
+
+    #[test]
+    fn sniff_audio_mime_chat_covers_known_formats() {
+        let mut riff = b"RIFF\0\0\0\0WAVE".to_vec();
+        riff.extend_from_slice(&[0u8; 4]);
+        assert_eq!(
+            sniff_audio_mime_chat(std::path::Path::new("x"), &riff),
+            "audio/wav",
+        );
+        assert_eq!(
+            sniff_audio_mime_chat(std::path::Path::new("x"), b"fLaC--"),
+            "audio/flac",
+        );
+        assert_eq!(
+            sniff_audio_mime_chat(std::path::Path::new("x"), b"OggS--"),
+            "audio/ogg",
+        );
+        assert_eq!(
+            sniff_audio_mime_chat(std::path::Path::new("x"), b"ID3-----"),
+            "audio/mpeg",
+        );
+        assert_eq!(
+            sniff_audio_mime_chat(std::path::Path::new("x"), &[0xFF, 0xFB, 0x00, 0x00]),
+            "audio/mpeg",
+        );
+        // Unknown bytes + unknown extension → octet-stream.
+        assert_eq!(
+            sniff_audio_mime_chat(std::path::Path::new("noise.bin"), b"???"),
+            "application/octet-stream",
+        );
+        // Unknown bytes + known extension → extension wins.
+        assert_eq!(
+            sniff_audio_mime_chat(std::path::Path::new("clip.opus"), b"???"),
+            "audio/opus",
+        );
+    }
+
+    #[test]
+    fn trim_for_ack_collapses_and_truncates() {
+        assert_eq!(trim_for_ack("short", 10), "short");
+        assert_eq!(trim_for_ack("multi\nline", 80), "multi line");
+        let long = "x".repeat(200);
+        let trimmed = trim_for_ack(&long, 10);
+        assert!(trimmed.ends_with('…'));
+        assert!(trimmed.chars().count() <= 10);
+    }
+
+    /// RAII helper so a panicking test still restores the previous CWD.
+    fn scopeguard_chdir(prev: std::path::PathBuf) -> ChdirRestore {
+        ChdirRestore { prev }
+    }
+    struct ChdirRestore {
+        prev: std::path::PathBuf,
+    }
+    impl Drop for ChdirRestore {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
     }
 }

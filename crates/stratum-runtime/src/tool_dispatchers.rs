@@ -1464,9 +1464,126 @@ impl ToolDispatcher for ReadImageToolDispatcher {
     }
 }
 
+/// `ToolDispatcher` for `read_audio`.
+///
+/// Mirrors [`ReadImageToolDispatcher`] for audio attachments: reads
+/// bytes inside the workspace root, sniffs the MIME from magic bytes
+/// (WAV / MP3 / FLAC / OGG), base64-encodes, and returns the trio
+/// `{path, mime, data_base64}` so a higher layer can stage a
+/// `Block::Audio` for the next turn.
+///
+/// Unknown formats degrade to `application/octet-stream` rather than
+/// erroring — Phase 5 v2 treats the audio attachment seam as best-effort
+/// (the typed transcript path is the durable fallback).
+#[derive(Debug, Clone)]
+pub struct ReadAudioToolDispatcher {
+    id: String,
+    root: PathBuf,
+    max_bytes: u64,
+}
+
+impl ReadAudioToolDispatcher {
+    /// Stable id used to look this dispatcher up in the registry.
+    pub const ID: &'static str = "read_audio";
+    /// Default cap on a single audio read: 25 MiB. Voice clips on the
+    /// resident tier are typically well under this; lift via the
+    /// struct-update pattern in tests if a larger payload is needed.
+    pub const DEFAULT_MAX_BYTES: u64 = 25 << 20;
+
+    /// Build a new dispatcher anchored at `root`.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            id: Self::ID.to_string(),
+            root,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+        }
+    }
+
+    fn err(&self, code: &str, message: impl Into<String>) -> ToolResult {
+        ToolResult::Err {
+            tool_id: self.id.clone(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+impl ToolDispatcher for ReadAudioToolDispatcher {
+    fn invoke(&self, inv: &ToolInvocation) -> ToolResult {
+        let requested = match inv.args.get("path") {
+            Some(Value::String(s)) if !s.is_empty() => PathBuf::from(s),
+            _ => return self.err(E_DISPATCH_MISSING_ARG, "read_audio requires `path`"),
+        };
+        if requested.is_absolute()
+            || requested
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+
+        let canonical_root = match self.root.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                return self.err(
+                    E_DISPATCH_READ_FAILED,
+                    format!("workspace root unreadable: {e}"),
+                )
+            }
+        };
+        let joined = canonical_root.join(&requested);
+        let canonical_target = match joined.canonicalize() {
+            Ok(p) => p,
+            Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("path unreadable: {e}")),
+        };
+        if !canonical_target.starts_with(&canonical_root) {
+            return self.err(E_DISPATCH_PATH_ESCAPE, "path escapes workspace root");
+        }
+
+        let metadata = match std::fs::metadata(&canonical_target) {
+            Ok(m) => m,
+            Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("stat failed: {e}")),
+        };
+        if metadata.len() > self.max_bytes {
+            return self.err(
+                E_DISPATCH_SIZE_CAP,
+                format!("audio exceeds {} byte cap", self.max_bytes),
+            );
+        }
+        let bytes = match std::fs::read(&canonical_target) {
+            Ok(b) => b,
+            Err(e) => return self.err(E_DISPATCH_READ_FAILED, format!("read failed: {e}")),
+        };
+        let mime =
+            sniff_audio_mime(&canonical_target, &bytes).unwrap_or("application/octet-stream");
+        let raw_len = bytes.len() as u64;
+        let encoded = base64_encode(&bytes);
+        let body = serde_json::json!({
+            "path": canonical_target.display().to_string(),
+            "mime": mime,
+            "data_base64": encoded,
+        });
+        ToolResult::Ok {
+            tool_id: self.id.clone(),
+            body,
+            bytes: raw_len,
+        }
+    }
+
+    fn supports(&self, tool_id: &str) -> bool {
+        tool_id == Self::ID
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 /// Build the default dispatcher registry used by the agent loop.
 /// Includes: `fs.read`, `fs.write`, `fs.edit`, `fs.tree`, `grep`,
-/// `glob`, `shell.exec`, `git.diff`, `git.log`, `read_image`.
+/// `glob`, `shell.exec`, `git.diff`, `git.log`, `read_image`,
+/// `read_audio`.
 #[must_use]
 pub fn default_dispatchers(
     workspace_root: PathBuf,
@@ -1483,7 +1600,8 @@ pub fn default_dispatchers(
     let shell = ShellToolDispatcher::new(sandbox, base_spec);
     let git_diff = GitDiffToolDispatcher::new(workspace_root.clone());
     let git_log = GitLogToolDispatcher::new(workspace_root.clone());
-    let read_image = ReadImageToolDispatcher::new(workspace_root);
+    let read_image = ReadImageToolDispatcher::new(workspace_root.clone());
+    let read_audio = ReadAudioToolDispatcher::new(workspace_root);
     let _ = reg.register(Box::new(fs_read));
     let _ = reg.register(Box::new(fs_write));
     let _ = reg.register(Box::new(fs_edit));
@@ -1494,6 +1612,7 @@ pub fn default_dispatchers(
     let _ = reg.register(Box::new(git_diff));
     let _ = reg.register(Box::new(git_log));
     let _ = reg.register(Box::new(read_image));
+    let _ = reg.register(Box::new(read_audio));
     reg
 }
 
@@ -1502,7 +1621,11 @@ pub fn default_dispatchers(
 /// Resolve `binary` against `PATH`, returning the first directory entry
 /// that exists as a regular file. Mirrors the lookup the platform shell
 /// would do, without any of the more exotic features (aliases, globs).
-fn which_in_path(binary: &str) -> Option<PathBuf> {
+///
+/// Crate-visible: shared with [`crate::whisper`] which uses the same
+/// "bare-name, walk PATH" contract to detect the optional whisper.cpp
+/// binary.
+pub(crate) fn which_in_path(binary: &str) -> Option<PathBuf> {
     if binary.contains('/') {
         // Refuse fully-qualified paths: the allowlist contract is a
         // bare name. This is also a defense-in-depth against bypasses
@@ -1744,6 +1867,50 @@ pub fn sniff_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
         Some("webp") => Some("image/webp"),
         Some("bmp") => Some("image/bmp"),
         Some("svg") => Some("image/svg+xml"),
+        _ => None,
+    }
+}
+
+/// Sniff a small set of audio MIME types from magic bytes, falling back
+/// to the path extension if the leading bytes are ambiguous. Returns
+/// `None` when neither path matches — the caller folds that into
+/// `application/octet-stream`.
+fn sniff_audio_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
+    // WAV: "RIFF" .... "WAVE" at offset 8. Check both fences so we
+    // don't collide with WebP (which is also a RIFF container).
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+    // FLAC: "fLaC" stream marker.
+    if bytes.starts_with(b"fLaC") {
+        return Some("audio/flac");
+    }
+    // OGG: "OggS" page header.
+    if bytes.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+    // MP3: either ID3v2 ("ID3") or a raw MPEG frame sync. The most
+    // common frame headers in the wild are 0xFFFB / 0xFFFA / 0xFFF3 /
+    // 0xFFF2 — sniff the high-bit-set sync plus the MPEG-1 layer-III
+    // marker in the second nibble.
+    if bytes.starts_with(b"ID3") {
+        return Some("audio/mpeg");
+    }
+    if bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0 {
+        return Some("audio/mpeg");
+    }
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("wav") => Some("audio/wav"),
+        Some("mp3") => Some("audio/mpeg"),
+        Some("flac") => Some("audio/flac"),
+        Some("ogg" | "oga") => Some("audio/ogg"),
+        Some("opus") => Some("audio/opus"),
+        Some("m4a") => Some("audio/mp4"),
         _ => None,
     }
 }
@@ -2293,7 +2460,7 @@ mod tests {
             passthrough_spec_in(tmp.path()),
         );
         let ids = reg.ids();
-        assert_eq!(ids.len(), 10);
+        assert_eq!(ids.len(), 11);
         assert!(ids.contains(&"fs.read"));
         assert!(ids.contains(&"fs.write"));
         assert!(ids.contains(&"fs.edit"));
@@ -2304,6 +2471,7 @@ mod tests {
         assert!(ids.contains(&"git.diff"));
         assert!(ids.contains(&"git.log"));
         assert!(ids.contains(&"read_image"));
+        assert!(ids.contains(&"read_audio"));
     }
 
     #[test]
@@ -2696,6 +2864,158 @@ mod tests {
         assert_eq!(sniff_image_mime(&p, b"<svg></svg>"), Some("image/svg+xml"));
         let p = PathBuf::from("unknown.bin");
         assert_eq!(sniff_image_mime(&p, b"random"), None);
+    }
+
+    // ---- ReadAudioToolDispatcher / sniff_audio_mime tests --------------
+
+    fn wav_header() -> Vec<u8> {
+        // 16-byte synthetic RIFF/WAVE prefix is enough for the sniffer
+        // and keeps the on-disk fixture well under the 8 KiB cap the
+        // task forbids us from exceeding for binary fixtures.
+        let mut v = Vec::with_capacity(16);
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&[0u8; 4]); // chunk size (don't care)
+        v.extend_from_slice(b"WAVE");
+        v.extend_from_slice(&[0u8; 4]); // pad to 16 bytes
+        v
+    }
+
+    #[test]
+    fn read_audio_sniffs_wav() {
+        assert_eq!(
+            sniff_audio_mime(Path::new("x"), &wav_header()),
+            Some("audio/wav"),
+        );
+    }
+
+    #[test]
+    fn read_audio_sniffs_mp3_id3() {
+        let mut bytes = b"ID3\x03\x00".to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 8));
+        assert_eq!(sniff_audio_mime(Path::new("x"), &bytes), Some("audio/mpeg"));
+    }
+
+    #[test]
+    fn read_audio_sniffs_mp3_frame_sync() {
+        // 0xFFFB matches the high 11-bit sync used by MPEG-1 layer-III.
+        let bytes = vec![0xFF, 0xFB, 0x90, 0x00];
+        assert_eq!(sniff_audio_mime(Path::new("x"), &bytes), Some("audio/mpeg"));
+    }
+
+    #[test]
+    fn read_audio_sniffs_flac() {
+        let bytes = b"fLaCxx".to_vec();
+        assert_eq!(sniff_audio_mime(Path::new("x"), &bytes), Some("audio/flac"));
+    }
+
+    #[test]
+    fn read_audio_sniffs_ogg() {
+        let bytes = b"OggS\x00".to_vec();
+        assert_eq!(sniff_audio_mime(Path::new("x"), &bytes), Some("audio/ogg"));
+    }
+
+    #[test]
+    fn read_audio_falls_back_to_extension() {
+        // No magic match, but a known extension wins.
+        assert_eq!(
+            sniff_audio_mime(Path::new("clip.opus"), b"???"),
+            Some("audio/opus"),
+        );
+        assert_eq!(
+            sniff_audio_mime(Path::new("voice.m4a"), b"???"),
+            Some("audio/mp4"),
+        );
+    }
+
+    #[test]
+    fn read_audio_unknown_bytes_silent_fallback_via_dispatcher() {
+        // Neither magic bytes nor extension match — the dispatcher
+        // folds the missing sniff into "application/octet-stream"
+        // rather than erroring. This is the documented contract for
+        // the audio attachment seam.
+        let tmp = TempDir::new().expect("tmp");
+        fs::write(tmp.path().join("noise.bin"), b"random-bytes").expect("write");
+        let d = ReadAudioToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), serde_json::json!("noise.bin"));
+        let inv = make_invocation("read_audio", args);
+        let (_, body, _) = assert_ok(d.invoke(&inv));
+        assert_eq!(
+            body.get("mime").and_then(|v| v.as_str()),
+            Some("application/octet-stream"),
+        );
+    }
+
+    #[test]
+    fn read_audio_returns_base64_and_sniffs_wav() {
+        let tmp = TempDir::new().expect("tmp");
+        let header = wav_header();
+        fs::write(tmp.path().join("hi.wav"), &header).expect("write");
+        let d = ReadAudioToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), serde_json::json!("hi.wav"));
+        let inv = make_invocation("read_audio", args);
+        match d.invoke(&inv) {
+            ToolResult::Ok { body, .. } => {
+                assert_eq!(body.get("mime").and_then(|v| v.as_str()), Some("audio/wav"));
+                let b64 = body
+                    .get("data_base64")
+                    .and_then(|v| v.as_str())
+                    .expect("data_base64");
+                // "RIFF" base64-encodes to "UklGRg" — first six chars
+                // are stable across the synthetic prefix.
+                assert!(b64.starts_with("UklGR"));
+            }
+            ToolResult::Err { code, message, .. } => {
+                panic!("expected Ok, got Err({code}): {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn read_audio_rejects_path_traversal() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = ReadAudioToolDispatcher::new(tmp.path().to_path_buf());
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), serde_json::json!("../etc/passwd"));
+        let inv = make_invocation("read_audio", args);
+        assert_err_code(d.invoke(&inv), E_DISPATCH_PATH_ESCAPE);
+    }
+
+    #[test]
+    fn read_audio_rejects_oversize() {
+        let tmp = TempDir::new().expect("tmp");
+        // 16 KiB synthetic — exceeds the 1 KiB cap we set below but
+        // stays well under the 8 KiB on-disk binary fixture ceiling
+        // for committed test data. (This file is per-test scratch in
+        // a tempdir, never committed.)
+        let blob = vec![0u8; 16 * 1024];
+        fs::write(tmp.path().join("big.wav"), &blob).expect("write");
+        let d = ReadAudioToolDispatcher {
+            max_bytes: 1024,
+            ..ReadAudioToolDispatcher::new(tmp.path().to_path_buf())
+        };
+        let mut args = BTreeMap::new();
+        args.insert("path".to_string(), serde_json::json!("big.wav"));
+        let inv = make_invocation("read_audio", args);
+        assert_err_code(d.invoke(&inv), E_DISPATCH_SIZE_CAP);
+    }
+
+    #[test]
+    fn read_audio_missing_path_returns_missing_arg() {
+        let tmp = TempDir::new().expect("tmp");
+        let d = ReadAudioToolDispatcher::new(tmp.path().to_path_buf());
+        let inv = make_invocation("read_audio", BTreeMap::new());
+        assert_err_code(d.invoke(&inv), E_DISPATCH_MISSING_ARG);
+    }
+
+    #[test]
+    fn read_audio_id_supports_and_debug() {
+        let d = ReadAudioToolDispatcher::new(PathBuf::from("/"));
+        assert_eq!(d.id(), "read_audio");
+        assert!(d.supports("read_audio"));
+        assert!(!d.supports("read_image"));
+        assert!(format!("{d:?}").contains("ReadAudioToolDispatcher"));
     }
 
     // ---- sniff_image_mime: every magic-byte branch -------------------
