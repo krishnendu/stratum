@@ -46,7 +46,7 @@ jobs:
 
       - name: Cache GGUF model file
         id: gguf-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/stratum-models
           # Key the cache by the expected SHA so a change in the model

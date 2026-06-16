@@ -31,7 +31,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake build-essential
       - name: Cache GGUF
         id: gguf-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/stratum-models
           key: stratum-llama-gguf-${{ env.STRATUM_LLAMA_MODEL_SHA256 }}
