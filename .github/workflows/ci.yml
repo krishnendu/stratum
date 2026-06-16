@@ -129,7 +129,11 @@ jobs:
         # `stratum-tui` + `stratum-backend-local` (workspace-internal
         # crates housing the moved chat.rs whose render/event-loop
         # paths are TTY-bound; same carve-out as the original CLI
-        # chat::run + chat::event_loop). See
+        # chat::run + chat::event_loop). Excludes `mic.rs` via
+        # `--ignore-filename-regex`: the file mixes pure-data helpers
+        # (covered) with cpal-bound methods (SIGSEGV under cargo test on
+        # headless CI), and the OS-audio half cannot be unit-tested
+        # without a synthetic device backend; see
         # `docs/coverage-exclusions.md`.
         run: |
           set -euxo pipefail
@@ -138,6 +142,7 @@ jobs:
             --exclude xtask \
             --exclude stratum-tui \
             --exclude stratum-backend-local \
+            --ignore-filename-regex 'crates/stratum-runtime/src/mic\.rs' \
             --fail-under-lines 96
       - name: cargo llvm-cov (lcov artifact)
         shell: bash
