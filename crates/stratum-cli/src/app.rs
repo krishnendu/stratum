@@ -4031,23 +4031,26 @@ fn resolve_serve_provider(
 /// occupied by a non-stratum handler from a hosting process). Treated as
 /// non-fatal by callers — the `--stop-after-ms` watchdog and the
 /// in-protocol `stop` method remain available as shutdown surfaces.
-fn install_shutdown_signals(
-    shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Result<(), ctrlc::Error> {
+fn install_shutdown_signals(shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     use std::sync::OnceLock;
     static INSTALLED: OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> = OnceLock::new();
-    // First caller wins: stash the flag and register the handler. Later
-    // callers in the same process (test reruns; future multi-mode work)
-    // just observe the cached flag.
-    if INSTALLED.get().is_some() {
-        return Ok(());
-    }
-    let flag_for_handler = shutdown_flag.clone();
-    ctrlc::set_handler(move || {
-        flag_for_handler.store(true, std::sync::atomic::Ordering::Relaxed);
-    })?;
-    let _ = INSTALLED.set(shutdown_flag);
-    Ok(())
+    // Atomic register-or-observe: `get_or_init` guarantees the closure
+    // runs at most once even under concurrent calls, so we never invoke
+    // `ctrlc::set_handler` twice (which would return `MultipleHandlers`).
+    // After this call, every caller's `shutdown_flag` and the registered
+    // handler's flag refer to the same `Arc` (the *first* caller's flag).
+    // Subsequent serve modes in the same process therefore observe the
+    // original handler's flag, not their own — which is the intended
+    // behavior since there's only one OS signal source per process.
+    INSTALLED.get_or_init(move || {
+        let flag_for_handler = shutdown_flag.clone();
+        if let Err(e) = ctrlc::set_handler(move || {
+            flag_for_handler.store(true, std::sync::atomic::Ordering::Relaxed);
+        }) {
+            tracing::warn!(error = %e, "ctrlc::set_handler failed; signal-driven shutdown unavailable");
+        }
+        shutdown_flag
+    });
 }
 
 /// Implements `stratum serve`. Build the `AgentServeHandler` against an
@@ -4178,11 +4181,10 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
         }
         // Wire SIGINT/SIGTERM/Ctrl-Break to the same flag so an
         // interactive Ctrl-C (or a supervisor's SIGTERM) shuts the
-        // acceptor down cleanly. Install failure is non-fatal —
-        // `--stop-after-ms` still works as the explicit shutdown surface.
-        if let Err(e) = install_shutdown_signals(shutdown_flag.clone()) {
-            tracing::warn!(error = %e, "shutdown signal install failed; relying on --stop-after-ms");
-        }
+        // acceptor down cleanly. Install failure is non-fatal and is
+        // logged inside the helper — `--stop-after-ms` still works as
+        // the explicit shutdown surface.
+        install_shutdown_signals(shutdown_flag.clone());
         while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -4254,10 +4256,9 @@ fn serve(args: &ServeArgs, paths: &Paths, out: &mut dyn Write, err: &mut dyn Wri
     }
     // Wire SIGINT/SIGTERM/Ctrl-Break to the same flag so an
     // interactive Ctrl-C (or a supervisor's SIGTERM) flips it just like
-    // the in-protocol `stop` method does. Install failure is non-fatal.
-    if let Err(e) = install_shutdown_signals(shutdown_flag.clone()) {
-        tracing::warn!(error = %e, "shutdown signal install failed; relying on --stop-after-ms / `stop`");
-    }
+    // the in-protocol `stop` method does. Install failure is logged
+    // inside the helper; the in-protocol surface still works.
+    install_shutdown_signals(shutdown_flag.clone());
 
     // Poll for either the stopwatch fire or the handler's own
     // shutdown_requested flag (set by the in-protocol `stop` method). Tick

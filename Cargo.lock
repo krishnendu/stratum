@@ -2564,6 +2564,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "flate2",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",
