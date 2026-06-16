@@ -65,6 +65,7 @@ fn bin() -> Command {
 fn read_line_with_timeout(
     stdout: ChildStdout,
     timeout: Duration,
+    child: &mut Child,
 ) -> (BufReader<ChildStdout>, String) {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -73,11 +74,16 @@ fn read_line_with_timeout(
         let res = reader.read_line(&mut line);
         let _ = tx.send((reader, line, res));
     });
-    let (reader, line, res) = rx
-        .recv_timeout(timeout)
-        .expect("child stdout read_line timed out");
-    res.expect("read startup line");
-    (reader, line)
+    if let Ok((reader, line, res)) = rx.recv_timeout(timeout) {
+        res.expect("read startup line");
+        (reader, line)
+    } else {
+        // Kill the child so it doesn't linger as a zombie holding
+        // the stdout pipe open, then panic the test.
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child stdout read_line timed out");
+    }
 }
 
 /// Parse the bound address from a `--json` startup line. Returns the
@@ -117,7 +123,7 @@ fn spawn_openai_daemon(tmp: &TempDir, stop_after_ms: u64) -> (Child, String) {
     // try to dial. The 10 s ceiling guards against a daemon that fails
     // before printing — see `read_line_with_timeout`.
     let stdout = child.stdout.take().expect("child stdout");
-    let (_reader, line) = read_line_with_timeout(stdout, Duration::from_secs(10));
+    let (_reader, line) = read_line_with_timeout(stdout, Duration::from_secs(10), &mut child);
     let bound = bound_from_json(&line);
     (child, bound)
 }

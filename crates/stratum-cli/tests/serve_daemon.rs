@@ -23,7 +23,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -42,7 +42,7 @@ fn bin() -> Command {
 /// would otherwise hang the test runner until the CI watchdog kills
 /// it. We hand the stdout off to a worker thread that does the actual
 /// `read_line`, then wait on a bounded `recv_timeout`.
-fn read_startup_line(stdout: ChildStdout, timeout: Duration) -> String {
+fn read_startup_line(stdout: ChildStdout, timeout: Duration, child: &mut Child) -> String {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -50,11 +50,16 @@ fn read_startup_line(stdout: ChildStdout, timeout: Duration) -> String {
         let res = reader.read_line(&mut line);
         let _ = tx.send((line, res));
     });
-    let (line, res) = rx
-        .recv_timeout(timeout)
-        .expect("child stdout read_line timed out");
-    res.expect("read startup line");
-    line
+    if let Ok((line, res)) = rx.recv_timeout(timeout) {
+        res.expect("read startup line");
+        line
+    } else {
+        // Kill the child so it doesn't linger as a zombie holding
+        // the stdout pipe open, then panic the test.
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child stdout read_line timed out");
+    }
 }
 
 /// Parse the bound address from a `--json` startup line. Returns the
@@ -209,7 +214,7 @@ fn serve_accepts_jsonrpc_ping_over_tcp() {
     // never writes to stdout — see `read_startup_line`.
     let stdout = child.stdout.take().expect("child stdout");
     let stderr = child.stderr.take().expect("child stderr");
-    let line = read_startup_line(stdout, Duration::from_secs(10));
+    let line = read_startup_line(stdout, Duration::from_secs(10), &mut child);
     let bound = bound_from_json(&line);
 
     // Drain stderr in the background so the child doesn't block on a
