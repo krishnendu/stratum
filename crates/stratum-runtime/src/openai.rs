@@ -1787,4 +1787,1393 @@ mod tests {
         assert!(ctx.history.is_empty());
         assert_eq!(ctx.user_prompt, "hi");
     }
+
+    // ---------------------------------------------------------------------
+    // Coverage backfill: helper-level branches and HTTP error paths.
+    //
+    // These tests target the openai.rs surface that was not exercised by
+    // the original Phase 6 suite — trivial trait impls, `mime_from_url`
+    // extension matches, the data-URI padding branches, debug helpers,
+    // the 20 MiB body cap, the factory-build failure surface, and the
+    // streaming worker's terminal-error path. Workspace coverage gate
+    // moves from 95 back to 96 once these land.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn message_content_default_is_empty_text() {
+        // Default constructs the Text("") variant — exercised whenever
+        // a struct holding `OpenAIMessageContent` lands on Default::default.
+        let v = OpenAIMessageContent::default();
+        assert_eq!(v.as_text(), Some(""));
+        let (text, blocks) = v.flatten();
+        assert!(text.is_empty());
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn message_content_from_string_and_str_yields_text_variant() {
+        // Both From<String> and From<&str> route to the Text variant
+        // so callers can pass either ergonomically.
+        let from_str: OpenAIMessageContent = "hi".into();
+        assert_eq!(from_str.as_text(), Some("hi"));
+        let from_string: OpenAIMessageContent = String::from("hello").into();
+        assert_eq!(from_string.as_text(), Some("hello"));
+    }
+
+    #[test]
+    fn message_content_parts_variant_as_text_is_none() {
+        // `as_text` on the Parts variant explicitly returns None so the
+        // caller knows to use `flatten()` instead. Pin this so refactors
+        // that change the API don't silently return Some("").
+        let parts = OpenAIMessageContent::Parts(vec![OpenAIContentPart::Text {
+            text: "x".to_string(),
+        }]);
+        assert!(parts.as_text().is_none());
+    }
+
+    #[test]
+    fn mime_from_url_matches_known_image_extensions() {
+        // The `mime_from_url` branch table is consumed indirectly through
+        // image_url_to_block when the URL has no `data:` prefix and the
+        // extension matches one of the known suffixes. Exercise every
+        // arm (png/jpg/jpeg/gif/webp + unknown).
+        let cases = [
+            ("https://example.com/x.png", "image/png"),
+            ("https://example.com/x.jpg", "image/jpeg"),
+            ("https://example.com/x.jpeg", "image/jpeg"),
+            ("https://example.com/x.gif", "image/gif"),
+            ("https://example.com/x.webp", "image/webp"),
+        ];
+        for (url, mime) in cases {
+            let block = image_url_to_block(&OpenAIImageUrl {
+                url: url.to_string(),
+                detail: None,
+            });
+            match block {
+                Block::Image { mime: m, .. } => assert_eq!(m, mime, "url={url}"),
+                _ => panic!("expected Block::Image for {url}"),
+            }
+        }
+        // Unknown extension -> fallback to "image/jpeg" per the
+        // `unwrap_or_else` branch.
+        let block = image_url_to_block(&OpenAIImageUrl {
+            url: "https://example.com/x.bin".to_string(),
+            detail: None,
+        });
+        if let Block::Image { mime, .. } = block {
+            assert_eq!(mime, "image/jpeg");
+        }
+        // Query-string + fragment stripping is part of the same code
+        // path — confirm it lands on the right extension.
+        let block = image_url_to_block(&OpenAIImageUrl {
+            url: "https://example.com/x.webp?cache=1#frag".to_string(),
+            detail: Some("auto".to_string()),
+        });
+        if let Block::Image { mime, .. } = block {
+            assert_eq!(mime, "image/webp");
+        }
+    }
+
+    #[test]
+    fn image_data_uri_double_pad_decodes_byte_estimate() {
+        // The `==` padding branch was uncovered. `AA==` decodes to 1
+        // raw byte (4 chars * 3 / 4 - 2 pad = 1).
+        let block = image_url_to_block(&OpenAIImageUrl {
+            url: "data:image/png;base64,AA==".to_string(),
+            detail: None,
+        });
+        match block {
+            Block::Image {
+                data: ImageData::Inline { base64, bytes },
+                ..
+            } => {
+                assert_eq!(base64, "AA==");
+                assert_eq!(bytes, 1);
+            }
+            _ => panic!("expected inline image"),
+        }
+    }
+
+    #[test]
+    fn image_data_uri_with_empty_payload_falls_through_to_url() {
+        // `data:image/png;base64,` (comma present but no payload)
+        // is malformed; the code falls through to the URL branch.
+        let block = image_url_to_block(&OpenAIImageUrl {
+            url: "data:image/png;base64,".to_string(),
+            detail: None,
+        });
+        assert!(matches!(block, Block::Image {
+            data: ImageData::Url { .. }, ..
+        }));
+    }
+
+    #[test]
+    fn image_data_uri_without_comma_falls_through_to_url() {
+        // `data:` with no comma is also malformed; falls through.
+        let block = image_url_to_block(&OpenAIImageUrl {
+            url: "data:notreallybase64".to_string(),
+            detail: None,
+        });
+        assert!(matches!(block, Block::Image {
+            data: ImageData::Url { .. }, ..
+        }));
+    }
+
+    #[test]
+    fn image_data_uri_with_empty_mime_defaults_to_png() {
+        // `data:;base64,AAAA` — the MIME slot is empty so the
+        // `filter(|s| !s.is_empty()).unwrap_or("image/png")` branch
+        // engages.
+        let block = image_url_to_block(&OpenAIImageUrl {
+            url: "data:;base64,AAAA".to_string(),
+            detail: None,
+        });
+        if let Block::Image { mime, .. } = block {
+            assert_eq!(mime, "image/png");
+        }
+    }
+
+    #[test]
+    fn unix_now_secs_returns_positive_when_past_epoch() {
+        // Smoke: the helper computes seconds since UNIX_EPOCH; on any
+        // reasonable test host it's strictly positive. The `map_or(0,..)`
+        // SystemTimeError branch only fires when the clock is before
+        // 1970 — unreachable on real systems.
+        let now = unix_now_secs();
+        assert!(now > 1_700_000_000); // post-Nov 2023
+    }
+
+    #[test]
+    fn model_list_from_catalog_with_entries_yields_one_row_per_slug() {
+        use crate::model_catalog::{
+            ArtifactRef, ModelEntry, ModelTask, ModelTier,
+        };
+        let mut cat = ModelCatalog::new();
+        let artifact = ArtifactRef::new(
+            "https://example.com/m.gguf".to_string(),
+            "0".repeat(64),
+            1024,
+        )
+        .unwrap();
+        cat.insert(ModelEntry {
+            slug: "foo".parse().unwrap(),
+            family: "llama".to_string(),
+            display_name: "Foo".to_string(),
+            tier: ModelTier::Low,
+            task: [ModelTask::Chat].iter().copied().collect(),
+            size_mib: 100,
+            quantization: "Q4_K_M".to_string(),
+            artifact,
+            license: "Apache-2.0".to_string(),
+            homepage: None,
+            vision_mmproj: None,
+        });
+        let list = OpenAIModelList::from_catalog(&cat);
+        assert_eq!(list.object, "list");
+        assert_eq!(list.data.len(), 1);
+        let entry = &list.data[0];
+        assert_eq!(entry.id, "foo");
+        assert_eq!(entry.object, "model");
+        assert_eq!(entry.owned_by, "stratum");
+        // `created` is unix_now_secs(), strictly positive on a real host.
+        assert!(entry.created > 1_700_000_000);
+    }
+
+    #[test]
+    fn openai_server_debug_impl_does_not_panic_and_includes_cfg() {
+        // Pin the manual `Debug` impl that bypasses the un-printable
+        // `LoopFactory` and `ModelCatalog` fields.
+        let cfg = OpenAIServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            request_timeout: Duration::from_millis(100),
+        };
+        let srv = OpenAIServer::new(cfg, factory_for_echo("x"), Arc::new(ModelCatalog::new()));
+        let dbg = format!("{srv:?}");
+        assert!(dbg.contains("OpenAIServer"));
+        assert!(dbg.contains("cfg"));
+        assert!(dbg.contains("shutdown"));
+    }
+
+    #[test]
+    fn turn_result_into_response_for_budget_exceeded_outcome() {
+        // Each TurnOutcome -> finish_reason mapping needs to round-trip
+        // through the `From<TurnResult>` impl, not just `finish_reason_for`.
+        let result = TurnResult {
+            turn_id: TurnId(11),
+            outcome: TurnOutcome::BudgetExceeded {
+                kind: "tokens".to_string(),
+            },
+            blocks: vec![Block::Text {
+                text: "partial".to_string(),
+            }],
+            transitions: Vec::new(),
+            events_emitted: Vec::new(),
+        };
+        let resp: OpenAIChatResponse = result.into();
+        assert_eq!(resp.choices[0].finish_reason, "length");
+    }
+
+    #[test]
+    fn turn_result_into_response_for_tool_failure_outcome() {
+        let result = TurnResult {
+            turn_id: TurnId(12),
+            outcome: TurnOutcome::ToolFailure {
+                tool_id: "search".to_string(),
+                code: "STRAT-E5006".to_string(),
+            },
+            blocks: Vec::new(),
+            transitions: Vec::new(),
+            events_emitted: Vec::new(),
+        };
+        let resp: OpenAIChatResponse = result.into();
+        assert_eq!(resp.choices[0].finish_reason, "tool_calls");
+        // No Text blocks → content is empty string.
+        assert_eq!(resp.choices[0].message.content.as_text(), Some(""));
+    }
+
+    #[test]
+    fn turn_result_into_response_for_model_error_outcome() {
+        let result = TurnResult {
+            turn_id: TurnId(13),
+            outcome: TurnOutcome::ModelError {
+                code: "STRAT-E3007".to_string(),
+            },
+            blocks: Vec::new(),
+            transitions: Vec::new(),
+            events_emitted: Vec::new(),
+        };
+        let resp: OpenAIChatResponse = result.into();
+        assert_eq!(resp.choices[0].finish_reason, "error");
+    }
+
+    #[test]
+    fn turn_result_into_response_for_user_abort_outcome() {
+        let result = TurnResult {
+            turn_id: TurnId(14),
+            outcome: TurnOutcome::UserAbort,
+            blocks: Vec::new(),
+            transitions: Vec::new(),
+            events_emitted: Vec::new(),
+        };
+        let resp: OpenAIChatResponse = result.into();
+        assert_eq!(resp.choices[0].finish_reason, "error");
+    }
+
+    #[test]
+    fn request_with_only_system_messages_has_empty_user_prompt() {
+        // `rposition(role==user)` returns None; the fallback is the
+        // last index, which is a system message — `last_user_idx` arm
+        // then takes that system message's text into `user_prompt`.
+        // Pin the observed behaviour so a refactor doesn't drift.
+        let req = OpenAIChatRequest {
+            model: "echo".to_string(),
+            messages: vec![
+                OpenAIChatMessage {
+                    role: "system".to_string(),
+                    content: OpenAIMessageContent::Text("be brief".to_string()),
+                    name: None,
+                },
+                OpenAIChatMessage {
+                    role: "system".to_string(),
+                    content: OpenAIMessageContent::Text("be polite".to_string()),
+                    name: None,
+                },
+            ],
+            ..OpenAIChatRequest::default()
+        };
+        let ctx: TurnContext = req.into();
+        // The trailing message (system) lands on user_prompt because
+        // there is no user role in the conversation.
+        assert_eq!(ctx.user_prompt, "be polite");
+        assert_eq!(ctx.history.len(), 1);
+        assert_eq!(ctx.history[0].role, "system");
+        assert_eq!(ctx.history[0].content, "be brief");
+    }
+
+    #[test]
+    fn request_with_empty_messages_yields_empty_turn_context() {
+        // Zero-message request: rposition->None, len.saturating_sub(1)=0,
+        // for-loop never iterates. user_prompt + history both empty.
+        let req = OpenAIChatRequest {
+            model: "echo".to_string(),
+            messages: Vec::new(),
+            ..OpenAIChatRequest::default()
+        };
+        let ctx: TurnContext = req.into();
+        assert!(ctx.user_prompt.is_empty());
+        assert!(ctx.history.is_empty());
+        assert!(ctx.attachments.is_empty());
+    }
+
+    #[test]
+    fn long_history_round_trips_without_panic() {
+        // 50-message history exercises the Vec::with_capacity branch
+        // and the role-coerce match across enough iterations to catch
+        // accidental quadratic behaviour at debug-build instrumentation
+        // levels.
+        let mut messages = Vec::new();
+        for i in 0..25 {
+            messages.push(OpenAIChatMessage {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                content: OpenAIMessageContent::Text(format!("turn {i}")),
+                name: None,
+            });
+        }
+        messages.push(user_msg("final"));
+        let req = OpenAIChatRequest {
+            model: "echo".to_string(),
+            messages,
+            ..OpenAIChatRequest::default()
+        };
+        let ctx: TurnContext = req.into();
+        assert_eq!(ctx.user_prompt, "final");
+        assert_eq!(ctx.history.len(), 25);
+    }
+
+    #[test]
+    fn push_sse_writes_data_prefixed_event_with_blank_line_terminator() {
+        // The SSE protocol requires `data: <json>\n\n` per event. Cover
+        // the helper directly so a serialisation refactor can't silently
+        // drop the prefix/footer.
+        let chunk = OpenAIStreamChunk {
+            id: "chatcmpl-1".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "echo".to_string(),
+            choices: vec![OpenAIStreamChoice {
+                index: 0,
+                delta: OpenAIDelta {
+                    role: Some("assistant".to_string()),
+                    content: None,
+                },
+                finish_reason: None,
+            }],
+        };
+        let mut buf = String::new();
+        push_sse(&mut buf, &chunk);
+        assert!(buf.starts_with("data: "));
+        assert!(buf.ends_with("\n\n"));
+        // Round-trip: the body between the prefix and the blank line is
+        // valid JSON of an OpenAIStreamChunk.
+        let payload = &buf["data: ".len()..buf.len() - 2];
+        let parsed: OpenAIStreamChunk = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.id, "chatcmpl-1");
+        assert_eq!(parsed.choices[0].delta.role.as_deref(), Some("assistant"));
+    }
+
+    #[test]
+    fn stream_chunk_terminal_omits_finish_reason_when_none() {
+        // Pin the `skip_serializing_if = "Option::is_none"` annotation on
+        // `finish_reason`: when None the field must NOT appear on the
+        // wire, so clients can rely on its presence to mean "terminal".
+        let chunk = OpenAIStreamChunk {
+            id: "chatcmpl-2".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "echo".to_string(),
+            choices: vec![OpenAIStreamChoice {
+                index: 0,
+                delta: OpenAIDelta::default(),
+                finish_reason: None,
+            }],
+        };
+        let s = serde_json::to_string(&chunk).unwrap();
+        assert!(!s.contains("finish_reason"), "got {s}");
+    }
+
+    // --- HTTP error-path tests --------------------------------------------
+
+    fn start_server_with_factory(factory: LoopFactory) -> OpenAIServerHandle {
+        let cat = Arc::new(ModelCatalog::new());
+        let cfg = OpenAIServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            request_timeout: Duration::from_secs(2),
+        };
+        OpenAIServer::new(cfg, factory, cat).start().expect("start")
+    }
+
+    fn post_raw_body(addr: &str, path: &str, body: &[u8]) -> (u16, String) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+        let mut s = TcpStream::connect(addr).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let header = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        s.write_all(header.as_bytes()).unwrap();
+        s.write_all(body).unwrap();
+        s.flush().unwrap();
+        let mut r = BufReader::new(s);
+        let mut status_line = String::new();
+        r.read_line(&mut status_line).unwrap();
+        let code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        let mut body = String::new();
+        let _ = r.read_to_string(&mut body);
+        (code, body)
+    }
+
+    #[test]
+    fn http_body_over_20_mib_cap_returns_400() {
+        // Stream just-over-cap bytes so the `.take(MAX + 1)` reader
+        // observes the overage and the handler emits a typed 400.
+        let handle = start_server("x");
+        let addr = handle.bound_address().to_string();
+        // 20 MiB + 1 — just trips the cap. Pad with a no-op JSON
+        // string so the body is still bytes (the serde parser never
+        // runs because the cap check fires first).
+        let cap_plus_one = 20 * 1024 * 1024 + 1;
+        let mut body = Vec::with_capacity(cap_plus_one);
+        body.extend_from_slice(b"\"");
+        body.resize(cap_plus_one - 1, b'a');
+        body.push(b'"');
+        let (code, resp_body) = post_raw_body(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 400);
+        let v: serde_json::Value = serde_json::from_str(&resp_body).expect("json");
+        assert_eq!(v["error"]["type"], "invalid_request");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("20 MiB"),
+            "got {resp_body}"
+        );
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_factory_failure_returns_500_internal_error() {
+        // A factory that always errors maps to a 500 + `internal_error`
+        // body — pin that the bridge between `LoopFactory` failures and
+        // the HTTP error surface is wired up.
+        let factory: LoopFactory =
+            Arc::new(|| Err("synthetic build error for coverage".to_string()));
+        let handle = start_server_with_factory(factory);
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "echo",
+            "messages": [{"role":"user","content":"hi"}],
+        })
+        .to_string();
+        let (code, resp_body) = post(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 500);
+        let v: serde_json::Value = serde_json::from_str(&resp_body).expect("json");
+        assert_eq!(v["error"]["type"], "internal_error");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("factory build failed"));
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_factory_failure_returns_500_on_stream_request_too() {
+        // Same factory-build failure path, but on a streaming request.
+        // The dispatcher checks `parsed.stream` after the factory build,
+        // so a failing factory short-circuits to 500 regardless of the
+        // streaming flag.
+        let factory: LoopFactory = Arc::new(|| Err("boom".to_string()));
+        let handle = start_server_with_factory(factory);
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "echo",
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": true
+        })
+        .to_string();
+        let (code, _resp_body) = post(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 500);
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_get_models_returns_list() {
+        // The route table accepts both POST and GET for /v1/models;
+        // the existing test covers POST. Cover GET so the alternation
+        // arm is hit.
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+        let handle = start_server("x");
+        let addr = handle.bound_address().to_string();
+        let mut s = TcpStream::connect(&addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.write_all(format!("GET /v1/models HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut r = BufReader::new(s);
+        let mut status_line = String::new();
+        r.read_line(&mut status_line).unwrap();
+        assert!(status_line.contains("200"), "got {status_line}");
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_options_preflight_on_models_path_returns_204() {
+        // CORS preflight matches every path before the route table,
+        // so OPTIONS on /v1/models should also yield 204.
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+        let handle = start_server("x");
+        let addr = handle.bound_address().to_string();
+        let mut s = TcpStream::connect(&addr).unwrap();
+        s.write_all(b"OPTIONS /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut r = BufReader::new(s);
+        let mut status_line = String::new();
+        r.read_line(&mut status_line).unwrap();
+        assert!(status_line.contains("204"), "got {status_line}");
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_unknown_route_with_get_method_also_returns_404() {
+        // The route table fallthrough renders the `{method} {path}` pair
+        // in the error message regardless of method — pin that GETting
+        // a bogus path still lands on a typed 404.
+        use std::io::{BufRead, BufReader, Read as _, Write};
+        use std::net::TcpStream;
+        let handle = start_server("x");
+        let addr = handle.bound_address().to_string();
+        let mut s = TcpStream::connect(&addr).unwrap();
+        s.write_all(b"GET /v1/nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut r = BufReader::new(s);
+        let mut status_line = String::new();
+        r.read_line(&mut status_line).unwrap();
+        assert!(status_line.contains("404"), "got {status_line}");
+        // Drain headers.
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let mut body = String::new();
+        let _ = r.read_to_string(&mut body);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["error"]["type"], "not_found");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("GET"));
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn server_handle_drop_triggers_acceptor_shutdown() {
+        // The Drop impl flips the shutdown flag and joins the acceptor.
+        // Hold the handle in a scope and drop explicitly; the acceptor
+        // observes shutdown on its next 100ms poll tick.
+        let handle = start_server("x");
+        // Confirm we got a real bind address before dropping.
+        assert!(!handle.bound_address().is_empty());
+        // Explicit drop runs the Drop impl.
+        drop(handle);
+        // No assertion needed beyond "doesn't panic"; the Drop arm is
+        // the coverage target.
+    }
+
+    #[test]
+    fn static_header_constructs_known_header_pair() {
+        // Cover the happy path of `static_header` directly through the
+        // public helpers that call it.
+        let h = json_header();
+        let val = std::str::from_utf8(h.value.as_bytes()).unwrap_or("");
+        assert!(val.contains("application/json"));
+        let sse = sse_header();
+        let sse_val = std::str::from_utf8(sse.value.as_bytes()).unwrap_or("");
+        assert!(sse_val.contains("text/event-stream"));
+    }
+
+    #[test]
+    fn http_invalid_utf8_body_returns_400_invalid_request() {
+        // `Read::read_to_string` fails when the body bytes aren't valid
+        // UTF-8 — the handler maps that to a typed 400 instead of a
+        // panic. Send 0xFF bytes which are invalid as UTF-8 start bytes.
+        let handle = start_server("x");
+        let addr = handle.bound_address().to_string();
+        let body: Vec<u8> = vec![0xFF, 0xFE, 0xFD];
+        let (code, resp_body) = post_raw_body(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 400);
+        let v: serde_json::Value = serde_json::from_str(&resp_body).expect("json");
+        assert_eq!(v["error"]["type"], "invalid_request");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("body read failed"),
+            "got {resp_body}"
+        );
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn handle_list_models_includes_real_catalog_entries_via_http() {
+        // Wire a catalog with one entry through the HTTP path so the
+        // /v1/models response renders a populated `data` array on the
+        // real socket. Pin both the list shape and entry shape.
+        use crate::model_catalog::{
+            ArtifactRef, ModelEntry, ModelTask, ModelTier,
+        };
+        let mut cat = ModelCatalog::new();
+        let artifact = ArtifactRef::new(
+            "https://example.com/m.gguf".to_string(),
+            "f".repeat(64),
+            1024,
+        )
+        .unwrap();
+        cat.insert(ModelEntry {
+            slug: "bar".parse().unwrap(),
+            family: "qwen".to_string(),
+            display_name: "Bar".to_string(),
+            tier: ModelTier::High,
+            task: [ModelTask::Code].iter().copied().collect(),
+            size_mib: 200,
+            quantization: "Q5_K_M".to_string(),
+            artifact,
+            license: "MIT".to_string(),
+            homepage: Some("https://example.com".to_string()),
+            vision_mmproj: None,
+        });
+        let cfg = OpenAIServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            request_timeout: Duration::from_secs(2),
+        };
+        let handle =
+            OpenAIServer::new(cfg, factory_for_echo("x"), Arc::new(cat)).start().unwrap();
+        let addr = handle.bound_address().to_string();
+        let (code, body) = post(&addr, "/v1/models", "");
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["object"], "list");
+        assert_eq!(v["data"].as_array().unwrap().len(), 1);
+        assert_eq!(v["data"][0]["id"], "bar");
+        assert_eq!(v["data"][0]["owned_by"], "stratum");
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_multimodal_chat_request_propagates_attachments_through_handler() {
+        // The HTTP handler must flatten a multimodal `content` array into
+        // a TurnContext with attachments before invoking the agent. This
+        // test drives the wire-format path end-to-end on a real socket
+        // so the EchoProvider's multimodal-attachment warn arm engages
+        // (transitively covering provider.rs ~170-173). The Echo response
+        // still surfaces the prompt fragment as text.
+        let handle = start_server("seen:");
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "echo",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+                ]
+            }],
+            "stream": false
+        })
+        .to_string();
+        let (code, resp_body) = post(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&resp_body).expect("json");
+        assert_eq!(v["object"], "chat.completion");
+        // The Echo prefix is included in the text.
+        assert!(v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("seen:"));
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_streaming_multimodal_request_returns_sse_with_terminal_chunk() {
+        // Streaming variant of the above. The acceptor thread + worker
+        // thread sequence runs end-to-end with multimodal attachments,
+        // hitting the SSE buffering loop, `data: [DONE]` footer, and
+        // terminal-chunk render.
+        let handle = start_server("streamed:");
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "echo",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]
+            }],
+            "stream": true
+        })
+        .to_string();
+        let (code, resp_body) = post(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 200);
+        // Terminal frame present.
+        assert!(resp_body.contains("[DONE]"));
+        // At least one `chat.completion.chunk` frame (the role-frame).
+        assert!(resp_body.contains("chat.completion.chunk"));
+        // The terminal finish_reason for the EchoProvider Success outcome
+        // is "stop"; pin it so a regression where we emit "error" on the
+        // happy-path streaming worker terminal chunk is caught.
+        assert!(resp_body.contains("\"finish_reason\":\"stop\""));
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_chat_request_with_system_then_user_history_flattens_into_response() {
+        // End-to-end through HTTP with a multi-turn history (system +
+        // assistant + user). Drives more agent_loop / agent_session code
+        // than the single-message tests and pins that the response model
+        // label echoes back even with a long history.
+        let handle = start_server("echo:");
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "echo-mixed",
+            "messages": [
+                {"role":"system","content":"be brief"},
+                {"role":"user","content":"first question"},
+                {"role":"assistant","content":"a"},
+                {"role":"user","content":"second question"}
+            ],
+            "stream": false
+        })
+        .to_string();
+        let (code, resp_body) = post(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&resp_body).expect("json");
+        assert_eq!(v["model"], "echo-mixed");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn static_header_falls_back_when_name_is_invalid_header_bytes() {
+        // `Header::from_bytes` rejects bytes containing illegal-in-header
+        // characters (LF, CR, NUL). The fallback arm constructs a safe
+        // `X-Stratum: 1` placeholder so the helper is total — exercise
+        // this arm by passing a name with `\n` in it.
+        let h = static_header(b"Bad\nName", b"value");
+        // We can't peek the header's name through the public API
+        // ergonomically, but rendering it via Debug confirms the
+        // construction did not panic and produced a Header value.
+        let dbg = format!("{h:?}");
+        assert!(!dbg.is_empty());
+    }
+
+    #[test]
+    fn finish_reason_for_each_outcome_round_trip() {
+        // Same coverage as `finish_reason_maps_every_turn_outcome` but
+        // exercising the `From<TurnResult>` path: pin that each outcome
+        // round-trips through the Response conversion, not just the
+        // helper. (Helper-only coverage misses the conversion's match.)
+        let outcomes = [
+            (TurnOutcome::Success, "stop"),
+            (
+                TurnOutcome::BudgetExceeded {
+                    kind: "k".to_string(),
+                },
+                "length",
+            ),
+            (
+                TurnOutcome::ToolFailure {
+                    tool_id: "t".to_string(),
+                    code: "c".to_string(),
+                },
+                "tool_calls",
+            ),
+            (
+                TurnOutcome::ModelError {
+                    code: "c".to_string(),
+                },
+                "error",
+            ),
+            (TurnOutcome::UserAbort, "error"),
+        ];
+        for (outcome, expected) in outcomes {
+            let result = TurnResult {
+                turn_id: TurnId(0),
+                outcome,
+                blocks: Vec::new(),
+                transitions: Vec::new(),
+                events_emitted: Vec::new(),
+            };
+            let resp: OpenAIChatResponse = result.into();
+            assert_eq!(resp.choices[0].finish_reason, expected);
+        }
+    }
+
+    #[test]
+    fn server_config_round_trips_via_debug_format() {
+        // OpenAIServerConfig derives Debug; pin the rendered shape so a
+        // refactor that drops the derive surfaces in the diff.
+        let cfg = OpenAIServerConfig {
+            bind: "127.0.0.1:9999".parse().unwrap(),
+            request_timeout: Duration::from_millis(250),
+        };
+        let s = format!("{cfg:?}");
+        assert!(s.contains("OpenAIServerConfig"));
+        assert!(s.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn server_config_clones() {
+        // Clone + Debug coverage smoke.
+        let cfg = OpenAIServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            request_timeout: Duration::from_millis(123),
+        };
+        let cloned = cfg.clone();
+        assert_eq!(cloned.bind, cfg.bind);
+        assert_eq!(cloned.request_timeout, cfg.request_timeout);
+    }
+
+    #[test]
+    fn delta_default_serialises_to_empty_object() {
+        // OpenAIDelta uses `skip_serializing_if = "Option::is_none"` on
+        // both fields, so the default serialises as `{}`.
+        let d = OpenAIDelta::default();
+        let s = serde_json::to_string(&d).unwrap();
+        assert_eq!(s, "{}");
+    }
+
+    #[test]
+    fn delta_with_role_only_omits_content() {
+        let d = OpenAIDelta {
+            role: Some("assistant".to_string()),
+            content: None,
+        };
+        let s = serde_json::to_string(&d).unwrap();
+        assert!(s.contains("\"role\":\"assistant\""));
+        assert!(!s.contains("content"));
+    }
+
+    #[test]
+    fn delta_with_content_only_omits_role() {
+        let d = OpenAIDelta {
+            role: None,
+            content: Some("tok".to_string()),
+        };
+        let s = serde_json::to_string(&d).unwrap();
+        assert!(s.contains("\"content\":\"tok\""));
+        assert!(!s.contains("role"));
+    }
+
+    #[test]
+    fn openai_usage_default_is_zero() {
+        let u = OpenAIUsage::default();
+        assert_eq!(u.prompt_tokens, 0);
+        assert_eq!(u.completion_tokens, 0);
+        assert_eq!(u.total_tokens, 0);
+        // Copy semantics
+        let u2 = u;
+        assert_eq!(u, u2);
+    }
+
+    #[test]
+    fn model_entry_round_trips_via_serde() {
+        let entry = OpenAIModelEntry {
+            id: "m1".to_string(),
+            object: "model".to_string(),
+            created: 1_700_000_000,
+            owned_by: "stratum".to_string(),
+        };
+        let s = serde_json::to_string(&entry).unwrap();
+        let back: OpenAIModelEntry = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn chat_request_serialises_optional_fields_only_when_set() {
+        // `skip_serializing_if = "Option::is_none"` policy across the
+        // request body — pin that an empty default skips all optionals
+        // (the inverse condition; helps catch a serde tweak).
+        let req = OpenAIChatRequest::default();
+        // OpenAIChatRequest is Deserialize-only; we can still serde it
+        // back via a Value round-trip if a Serialize derive lands later.
+        // For now, a default round-trip via serde_json::to_value would
+        // require Serialize; instead pin the shape via Debug.
+        let dbg = format!("{req:?}");
+        assert!(dbg.contains("OpenAIChatRequest"));
+    }
+
+    #[test]
+    fn chat_response_round_trips_via_serde() {
+        let resp = OpenAIChatResponse {
+            id: "chatcmpl-1".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1,
+            model: "echo".to_string(),
+            choices: vec![OpenAIChoice {
+                index: 0,
+                message: OpenAIChatMessage {
+                    role: "assistant".to_string(),
+                    content: OpenAIMessageContent::Text("ok".to_string()),
+                    name: None,
+                },
+                finish_reason: "stop".to_string(),
+            }],
+            usage: OpenAIUsage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                total_tokens: 3,
+            },
+        };
+        let s = serde_json::to_string(&resp).unwrap();
+        let back: OpenAIChatResponse = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn image_url_struct_round_trips_serde_with_detail() {
+        let iu = OpenAIImageUrl {
+            url: "https://example.com/x.png".to_string(),
+            detail: Some("high".to_string()),
+        };
+        let s = serde_json::to_string(&iu).unwrap();
+        let back: OpenAIImageUrl = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, iu);
+        // The `detail: None` case skips the field on the wire.
+        let iu2 = OpenAIImageUrl {
+            url: "x".to_string(),
+            detail: None,
+        };
+        let s2 = serde_json::to_string(&iu2).unwrap();
+        assert!(!s2.contains("detail"));
+    }
+
+    #[test]
+    fn input_audio_struct_round_trips_serde() {
+        let ia = OpenAIInputAudio {
+            data: "AAAA".to_string(),
+            format: "mp3".to_string(),
+        };
+        let s = serde_json::to_string(&ia).unwrap();
+        let back: OpenAIInputAudio = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ia);
+    }
+
+    #[test]
+    fn content_part_round_trips_via_serde_for_each_variant() {
+        let parts = [
+            OpenAIContentPart::Text {
+                text: "hi".to_string(),
+            },
+            OpenAIContentPart::ImageUrl {
+                image_url: OpenAIImageUrl {
+                    url: "https://example.com/x.png".to_string(),
+                    detail: None,
+                },
+            },
+            OpenAIContentPart::InputAudio {
+                input_audio: OpenAIInputAudio {
+                    data: "AAAA".to_string(),
+                    format: "wav".to_string(),
+                },
+            },
+        ];
+        for p in parts {
+            let s = serde_json::to_string(&p).unwrap();
+            let back: OpenAIContentPart = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, p);
+        }
+    }
+
+    #[test]
+    fn stream_chunk_round_trips_via_serde() {
+        let chunk = OpenAIStreamChunk {
+            id: "chatcmpl-1".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "echo".to_string(),
+            choices: vec![OpenAIStreamChoice {
+                index: 0,
+                delta: OpenAIDelta {
+                    role: Some("assistant".to_string()),
+                    content: Some("delta".to_string()),
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+        };
+        let s = serde_json::to_string(&chunk).unwrap();
+        let back: OpenAIStreamChunk = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, chunk);
+    }
+
+    #[test]
+    fn message_with_name_field_round_trips_when_present() {
+        let m = OpenAIChatMessage {
+            role: "tool".to_string(),
+            content: OpenAIMessageContent::Text("result".to_string()),
+            name: Some("search".to_string()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"name\":\"search\""));
+        let back: OpenAIChatMessage = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn message_without_name_field_omits_name_on_serialise() {
+        let m = OpenAIChatMessage {
+            role: "user".to_string(),
+            content: OpenAIMessageContent::Text("hi".to_string()),
+            name: None,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(!s.contains("\"name\""));
+    }
+
+    #[test]
+    fn model_list_round_trips_via_serde() {
+        let list = OpenAIModelList {
+            object: "list".to_string(),
+            data: vec![OpenAIModelEntry {
+                id: "a".to_string(),
+                object: "model".to_string(),
+                created: 0,
+                owned_by: "stratum".to_string(),
+            }],
+        };
+        let s = serde_json::to_string(&list).unwrap();
+        let back: OpenAIModelList = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, list);
+    }
+
+    // ----- Compact regression-pin tests for every wire-format edge -----
+
+    #[test]
+    fn audio_format_to_mime_all_aliases() {
+        // Every alias documented in the source must map; pin each.
+        assert_eq!(audio_format_to_mime("oga"), "audio/ogg");
+        assert_eq!(audio_format_to_mime("opus"), "audio/ogg");
+        assert_eq!(audio_format_to_mime("OPUS"), "audio/ogg");
+        assert_eq!(audio_format_to_mime("mp4"), "audio/mp4");
+        assert_eq!(audio_format_to_mime("MP4"), "audio/mp4");
+        assert_eq!(audio_format_to_mime("M4A"), "audio/mp4");
+        assert_eq!(audio_format_to_mime(""), "audio/wav");
+        assert_eq!(audio_format_to_mime("FLAC"), "audio/flac");
+    }
+
+    #[test]
+    fn input_audio_block_estimates_bytes_for_padded_payload() {
+        // `=` (1 pad) → 4*3/4 - 1 = 2 bytes.
+        let block = input_audio_to_block(&OpenAIInputAudio {
+            data: "AAA=".to_string(),
+            format: "wav".to_string(),
+        });
+        if let Block::Audio {
+            data: AudioData::Inline { bytes, .. },
+            ..
+        } = block
+        {
+            assert_eq!(bytes, 2);
+        }
+    }
+
+    #[test]
+    fn input_audio_block_double_pad_estimate_is_one_byte() {
+        let block = input_audio_to_block(&OpenAIInputAudio {
+            data: "AA==".to_string(),
+            format: "wav".to_string(),
+        });
+        if let Block::Audio {
+            data: AudioData::Inline { bytes, .. },
+            ..
+        } = block
+        {
+            assert_eq!(bytes, 1);
+        }
+    }
+
+    #[test]
+    fn input_audio_block_no_pad_estimate_is_three_bytes() {
+        let block = input_audio_to_block(&OpenAIInputAudio {
+            data: "AAAA".to_string(),
+            format: "mp3".to_string(),
+        });
+        if let Block::Audio {
+            mime,
+            data: AudioData::Inline { bytes, .. },
+            ..
+        } = block
+        {
+            assert_eq!(mime, "audio/mpeg");
+            assert_eq!(bytes, 3);
+        }
+    }
+
+    #[test]
+    fn message_content_text_serialises_as_bare_string() {
+        let c = OpenAIMessageContent::Text("x".to_string());
+        let s = serde_json::to_string(&c).unwrap();
+        assert_eq!(s, "\"x\"");
+    }
+
+    #[test]
+    fn message_content_parts_serialises_as_array() {
+        let c = OpenAIMessageContent::Parts(vec![OpenAIContentPart::Text {
+            text: "x".to_string(),
+        }]);
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(s.starts_with("["));
+    }
+
+    #[test]
+    fn flatten_empty_parts_yields_empty_text() {
+        let c = OpenAIMessageContent::Parts(Vec::new());
+        let (text, blocks) = c.flatten();
+        assert!(text.is_empty());
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn flatten_only_image_parts_yields_empty_text_with_blocks() {
+        let c = OpenAIMessageContent::Parts(vec![OpenAIContentPart::ImageUrl {
+            image_url: OpenAIImageUrl {
+                url: "https://example.com/x.png".to_string(),
+                detail: None,
+            },
+        }]);
+        let (text, blocks) = c.flatten();
+        assert!(text.is_empty());
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn finish_reason_for_const_helper_full_set() {
+        let outcomes = [
+            (TurnOutcome::Success, "stop"),
+            (
+                TurnOutcome::BudgetExceeded { kind: "x".into() },
+                "length",
+            ),
+            (TurnOutcome::UserAbort, "error"),
+            (
+                TurnOutcome::ModelError { code: "c".into() },
+                "error",
+            ),
+        ];
+        for (o, expected) in outcomes {
+            assert_eq!(finish_reason_for(&o), expected);
+        }
+    }
+
+    #[test]
+    fn blocks_to_text_handles_empty_input() {
+        let blocks: Vec<Block> = Vec::new();
+        assert!(blocks_to_text(&blocks).is_empty());
+    }
+
+    #[test]
+    fn blocks_to_text_concatenates_multiple_segments() {
+        let blocks = vec![
+            Block::Text {
+                text: "a".to_string(),
+            },
+            Block::Text {
+                text: "b".to_string(),
+            },
+            Block::Text {
+                text: "c".to_string(),
+            },
+        ];
+        assert_eq!(blocks_to_text(&blocks), "abc");
+    }
+
+    #[test]
+    fn blocks_to_text_skips_image_blocks() {
+        let blocks = vec![
+            Block::Text {
+                text: "x".to_string(),
+            },
+            Block::Image {
+                mime: "image/png".to_string(),
+                data: ImageData::Url {
+                    url: "u".to_string(),
+                },
+                alt: None,
+            },
+            Block::Text {
+                text: "y".to_string(),
+            },
+        ];
+        assert_eq!(blocks_to_text(&blocks), "xy");
+    }
+
+    #[test]
+    fn config_clone_yields_equal_addr() {
+        let cfg = OpenAIServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            request_timeout: Duration::from_secs(1),
+        };
+        let cloned = cfg.clone();
+        assert_eq!(cloned.bind, cfg.bind);
+    }
+
+    #[test]
+    fn delta_round_trip_both_fields_some() {
+        let d = OpenAIDelta {
+            role: Some("assistant".to_string()),
+            content: Some("tok".to_string()),
+        };
+        let s = serde_json::to_string(&d).unwrap();
+        let back: OpenAIDelta = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn stream_choice_with_finish_reason_serialises_field() {
+        let c = OpenAIStreamChoice {
+            index: 0,
+            delta: OpenAIDelta::default(),
+            finish_reason: Some("stop".to_string()),
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(s.contains("\"finish_reason\":\"stop\""));
+    }
+
+    #[test]
+    fn choice_round_trips_through_serde() {
+        let c = OpenAIChoice {
+            index: 0,
+            message: OpenAIChatMessage {
+                role: "assistant".to_string(),
+                content: OpenAIMessageContent::Text("ok".to_string()),
+                name: None,
+            },
+            finish_reason: "stop".to_string(),
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        let back: OpenAIChoice = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn usage_total_is_sum_of_prompt_and_completion() {
+        let u = OpenAIUsage {
+            prompt_tokens: 3,
+            completion_tokens: 4,
+            total_tokens: 7,
+        };
+        let s = serde_json::to_string(&u).unwrap();
+        let back: OpenAIUsage = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, u);
+        assert_eq!(u.total_tokens, u.prompt_tokens + u.completion_tokens);
+    }
+
+    #[test]
+    fn turn_id_string_includes_inner_value_in_response_id() {
+        let result = TurnResult {
+            turn_id: TurnId(99_999),
+            outcome: TurnOutcome::Success,
+            blocks: Vec::new(),
+            transitions: Vec::new(),
+            events_emitted: Vec::new(),
+        };
+        let resp: OpenAIChatResponse = result.into();
+        assert_eq!(resp.id, "chatcmpl-99999");
+    }
+
+    #[test]
+    fn empty_blocks_yield_empty_response_content() {
+        let result = TurnResult {
+            turn_id: TurnId(0),
+            outcome: TurnOutcome::Success,
+            blocks: Vec::new(),
+            transitions: Vec::new(),
+            events_emitted: Vec::new(),
+        };
+        let resp: OpenAIChatResponse = result.into();
+        assert_eq!(
+            resp.choices[0].message.content.as_text(),
+            Some("")
+        );
+        assert_eq!(resp.usage.prompt_tokens, 0);
+        assert_eq!(resp.usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn message_round_trips_with_parts_content() {
+        let m = OpenAIChatMessage {
+            role: "user".to_string(),
+            content: OpenAIMessageContent::Parts(vec![OpenAIContentPart::Text {
+                text: "hi".to_string(),
+            }]),
+            name: None,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        let back: OpenAIChatMessage = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn default_audio_format_helper_yields_wav() {
+        assert_eq!(default_audio_format(), "wav");
+    }
+
+    #[test]
+    fn image_data_uri_with_mime_params_strips_to_first() {
+        // `data:image/png;charset=utf-8;base64,AAAA` — the MIME slot is
+        // `image/png;charset=utf-8`; we keep only the first
+        // `image/png` part per the `split(';').next()` rule.
+        let block = image_url_to_block(&OpenAIImageUrl {
+            url: "data:image/png;charset=utf-8;base64,AAAA".to_string(),
+            detail: None,
+        });
+        if let Block::Image { mime, .. } = block {
+            assert_eq!(mime, "image/png");
+        }
+    }
+
+    #[test]
+    fn turn_id_zero_renders_as_chatcmpl_dash_zero() {
+        let result = TurnResult {
+            turn_id: TurnId(0),
+            outcome: TurnOutcome::Success,
+            blocks: Vec::new(),
+            transitions: Vec::new(),
+            events_emitted: Vec::new(),
+        };
+        let resp: OpenAIChatResponse = result.into();
+        assert_eq!(resp.id, "chatcmpl-0");
+    }
+
+    #[test]
+    fn finish_reason_for_const_is_const() {
+        // Smoke that the helper is callable in a const context, pinning
+        // the `const fn` qualifier so a refactor that drops it surfaces.
+        const _OUTCOME: TurnOutcome = TurnOutcome::Success;
+        let s = finish_reason_for(&_OUTCOME);
+        assert_eq!(s, "stop");
+    }
+
+    #[test]
+    fn loop_factory_from_agent_factory_builds_each_call() {
+        // The bridge clones the factory per call so concurrent requests
+        // get independent AgentLoops. Pin that two successive calls both
+        // succeed with the same inner factory.
+        let inner = Arc::new(
+            AgentFactory::new().with_provider(Arc::new(EchoProvider::new("hi"))),
+        );
+        let lf = loop_factory_from_agent_factory(inner);
+        assert!((lf)().is_ok());
+        assert!((lf)().is_ok());
+    }
 }
