@@ -61,9 +61,113 @@ use crate::agent_factory::AgentFactory;
 use crate::agent_loop::{AgentLoop, TurnContext, TurnResult};
 use crate::cancel::CancelToken;
 use crate::conversation::TurnOutcome;
-use crate::model_catalog::ModelCatalog;
+use crate::model_catalog::{ModelCatalog, ModelEntry, ModelTask};
 use crate::observability::TurnId;
 use crate::provider::ChatHistoryTurn;
+
+// ---------------------------------------------------------------------------
+// Virtual model names
+// ---------------------------------------------------------------------------
+
+/// All recognised virtual model names — `stratum/<role>` slugs the
+/// OpenAI surface resolves to concrete catalog entries at request time.
+/// The order is the one we render in `/v1/models` so clients see a
+/// stable list.
+pub const VIRTUAL_MODEL_NAMES: &[&str] = &[
+    "stratum/auto",
+    "stratum/fast",
+    "stratum/code",
+    "stratum/think",
+    "stratum/multimodal",
+];
+
+/// Resolve a `stratum/<role>` virtual model name to a concrete catalog
+/// slug, using the currently installed roster.
+///
+/// Returns `None` when:
+/// * `name` is not one of [`VIRTUAL_MODEL_NAMES`] (i.e. the caller is
+///   referencing a concrete slug and no resolution is needed), OR
+/// * the catalog has no model that satisfies the virtual role (e.g.
+///   `stratum/multimodal` against an empty / vision-less catalog).
+///
+/// Resolution rules:
+///
+/// * `stratum/fast` → smallest installed model by `size_mib`; ties
+///   broken by slug.
+/// * `stratum/think` → largest installed model by `size_mib`; ties
+///   broken by slug.
+/// * `stratum/code` → a model whose slug contains `"coder"` if any,
+///   else any model whose task set includes [`ModelTask::Code`]; ties
+///   broken by slug.
+/// * `stratum/multimodal` → a model whose task set includes
+///   [`ModelTask::Vision`]; if none, falls back to the same model
+///   `stratum/think` would resolve to (largest installed).
+/// * `stratum/auto` → `stratum/think` if the catalog has any entry;
+///   else `stratum/fast`. With at least one entry both branches resolve
+///   to the same slug; only the empty-catalog case returns `None`.
+#[must_use]
+pub fn resolve_virtual_model(name: &str, catalog: &ModelCatalog) -> Option<String> {
+    match name {
+        "stratum/fast" => pick_smallest(catalog).map(slug_of),
+        "stratum/think" => pick_largest(catalog).map(slug_of),
+        "stratum/code" => pick_code(catalog).map(slug_of),
+        "stratum/multimodal" => pick_multimodal(catalog).map(slug_of),
+        "stratum/auto" => pick_largest(catalog)
+            .or_else(|| pick_smallest(catalog))
+            .map(slug_of),
+        _ => None,
+    }
+}
+
+fn slug_of(entry: &ModelEntry) -> String {
+    entry.slug.as_str().to_string()
+}
+
+fn pick_smallest(catalog: &ModelCatalog) -> Option<&ModelEntry> {
+    catalog.entries.values().min_by(|a, b| {
+        a.size_mib
+            .cmp(&b.size_mib)
+            .then_with(|| a.slug.cmp(&b.slug))
+    })
+}
+
+fn pick_largest(catalog: &ModelCatalog) -> Option<&ModelEntry> {
+    // `max_by` returns the LAST element on ties; flip the comparison so
+    // ties break to the LOWEST slug for determinism (matching the docs).
+    catalog.entries.values().max_by(|a, b| {
+        a.size_mib
+            .cmp(&b.size_mib)
+            .then_with(|| b.slug.cmp(&a.slug))
+    })
+}
+
+fn pick_code(catalog: &ModelCatalog) -> Option<&ModelEntry> {
+    // Prefer entries whose slug literally contains "coder" so installer
+    // catalogs that ship a dedicated coder model (e.g. `qwen-coder-7b`)
+    // win over a generic chat model that merely lists `Code` as a task.
+    if let Some(e) = catalog
+        .entries
+        .values()
+        .filter(|e| e.slug.as_str().contains("coder"))
+        .min_by(|a, b| a.slug.cmp(&b.slug))
+    {
+        return Some(e);
+    }
+    catalog
+        .entries
+        .values()
+        .filter(|e| e.task.contains(&ModelTask::Code))
+        .min_by(|a, b| a.slug.cmp(&b.slug))
+}
+
+fn pick_multimodal(catalog: &ModelCatalog) -> Option<&ModelEntry> {
+    catalog
+        .entries
+        .values()
+        .filter(|e| e.task.contains(&ModelTask::Vision))
+        .min_by(|a, b| a.slug.cmp(&b.slug))
+        .or_else(|| pick_largest(catalog))
+}
 
 // ---------------------------------------------------------------------------
 // Wire-protocol shapes
@@ -510,10 +614,15 @@ pub struct OpenAIModelEntry {
 
 impl OpenAIModelList {
     /// Build a model list from a [`ModelCatalog`].
+    ///
+    /// Includes both concrete catalog entries AND any `stratum/<role>`
+    /// virtual names that resolve on the current roster. Virtual entries
+    /// are emitted with `owned_by: "stratum"` so callers can distinguish
+    /// the synthetic rows from real model slugs by id pattern + provenance.
     #[must_use]
     pub fn from_catalog(catalog: &ModelCatalog) -> Self {
         let now = unix_now_secs();
-        let data = catalog
+        let mut data: Vec<OpenAIModelEntry> = catalog
             .entries
             .keys()
             .map(|slug| OpenAIModelEntry {
@@ -523,11 +632,31 @@ impl OpenAIModelList {
                 owned_by: "stratum".to_string(),
             })
             .collect();
+        for name in available_virtual_names(catalog) {
+            data.push(OpenAIModelEntry {
+                id: name,
+                object: "model".to_string(),
+                created: now,
+                owned_by: "stratum".to_string(),
+            });
+        }
         Self {
             object: "list".to_string(),
             data,
         }
     }
+}
+
+/// All `stratum/<role>` virtual names that currently resolve to a
+/// concrete catalog entry. Returns the names in the canonical
+/// [`VIRTUAL_MODEL_NAMES`] order, filtered down to the resolvable set.
+#[must_use]
+pub fn available_virtual_names(catalog: &ModelCatalog) -> Vec<String> {
+    VIRTUAL_MODEL_NAMES
+        .iter()
+        .filter(|name| resolve_virtual_model(name, catalog).is_some())
+        .map(|name| (*name).to_string())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -823,7 +952,7 @@ fn handle_request(
 
     match (method, path.as_str()) {
         (Method::Post, "/v1/chat/completions") => {
-            handle_chat_completions(req, factory);
+            handle_chat_completions(req, factory, catalog);
         }
         (Method::Post | Method::Get, "/v1/models") => {
             handle_list_models(req, catalog);
@@ -835,7 +964,11 @@ fn handle_request(
     }
 }
 
-fn handle_chat_completions(mut req: tiny_http::Request, factory: &LoopFactory) {
+fn handle_chat_completions(
+    mut req: tiny_http::Request,
+    factory: &LoopFactory,
+    catalog: &Arc<ModelCatalog>,
+) {
     // Cap request body at 20 MiB to bound the memory cost of a
     // multimodal request that ships base64 image payloads inline.
     // `.take(MAX + 1)` lets us tell "exactly at the cap" from
@@ -862,13 +995,42 @@ fn handle_chat_completions(mut req: tiny_http::Request, factory: &LoopFactory) {
         );
         return;
     }
-    let parsed: OpenAIChatRequest = match serde_json::from_str(&body) {
+    let mut parsed: OpenAIChatRequest = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(e) => {
             respond_error_owned(req, 400, "invalid_request", &format!("bad JSON: {e}"));
             return;
         }
     };
+
+    // Virtual model resolution: clients can reference `stratum/<role>`
+    // instead of a concrete catalog slug. Per `plan/07` Phase 6 we map
+    // those to the user's installed roster here. If the name starts with
+    // `stratum/` but doesn't resolve, return a typed 400 with the list
+    // of names that DO resolve on the current catalog — clients get a
+    // pointed "install something first" hint rather than a silent 404.
+    if parsed.model.starts_with("stratum/") {
+        if let Some(slug) = resolve_virtual_model(&parsed.model, catalog) {
+            parsed.model = slug;
+        } else {
+            let available = available_virtual_names(catalog);
+            let hint = if available.is_empty() {
+                "no installed models in catalog".to_string()
+            } else {
+                format!("install one of: {}", available.join(", "))
+            };
+            respond_error_owned(
+                req,
+                400,
+                "model_not_found",
+                &format!(
+                    "no installed model satisfies {name}; {hint}",
+                    name = parsed.model
+                ),
+            );
+            return;
+        }
+    }
 
     let stream = parsed.stream;
     let model_label = parsed.model.clone();
@@ -2126,13 +2288,18 @@ mod tests {
         });
         let list = OpenAIModelList::from_catalog(&cat);
         assert_eq!(list.object, "list");
-        assert_eq!(list.data.len(), 1);
-        let entry = &list.data[0];
-        assert_eq!(entry.id, "foo");
-        assert_eq!(entry.object, "model");
-        assert_eq!(entry.owned_by, "stratum");
+        // Concrete row + virtual rows that resolve. With one Chat-only
+        // Low entry: `stratum/code` does not resolve (no coder slug, no
+        // Code task); the other four virtuals do.
+        let foo = list
+            .data
+            .iter()
+            .find(|e| e.id == "foo")
+            .expect("foo row present");
+        assert_eq!(foo.object, "model");
+        assert_eq!(foo.owned_by, "stratum");
         // `created` is unix_now_secs(), strictly positive on a real host.
-        assert!(entry.created > 1_700_000_000);
+        assert!(foo.created > 1_700_000_000);
     }
 
     #[test]
@@ -2660,9 +2827,15 @@ mod tests {
         assert_eq!(code, 200);
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(v["object"], "list");
-        assert_eq!(v["data"].as_array().unwrap().len(), 1);
-        assert_eq!(v["data"][0]["id"], "bar");
-        assert_eq!(v["data"][0]["owned_by"], "stratum");
+        let arr = v["data"].as_array().unwrap();
+        // The concrete row is present alongside any virtual rows that
+        // resolve against this catalog (Code task → `stratum/code`
+        // resolves, etc).
+        let bar = arr
+            .iter()
+            .find(|e| e["id"] == "bar")
+            .expect("bar entry present");
+        assert_eq!(bar["owned_by"], "stratum");
         let _ = handle.stop();
     }
 
@@ -3338,5 +3511,382 @@ mod tests {
         let lf = loop_factory_from_agent_factory(inner);
         assert!((lf)().is_ok());
         assert!((lf)().is_ok());
+    }
+
+    // ---------------------------------------------------------------------
+    // Virtual model name resolution (`stratum/<role>` mapping).
+    // ---------------------------------------------------------------------
+
+    fn mk_entry(
+        slug: &str,
+        size_mib: u64,
+        tasks: &[crate::model_catalog::ModelTask],
+    ) -> crate::model_catalog::ModelEntry {
+        use crate::model_catalog::{ArtifactRef, ModelEntry, ModelTier};
+        let artifact = ArtifactRef::new(
+            "https://example.com/m.gguf".to_string(),
+            "0".repeat(64),
+            1024,
+        )
+        .unwrap();
+        ModelEntry {
+            slug: slug.parse().unwrap(),
+            family: "fam".to_string(),
+            display_name: slug.to_string(),
+            tier: ModelTier::Low,
+            task: tasks.iter().copied().collect(),
+            size_mib,
+            quantization: "Q4_K_M".to_string(),
+            artifact,
+            license: "Apache-2.0".to_string(),
+            homepage: None,
+            vision_mmproj: None,
+        }
+    }
+
+    fn catalog_with(entries: Vec<crate::model_catalog::ModelEntry>) -> ModelCatalog {
+        let mut cat = ModelCatalog::new();
+        for e in entries {
+            cat.insert(e);
+        }
+        cat
+    }
+
+    #[test]
+    fn resolve_virtual_model_returns_none_for_concrete_slug() {
+        let cat = catalog_with(vec![mk_entry("foo", 100, &[ModelTask::Chat])]);
+        // A name not prefixed with `stratum/` is concrete; resolver bows
+        // out with None and lets the caller forward it untouched.
+        assert!(resolve_virtual_model("foo", &cat).is_none());
+        assert!(resolve_virtual_model("openai/gpt-4", &cat).is_none());
+    }
+
+    #[test]
+    fn resolve_virtual_model_fast_picks_smallest() {
+        let cat = catalog_with(vec![
+            mk_entry("big", 9_000, &[ModelTask::Chat]),
+            mk_entry("small", 100, &[ModelTask::Chat]),
+            mk_entry("mid", 500, &[ModelTask::Chat]),
+        ]);
+        assert_eq!(
+            resolve_virtual_model("stratum/fast", &cat).as_deref(),
+            Some("small")
+        );
+    }
+
+    #[test]
+    fn resolve_virtual_model_think_picks_largest() {
+        let cat = catalog_with(vec![
+            mk_entry("big", 9_000, &[ModelTask::Chat]),
+            mk_entry("small", 100, &[ModelTask::Chat]),
+        ]);
+        assert_eq!(
+            resolve_virtual_model("stratum/think", &cat).as_deref(),
+            Some("big")
+        );
+    }
+
+    #[test]
+    fn resolve_virtual_model_code_prefers_coder_slug() {
+        // The slug-contains-"coder" rule wins over a generic Chat model
+        // that happens to also list Code in its task set.
+        let cat = catalog_with(vec![
+            mk_entry("chatty", 100, &[ModelTask::Chat, ModelTask::Code]),
+            mk_entry("qwen-coder-7b", 7_000, &[ModelTask::Code]),
+        ]);
+        assert_eq!(
+            resolve_virtual_model("stratum/code", &cat).as_deref(),
+            Some("qwen-coder-7b")
+        );
+    }
+
+    #[test]
+    fn resolve_virtual_model_code_falls_back_to_code_task() {
+        // No "coder" slug; fall back to any model with Code task.
+        let cat = catalog_with(vec![
+            mk_entry("alpha", 100, &[ModelTask::Chat]),
+            mk_entry("beta", 200, &[ModelTask::Code]),
+        ]);
+        assert_eq!(
+            resolve_virtual_model("stratum/code", &cat).as_deref(),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn resolve_virtual_model_code_returns_none_when_no_code_capable_model() {
+        let cat = catalog_with(vec![mk_entry("only", 100, &[ModelTask::Chat])]);
+        assert!(resolve_virtual_model("stratum/code", &cat).is_none());
+    }
+
+    #[test]
+    fn resolve_virtual_model_multimodal_picks_vision_when_present() {
+        let cat = catalog_with(vec![
+            mk_entry("text-only", 9_000, &[ModelTask::Chat]),
+            mk_entry("vision", 4_000, &[ModelTask::Vision]),
+        ]);
+        assert_eq!(
+            resolve_virtual_model("stratum/multimodal", &cat).as_deref(),
+            Some("vision")
+        );
+    }
+
+    #[test]
+    fn resolve_virtual_model_multimodal_falls_back_to_largest_when_no_vision() {
+        // No Vision model in catalog → fall back to the largest (same
+        // entry `stratum/think` would pick).
+        let cat = catalog_with(vec![
+            mk_entry("small", 100, &[ModelTask::Chat]),
+            mk_entry("big", 9_000, &[ModelTask::Chat]),
+        ]);
+        assert_eq!(
+            resolve_virtual_model("stratum/multimodal", &cat).as_deref(),
+            Some("big")
+        );
+    }
+
+    #[test]
+    fn resolve_virtual_model_multimodal_returns_none_on_empty_catalog() {
+        let cat = ModelCatalog::new();
+        assert!(resolve_virtual_model("stratum/multimodal", &cat).is_none());
+    }
+
+    #[test]
+    fn resolve_virtual_model_auto_prefers_think_then_fast() {
+        // With more than one entry, `stratum/auto` resolves the same as
+        // `stratum/think`.
+        let cat = catalog_with(vec![
+            mk_entry("small", 100, &[ModelTask::Chat]),
+            mk_entry("big", 9_000, &[ModelTask::Chat]),
+        ]);
+        assert_eq!(
+            resolve_virtual_model("stratum/auto", &cat).as_deref(),
+            Some("big")
+        );
+    }
+
+    #[test]
+    fn resolve_virtual_model_auto_falls_back_to_fast_when_only_fast_available() {
+        // With exactly one entry, both think and fast resolve to it; the
+        // auto fallback path is reached transparently.
+        let cat = catalog_with(vec![mk_entry("only", 100, &[ModelTask::Chat])]);
+        assert_eq!(
+            resolve_virtual_model("stratum/auto", &cat).as_deref(),
+            Some("only")
+        );
+    }
+
+    #[test]
+    fn resolve_virtual_model_returns_none_for_empty_catalog() {
+        let cat = ModelCatalog::new();
+        assert!(resolve_virtual_model("stratum/fast", &cat).is_none());
+        assert!(resolve_virtual_model("stratum/think", &cat).is_none());
+        assert!(resolve_virtual_model("stratum/auto", &cat).is_none());
+    }
+
+    #[test]
+    fn resolve_virtual_model_unknown_stratum_role_returns_none() {
+        // A `stratum/...` name that isn't one of the 5 canonical roles
+        // returns None — the HTTP layer turns that into 400.
+        let cat = catalog_with(vec![mk_entry("only", 100, &[ModelTask::Chat])]);
+        assert!(resolve_virtual_model("stratum/bogus", &cat).is_none());
+    }
+
+    #[test]
+    fn available_virtual_names_filters_to_resolvable_only() {
+        // Chat-only catalog with no coder slug → `stratum/code` does not
+        // resolve, the other four do. Order matches VIRTUAL_MODEL_NAMES.
+        let cat = catalog_with(vec![mk_entry("only", 100, &[ModelTask::Chat])]);
+        let names = available_virtual_names(&cat);
+        assert_eq!(
+            names,
+            vec![
+                "stratum/auto".to_string(),
+                "stratum/fast".to_string(),
+                "stratum/think".to_string(),
+                "stratum/multimodal".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn available_virtual_names_includes_code_when_coder_slug_present() {
+        let cat = catalog_with(vec![mk_entry(
+            "qwen-coder-7b",
+            7_000,
+            &[ModelTask::Code, ModelTask::Chat],
+        )]);
+        let names = available_virtual_names(&cat);
+        assert!(names.contains(&"stratum/code".to_string()));
+    }
+
+    #[test]
+    fn available_virtual_names_empty_catalog_yields_empty() {
+        let cat = ModelCatalog::new();
+        assert!(available_virtual_names(&cat).is_empty());
+    }
+
+    #[test]
+    fn from_catalog_appends_virtual_rows_after_concrete_entries() {
+        let cat = catalog_with(vec![mk_entry("foo", 100, &[ModelTask::Chat])]);
+        let list = OpenAIModelList::from_catalog(&cat);
+        // Concrete first.
+        assert_eq!(list.data[0].id, "foo");
+        // Then virtuals; all owned_by stratum.
+        let ids: Vec<&str> = list.data.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"stratum/fast"));
+        assert!(ids.contains(&"stratum/think"));
+        assert!(ids.contains(&"stratum/auto"));
+        assert!(ids.contains(&"stratum/multimodal"));
+        assert!(!ids.contains(&"stratum/code"));
+        for entry in &list.data {
+            assert_eq!(entry.owned_by, "stratum");
+            assert_eq!(entry.object, "model");
+        }
+    }
+
+    // ---------- HTTP-level virtual-model tests --------------------------
+
+    /// Build a server with a custom catalog and the echo factory.
+    fn start_server_with_catalog(reply: &str, catalog: ModelCatalog) -> OpenAIServerHandle {
+        let cfg = OpenAIServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            request_timeout: Duration::from_secs(2),
+        };
+        OpenAIServer::new(cfg, factory_for_echo(reply), Arc::new(catalog))
+            .start()
+            .expect("start")
+    }
+
+    #[test]
+    fn http_chat_completion_resolves_stratum_fast_to_smallest_model() {
+        // `stratum/fast` against a catalog with two entries resolves to
+        // the smaller slug; the response `model` field echoes the
+        // resolved slug, not the virtual name.
+        let cat = catalog_with(vec![
+            mk_entry("big", 9_000, &[ModelTask::Chat]),
+            mk_entry("tiny", 100, &[ModelTask::Chat]),
+        ]);
+        let handle = start_server_with_catalog("ok", cat);
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "stratum/fast",
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": false
+        })
+        .to_string();
+        let (code, resp_body) = post(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&resp_body).expect("json");
+        assert_eq!(v["model"], "tiny", "got body {resp_body}");
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_chat_completion_unresolved_stratum_name_returns_400_model_not_found() {
+        // `stratum/bogus` isn't one of the canonical 5; expected 400 with
+        // `error.code == "model_not_found"` and a helpful list of names
+        // that DO resolve.
+        let cat = catalog_with(vec![mk_entry("only", 100, &[ModelTask::Chat])]);
+        let handle = start_server_with_catalog("x", cat);
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "stratum/bogus",
+            "messages": [{"role":"user","content":"hi"}],
+        })
+        .to_string();
+        let (code, resp_body) = post(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 400);
+        let v: serde_json::Value = serde_json::from_str(&resp_body).expect("json");
+        assert_eq!(v["error"]["type"], "model_not_found");
+        assert_eq!(v["error"]["code"], "model_not_found");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("stratum/bogus"));
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_chat_completion_stratum_multimodal_with_no_vision_falls_back() {
+        // No vision model in catalog — `stratum/multimodal` MUST still
+        // resolve (falls back to largest) so callers don't get a 400.
+        // Pin that the resolution lands on a concrete slug AND the
+        // response model echoes the resolved name.
+        let cat = catalog_with(vec![mk_entry("only", 100, &[ModelTask::Chat])]);
+        let handle = start_server_with_catalog("x", cat);
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "stratum/multimodal",
+            "messages": [{"role":"user","content":"hi"}],
+        })
+        .to_string();
+        let (code, resp_body) = post(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&resp_body).expect("json");
+        assert_eq!(v["model"], "only");
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_chat_completion_stratum_multimodal_with_empty_catalog_returns_400() {
+        // No installed models at all → multimodal cannot resolve; the
+        // typed 400 fires.
+        let handle = start_server_with_catalog("x", ModelCatalog::new());
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "stratum/multimodal",
+            "messages": [{"role":"user","content":"hi"}],
+        })
+        .to_string();
+        let (code, resp_body) = post(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 400);
+        let v: serde_json::Value = serde_json::from_str(&resp_body).expect("json");
+        assert_eq!(v["error"]["code"], "model_not_found");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no installed models"));
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_list_models_includes_resolvable_virtual_names() {
+        // /v1/models against a Code-capable catalog includes the concrete
+        // entry AND every virtual name that resolves (including the
+        // `stratum/code` row that the Chat-only catalog suppresses).
+        let cat = catalog_with(vec![mk_entry(
+            "qwen-coder-7b",
+            7_000,
+            &[ModelTask::Code, ModelTask::Chat],
+        )]);
+        let handle = start_server_with_catalog("x", cat);
+        let addr = handle.bound_address().to_string();
+        let (code, body) = post(&addr, "/v1/models", "");
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        let arr = v["data"].as_array().unwrap();
+        let ids: Vec<String> = arr
+            .iter()
+            .map(|e| e["id"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert!(ids.contains(&"qwen-coder-7b".to_string()));
+        for vname in [
+            "stratum/auto",
+            "stratum/fast",
+            "stratum/code",
+            "stratum/think",
+            "stratum/multimodal",
+        ] {
+            assert!(
+                ids.contains(&vname.to_string()),
+                "missing {vname} in {ids:?}"
+            );
+        }
+        // Every row is owned_by stratum.
+        for row in arr {
+            assert_eq!(row["owned_by"], "stratum");
+        }
+        let _ = handle.stop();
     }
 }
