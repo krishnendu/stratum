@@ -164,6 +164,27 @@ impl MicCapture {
         self.stream.is_some()
     }
 
+    /// Test-only constructor that bypasses cpal entirely.
+    ///
+    /// Builds a `MicCapture` with the supplied native channel count and
+    /// sample rate and a pre-filled sample buffer. Lets the unit tests
+    /// exercise `stop`, `save_wav`, `is_recording`, `native_channels`,
+    /// and `native_sample_rate_hz` without touching the OS audio stack —
+    /// the cpal code paths themselves remain a documented carve-out
+    /// (`docs/coverage-exclusions.md`).
+    #[cfg(test)]
+    pub(crate) fn for_testing(channels: u16, sample_rate_hz: u32, samples: Vec<f32>) -> Self {
+        Self {
+            native_config: StreamConfig {
+                channels,
+                sample_rate: cpal::SampleRate(sample_rate_hz),
+                buffer_size: cpal::BufferSize::Default,
+            },
+            buffer: Arc::new(Mutex::new(samples)),
+            stream: None,
+        }
+    }
+
     /// Open the cpal input stream and begin appending samples.
     ///
     /// Idempotent in the sense that a second call while a stream is
@@ -527,12 +548,82 @@ mod tests {
     }
 
     // NOTE: We deliberately do NOT unit-test `MicCapture::new`,
-    // `MicCapture::start`, `MicCapture::stop`, or
-    // `MicCapture::list_input_devices`. cpal's CoreAudio backend on
-    // macOS test runners (and ALSA on headless Linux CI) issues OS-level
-    // calls during `cargo test` that can SIGSEGV when no audio device
-    // exists or no GUI run loop is available. These functions are
-    // exercised manually via the future `/audio` palette command and
-    // are documented as a measured coverage gap in
+    // `MicCapture::start`, or `MicCapture::list_input_devices`. cpal's
+    // CoreAudio backend on macOS test runners (and ALSA on headless Linux
+    // CI) issues OS-level calls during `cargo test` that can SIGSEGV when
+    // no audio device exists or no GUI run loop is available. These
+    // functions are exercised manually via the future `/audio` palette
+    // command and are documented as a measured coverage gap in
     // `docs/coverage-exclusions.md`.
+    //
+    // `MicCapture::stop` and `MicCapture::save_wav` ARE testable without
+    // touching cpal: the OS resource they care about — the `Stream` —
+    // is `Option<Stream>` and the test-only `for_testing` constructor
+    // synthesises a `MicCapture` with `stream = None` and a pre-filled
+    // buffer. The tests below cover the pure-data half of those methods.
+
+    #[test]
+    fn for_testing_constructor_round_trips_native_config() {
+        let cap = MicCapture::for_testing(2, 48_000, vec![]);
+        assert_eq!(cap.native_channels(), 2);
+        assert_eq!(cap.native_sample_rate_hz(), 48_000);
+        assert!(!cap.is_recording());
+    }
+
+    #[test]
+    fn stop_returns_resampled_mono_buffer() {
+        // 48 kHz stereo input → 16 kHz mono output. 6 stereo frames
+        // downmix to 6 mono samples, then downsample by 3 to 2 samples.
+        let samples = vec![
+            1.0_f32, -1.0, // frame 0 → 0.0
+            1.0, -1.0, // frame 1 → 0.0
+            1.0, -1.0, // frame 2 → 0.0
+            1.0, -1.0, // frame 3 → 0.0
+            1.0, -1.0, // frame 4 → 0.0
+            1.0, -1.0, // frame 5 → 0.0
+        ];
+        let mut cap = MicCapture::for_testing(2, 48_000, samples);
+        let out = cap.stop().expect("stop ok");
+        assert_eq!(out.len(), 2, "6 stereo frames / 3 (48→16) = 2 samples");
+        for s in out {
+            assert!(s.abs() < 1e-6, "stereo L=1.0,R=-1.0 averages to 0.0");
+        }
+    }
+
+    #[test]
+    fn stop_passthrough_when_already_mono_16k() {
+        let samples = vec![0.1_f32, -0.2, 0.3];
+        let mut cap = MicCapture::for_testing(1, TARGET_SAMPLE_RATE_HZ, samples.clone());
+        let out = cap.stop().expect("stop ok");
+        assert_eq!(out, samples);
+        // A second stop returns the same buffer — `stop` does not drain
+        // the captured samples, only the stream handle.
+        let out2 = cap.stop().expect("second stop ok");
+        assert_eq!(out2, samples);
+    }
+
+    #[test]
+    fn save_wav_writes_resampled_mono_16k_file() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = tmp.path().join("cap.wav");
+        // 1600 mono samples at 16 kHz — passthrough through resample,
+        // hound writes 1600 i16 samples.
+        let samples: Vec<f32> = (0..1600_u16)
+            .map(|i| (f32::from(i) / 1600.0) - 0.5)
+            .collect();
+        let mut cap = MicCapture::for_testing(1, TARGET_SAMPLE_RATE_HZ, samples);
+        cap.save_wav(&path).expect("save_wav ok");
+        let reader = hound::WavReader::open(&path).expect("open wav");
+        assert_eq!(reader.spec().sample_rate, TARGET_SAMPLE_RATE_HZ);
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.duration(), 1600);
+    }
+
+    #[test]
+    fn save_wav_returns_io_error_for_unwritable_path() {
+        let mut cap = MicCapture::for_testing(1, TARGET_SAMPLE_RATE_HZ, vec![0.0_f32]);
+        let nope = std::path::Path::new("/this/path/should/not/exist/clip.wav");
+        let err = cap.save_wav(nope).expect_err("expected io error");
+        assert!(matches!(err, MicError::Io(_)));
+    }
 }
