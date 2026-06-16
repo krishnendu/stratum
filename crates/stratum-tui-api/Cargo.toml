@@ -16,9 +16,10 @@ categories   = { workspace = true }
 workspace = true
 
 [dependencies]
-serde      = { workspace = true }
-thiserror  = { workspace = true }
-tokio-util = { workspace = true }
+serde         = { workspace = true }
+stratum-types = { path = "../stratum-types" }
+thiserror     = { workspace = true }
+tokio-util    = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

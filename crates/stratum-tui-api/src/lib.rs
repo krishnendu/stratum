@@ -51,6 +51,7 @@
 use std::sync::mpsc::Sender;
 
 use serde::{Deserialize, Serialize};
+use stratum_types::Block;
 use tokio_util::sync::CancellationToken;
 
 /// One model the user can select via `/models` / `/switch`.
@@ -85,6 +86,27 @@ pub struct BackendRequest {
     /// session ID; future fields land here without breaking older
     /// backends.
     pub system_hints: Vec<(String, String)>,
+    /// Multimodal payloads staged for this turn (`/image`, `/audio`,
+    /// or paste-image actions in the chat surface). Only
+    /// [`Block::Image`] and [`Block::Audio`] are meaningful here —
+    /// every other [`Block`] variant MUST be silently dropped by the
+    /// backend. Text-only backends MUST tolerate a populated
+    /// `attachments` field by dropping it with a debug log instead of
+    /// erroring; the user is responsible for picking a vision-capable
+    /// model. Empty for plain text-only turns.
+    ///
+    /// Note: the "MUST silently drop" rule is enforced **by convention
+    /// in each backend implementation** (see `EchoProvider` and
+    /// `LlamaCppProvider` in `stratum-runtime` for the canonical
+    /// pattern). This crate does not interpose a runtime filter.
+    ///
+    /// `#[serde(default)]` + `skip_serializing_if = "Vec::is_empty"`
+    /// keep the wire format backwards-compatible with pre-Phase-5
+    /// clients that don't know about attachments: an old client
+    /// serializes a request without the field; a new backend
+    /// deserializes it with an empty `attachments`, and vice versa.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Block>,
 }
 
 /// One event flowing back from the backend to the TUI. Maps onto
@@ -304,10 +326,56 @@ mod tests {
             turn_id: "t1".into(),
             plan_mode: true,
             system_hints: vec![("workspace".into(), "/tmp".into())],
+            attachments: vec![],
         };
         let raw = serde_json::to_string(&req).unwrap();
         let back: BackendRequest = serde_json::from_str(&raw).unwrap();
         assert_eq!(back, req);
+    }
+
+    #[test]
+    fn backend_request_round_trips_with_attachments() {
+        let req = BackendRequest {
+            prompt: "describe this picture".into(),
+            turn_id: "t7".into(),
+            plan_mode: false,
+            system_hints: vec![],
+            attachments: vec![
+                Block::image_inline_b64("image/png", "AAAA", 3),
+                Block::audio_url("audio/wav", "https://example.test/clip.wav"),
+            ],
+        };
+        let raw = serde_json::to_string(&req).unwrap();
+        let back: BackendRequest = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back, req, "attachments must round-trip verbatim");
+        assert_eq!(back.attachments.len(), 2);
+    }
+
+    #[test]
+    fn backend_request_empty_attachments_skip_serializing() {
+        // skip_serializing_if = "Vec::is_empty" keeps the wire format
+        // backwards-compatible with pre-Phase-5 clients.
+        let req = BackendRequest {
+            prompt: "hi".into(),
+            turn_id: "t1".into(),
+            plan_mode: false,
+            system_hints: vec![],
+            attachments: vec![],
+        };
+        let raw = serde_json::to_string(&req).unwrap();
+        assert!(
+            !raw.contains("attachments"),
+            "empty attachments must not appear on the wire, got: {raw}"
+        );
+    }
+
+    #[test]
+    fn backend_request_deserialises_without_attachments_field() {
+        // Pre-Phase-5 clients serialize without the field; new backends
+        // must parse those requests with attachments defaulting to [].
+        let raw = r#"{"prompt":"hi","turn_id":"t1","plan_mode":false,"system_hints":[]}"#;
+        let req: BackendRequest = serde_json::from_str(raw).unwrap();
+        assert!(req.attachments.is_empty());
     }
 
     #[test]

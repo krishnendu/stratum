@@ -176,10 +176,12 @@ impl BackendApi for LocalBackend {
                 turn_id: stratum_runtime::TurnId(turn_seq),
                 history: Vec::new(),
                 started_at: SystemTime::now(),
-                // TODO(plan/05): wire <vision-model> — the wire-protocol
-                // request shape currently has no attachments field. When
-                // it does, decode and forward here.
-                attachments: Vec::new(),
+                // Forward multimodal attachments verbatim. The wire
+                // contract (see `BackendRequest::attachments`) says only
+                // `Block::Image` and `Block::Audio` are meaningful;
+                // text-only providers downstream drop them with a
+                // debug log instead of erroring.
+                attachments: req.attachments,
             };
             let (chunk_tx, chunk_rx) = mpsc::channel::<Block>();
             let events_forward = events.clone();
@@ -368,6 +370,7 @@ mod tests {
                 turn_id: "t1".into(),
                 plan_mode: false,
                 system_hints: vec![],
+                attachments: vec![],
             },
             tx,
             cancel,
@@ -393,6 +396,156 @@ mod tests {
         assert!(saw_done, "expected terminal Done");
     }
 
+    /// A `Provider` that records every `GenerateRequest` it sees so
+    /// the integration test can assert the attachment list propagated
+    /// from `BackendRequest` → `TurnContext` → `GenerateRequest`
+    /// verbatim. Stubs out generation by emitting a single `Done`
+    /// block so the agent loop terminates cleanly.
+    #[derive(Debug, Default)]
+    struct CapturingProvider {
+        seen: Mutex<Vec<stratum_runtime::GenerateRequest>>,
+    }
+
+    impl stratum_runtime::Provider for CapturingProvider {
+        fn id(&self) -> &'static str {
+            "capturing"
+        }
+        fn capabilities(&self) -> &'static [stratum_types::Capability] {
+            &[]
+        }
+        fn generate(
+            &self,
+            request: &stratum_runtime::GenerateRequest,
+            _cancel: &CancelToken,
+        ) -> Vec<Block> {
+            self.seen.lock().unwrap().push(request.clone());
+            vec![Block::Done]
+        }
+    }
+
+    fn capturing_backend() -> (LocalBackend, Arc<CapturingProvider>) {
+        let provider = Arc::new(CapturingProvider::default());
+        let provider_dyn: Arc<dyn stratum_runtime::Provider> = provider.clone();
+        let events = Arc::new(EventEmitter::new(Arc::new(MemoryEventSink::new())));
+        let loop_ = Arc::new(
+            AgentLoop::builder()
+                .with_provider(provider_dyn)
+                .with_router(stratum_runtime::IntentRouter::default())
+                .with_permission_store(Arc::new(stratum_runtime::PermissionStore::new()))
+                .with_prompt_gen(Arc::new(stratum_runtime::PromptIdGen::new()))
+                .with_responder(Arc::new(stratum_runtime::AllowAllResponder))
+                .with_events(events)
+                .with_capability_matrix(Arc::new(stratum_runtime::CapabilityMatrix::new()))
+                .with_plan_mode(Arc::new(stratum_runtime::PlanMode::new()))
+                .with_config(AgentLoopConfig::default())
+                .build()
+                .expect("build capturing agent loop"),
+        );
+        let backend = LocalBackend::new(
+            loop_,
+            vec![ModelInfo {
+                slug: "capturing".into(),
+                display: "Capturing".into(),
+                active: true,
+            }],
+            "local · capturing".into(),
+        );
+        (backend, provider)
+    }
+
+    #[test]
+    fn submit_forwards_attachments_verbatim() {
+        // Integration: a `BackendRequest` carrying two attachments
+        // arrives at the provider with both still present and in
+        // order. This is the wire-shape contract a remote daemon /
+        // hosted backend will mirror.
+        let (b, provider) = capturing_backend();
+        let (tx, rx) = mpsc::channel();
+        let cancel = CancellationToken::new();
+        let attachments = vec![
+            stratum_types::Block::image_inline_b64("image/png", "AAAA", 3),
+            stratum_types::Block::audio_url("audio/wav", "https://example.test/clip.wav"),
+        ];
+        b.submit(
+            BackendRequest {
+                prompt: "describe these".into(),
+                turn_id: "t-attach".into(),
+                plan_mode: false,
+                system_hints: vec![],
+                attachments: attachments.clone(),
+            },
+            tx,
+            cancel,
+        );
+        // Drain until the turn terminates so the provider has been
+        // invoked. We don't care which terminal arrives — only that
+        // one does, then we inspect the captured request.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(
+                    BackendEvent::Done | BackendEvent::Cancelled { .. } | BackendEvent::Error(_),
+                ) => {
+                    break;
+                }
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
+            }
+        }
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "provider must see exactly one request");
+        assert_eq!(
+            seen[0].attachments.len(),
+            2,
+            "attachments must travel BackendRequest → TurnContext → GenerateRequest"
+        );
+        assert_eq!(
+            seen[0].attachments, attachments,
+            "attachments must arrive at the provider verbatim and in order"
+        );
+    }
+
+    #[test]
+    fn submit_with_empty_attachments_works() {
+        // Sanity: the default empty-attachments path still works end
+        // to end. Guards against accidentally requiring attachments
+        // on the caller side.
+        let (b, provider) = capturing_backend();
+        let (tx, rx) = mpsc::channel();
+        let cancel = CancellationToken::new();
+        b.submit(
+            BackendRequest {
+                prompt: "hi".into(),
+                turn_id: "t-empty".into(),
+                plan_mode: false,
+                system_hints: vec![],
+                attachments: vec![],
+            },
+            tx,
+            cancel,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(
+                    BackendEvent::Done | BackendEvent::Cancelled { .. } | BackendEvent::Error(_),
+                ) => {
+                    break;
+                }
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
+            }
+        }
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].attachments.is_empty(),
+            "an empty BackendRequest.attachments must reach the provider as empty"
+        );
+    }
+
     #[test]
     fn cancel_token_triggers_cancelled_event() {
         let b = echo_backend();
@@ -405,6 +558,7 @@ mod tests {
                 turn_id: "t1".into(),
                 plan_mode: false,
                 system_hints: vec![],
+                attachments: vec![],
             },
             tx,
             cancel,

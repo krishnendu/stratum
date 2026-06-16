@@ -2582,6 +2582,7 @@ version = "0.2.9"
 dependencies = [
  "serde",
  "serde_json",
+ "stratum-types",
  "thiserror",
  "tokio-util",
 ]
