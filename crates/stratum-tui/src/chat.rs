@@ -1383,7 +1383,13 @@ impl ChatState {
             // — that test asserts input/quit are untouched, which still
             // holds because the mic toggle mutates other fields only).
             KeyCode::F(5) => {
-                let _ = self.toggle_ptt();
+                // Surface any error (e.g. "voice support not compiled in"
+                // on a default-features build) as a transient status so
+                // the user gets visible feedback. Without this, pressing
+                // F5 on a non-voice build is a silent no-op.
+                if let Err(e) = self.toggle_ptt() {
+                    self.set_transient_status(format!("mic: {e}"));
+                }
             }
             // ---- editing ----------------------------------------------
             KeyCode::Char(c) => {
@@ -2519,6 +2525,28 @@ impl ChatState {
     /// Failures from Piper update the sticky session-disable flag and
     /// raise a transient status line so the user knows playback is off.
     fn speak_async(&mut self, text: String) {
+        // Default-features build (no `voice` feature): rodio is not
+        // linked, so even if piper synthesises successfully there is no
+        // way to play the resulting WAV. Disable TTS for the session
+        // and surface a visible status so the user does not believe
+        // playback is silently working.
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = text;
+            self.tts_enabled = false;
+            self.set_transient_status(
+                "tts: playback unavailable — rebuild with --features voice".to_string(),
+            );
+        }
+        #[cfg(feature = "voice")]
+        self.speak_async_inner(text);
+    }
+
+    /// Voice-feature-only body of [`Self::speak_async`]. Extracted so the
+    /// outer fn can short-circuit cleanly under `#[cfg(not(feature = "voice"))]`
+    /// without leaving an unused-binding lint or duplicated bookkeeping.
+    #[cfg(feature = "voice")]
+    fn speak_async_inner(&mut self, text: String) {
         let Some(piper) = self.piper.clone() else {
             return;
         };
@@ -4675,18 +4703,6 @@ fn play_wav_blocking(path: &std::path::Path) {
     sink.sleep_until_end();
 }
 
-/// Stub used when the `voice` feature is off. Voice-out is a UX nicety
-/// and the upstream code paths log a "[tts unavailable]" status when
-/// piper synth fails; this stub keeps the call site uniform so the
-/// caller does not need its own cfg.
-#[cfg(not(feature = "voice"))]
-fn play_wav_blocking(_path: &std::path::Path) {
-    tracing::debug!(
-        target = "tts",
-        "tts: playback skipped — voice support not compiled in"
-    );
-}
-
 /// Trim `text` for display in a one-line palette acknowledgement.
 fn trim_for_ack(text: &str, max_chars: usize) -> String {
     let one_line = text.replace(['\n', '\r'], " ");
@@ -5825,6 +5841,7 @@ mod tests {
         assert_eq!(s.expire_transient_status(), Some("heard: hi"));
     }
 
+    #[cfg(feature = "voice")]
     #[test]
     fn speak_async_disables_session_when_piper_missing() {
         let mut s = state();
@@ -5844,6 +5861,7 @@ mod tests {
             .unwrap_or(false));
     }
 
+    #[cfg(feature = "voice")]
     #[test]
     fn speak_async_no_piper_is_noop() {
         let mut s = state();
@@ -5855,6 +5873,7 @@ mod tests {
         assert!(s.transient_status().is_none());
     }
 
+    #[cfg(feature = "voice")]
     #[test]
     fn speak_async_empty_text_is_noop() {
         let mut s = state();
@@ -5867,6 +5886,24 @@ mod tests {
         // Whitespace-only payload should short-circuit before reaching piper.
         assert!(s.tts_enabled());
         assert!(!s.tts_session_disabled());
+    }
+
+    #[cfg(not(feature = "voice"))]
+    #[test]
+    fn speak_async_on_non_voice_build_surfaces_visible_status_and_disables_tts() {
+        // Pin the v1.0.0 Linux-prebuilt UX contract: pressing /tts on,
+        // then completing a turn, must produce a visible status line
+        // rather than a silent no-op. Without this guard a user who
+        // never set RUST_LOG=debug would believe playback worked.
+        let mut s = state();
+        s.tts_enabled = true;
+        s.speak_async("anything".to_string());
+        assert!(!s.tts_enabled());
+        let msg = s.transient_status().unwrap_or("");
+        assert!(
+            msg.contains("playback unavailable") && msg.contains("--features voice"),
+            "expected the non-voice tts message, got: {msg:?}"
+        );
     }
 
     #[test]
