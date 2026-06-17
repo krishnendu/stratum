@@ -661,15 +661,40 @@ mod tests {
     mod unix_subprocess {
         use super::*;
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
 
+        /// Atomically materialise a shell script at `dir/name` with mode
+        /// 0o755 and a real fsync before the file descriptor closes.
+        ///
+        /// The previous `fs::write` + chmod sequence had a Linux-only
+        /// race window where `execve` could observe the file as still
+        /// open-for-write and return `ETXTBSY` ("Text file busy"). This
+        /// most often hit on the coverage-instrumented CI job where the
+        /// runner is fork()-heavy and another thread can keep the new
+        /// fd reachable a bit longer than expected.
+        ///
+        /// Fix:
+        /// 1. Open with `mode(0o755)` at create time so we never go
+        ///    through a "writable-but-not-yet-executable" intermediate.
+        /// 2. `sync_all()` + drop the file so the kernel commits the
+        ///    inode + closes the fd before we return.
+        ///
+        /// Result: the file is mode 0o755 and not open-for-write by the
+        /// time `Command::new(...).spawn()` runs.
         fn write_script(dir: &TempDir, name: &str, body: &str) -> PathBuf {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
             let path = dir.path().join(name);
-            fs::write(&path, body).expect("write script");
-            let mut perms = fs::metadata(&path).expect("meta").permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&path, perms).expect("chmod");
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o755)
+                .open(&path)
+                .expect("create script");
+            f.write_all(body.as_bytes()).expect("write script body");
+            f.sync_all().expect("sync script");
+            drop(f);
             path
         }
 
