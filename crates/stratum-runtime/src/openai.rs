@@ -61,8 +61,9 @@ use crate::agent_factory::AgentFactory;
 use crate::agent_loop::{AgentLoop, TurnContext, TurnResult};
 use crate::cancel::CancelToken;
 use crate::conversation::TurnOutcome;
-use crate::model_catalog::{ModelCatalog, ModelEntry, ModelTask};
+use crate::model_catalog::{ModelCatalog, ModelEntry, ModelSlug, ModelTask};
 use crate::observability::TurnId;
+use crate::probe::HardwareProbe;
 use crate::provider::ChatHistoryTurn;
 
 // ---------------------------------------------------------------------------
@@ -814,6 +815,10 @@ pub struct OpenAIServer {
     factory: LoopFactory,
     catalog: Arc<ModelCatalog>,
     shutdown: Arc<AtomicBool>,
+    /// Test-only override for the RAM probe. `None` in production →
+    /// the request handler instantiates a [`LiveRamProbe`] per call.
+    #[cfg(test)]
+    probe_override: Option<Arc<dyn RamProbe + Send + Sync>>,
 }
 
 impl std::fmt::Debug for OpenAIServer {
@@ -834,7 +839,18 @@ impl OpenAIServer {
             factory,
             catalog,
             shutdown: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            probe_override: None,
         }
+    }
+
+    /// Test-only: swap in a synthetic RAM probe. Used by the memory-probe
+    /// 503 tests so the assertion does not depend on the host's free
+    /// memory.
+    #[cfg(test)]
+    fn with_probe(mut self, probe: Arc<dyn RamProbe + Send + Sync>) -> Self {
+        self.probe_override = Some(probe);
+        self
     }
 
     /// Start the acceptor loop on a dedicated thread.
@@ -853,6 +869,8 @@ impl OpenAIServer {
         let factory = self.factory.clone();
         let catalog = self.catalog.clone();
         let timeout = self.cfg.request_timeout;
+        #[cfg(test)]
+        let probe_override = self.probe_override.clone();
 
         let acceptor = thread::Builder::new()
             .name("stratum-openai-acceptor".to_string())
@@ -865,10 +883,25 @@ impl OpenAIServer {
                         Ok(Some(req)) => {
                             let factory = factory.clone();
                             let catalog = catalog.clone();
+                            #[cfg(test)]
+                            let probe_override = probe_override.clone();
                             let _ = thread::Builder::new()
                                 .name("stratum-openai-conn".to_string())
                                 .spawn(move || {
-                                    handle_request(req, &factory, &catalog, timeout);
+                                    #[cfg(test)]
+                                    {
+                                        handle_request_with_probe(
+                                            req,
+                                            &factory,
+                                            &catalog,
+                                            timeout,
+                                            probe_override.as_deref(),
+                                        );
+                                    }
+                                    #[cfg(not(test))]
+                                    {
+                                        handle_request(req, &factory, &catalog, timeout);
+                                    }
                                 });
                         }
                         Ok(None) => {
@@ -933,11 +966,41 @@ impl Drop for OpenAIServerHandle {
 // Request dispatch
 // ---------------------------------------------------------------------------
 
+#[cfg(not(test))]
 fn handle_request(
     req: tiny_http::Request,
     factory: &LoopFactory,
     catalog: &Arc<ModelCatalog>,
     _timeout: Duration,
+) {
+    dispatch(req, factory, catalog, &LiveRamProbe);
+}
+
+/// Test-mode variant of [`handle_request`] that accepts an optional
+/// probe override. When `probe_override` is `None` the live host probe
+/// is used; when `Some` the supplied probe is threaded into the chat
+/// handler so synthetic-memory tests can refuse without depending on
+/// the host's free RAM.
+#[cfg(test)]
+fn handle_request_with_probe(
+    req: tiny_http::Request,
+    factory: &LoopFactory,
+    catalog: &Arc<ModelCatalog>,
+    _timeout: Duration,
+    probe_override: Option<&(dyn RamProbe + Send + Sync)>,
+) {
+    if let Some(probe) = probe_override {
+        dispatch(req, factory, catalog, probe);
+    } else {
+        dispatch(req, factory, catalog, &LiveRamProbe);
+    }
+}
+
+fn dispatch(
+    req: tiny_http::Request,
+    factory: &LoopFactory,
+    catalog: &Arc<ModelCatalog>,
+    probe: &dyn RamProbe,
 ) {
     let method = req.method().clone();
     let url = req.url().to_string();
@@ -952,7 +1015,7 @@ fn handle_request(
 
     match (method, path.as_str()) {
         (Method::Post, "/v1/chat/completions") => {
-            handle_chat_completions(req, factory, catalog);
+            handle_chat_completions(req, factory, catalog, probe);
         }
         (Method::Post | Method::Get, "/v1/models") => {
             handle_list_models(req, catalog);
@@ -964,10 +1027,98 @@ fn handle_request(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Memory-probe / activation refusal
+// ---------------------------------------------------------------------------
+
+/// Working-set RAM estimate for a model on disk, in MiB.
+///
+/// Heuristic per `plan/07` Phase 6: `file_size_mib + 1.5x overhead` covers
+/// the GGUF mmap residency + KV cache + activation buffers a llama.cpp
+/// inference loop touches once it warms up. Saturating arithmetic guards
+/// against catalog entries that declare nonsense sizes.
+#[must_use]
+pub const fn required_mib_for_model(file_size_mib: u64) -> u64 {
+    let overhead = file_size_mib.saturating_mul(3).saturating_div(2);
+    file_size_mib.saturating_add(overhead)
+}
+
+/// Pluggable RAM-availability source. The HTTP request path uses
+/// [`LiveRamProbe`] (delegates to [`HardwareProbe::run`]); tests
+/// substitute a [`SyntheticRamProbe`] so the assertion does not depend
+/// on the host's free memory.
+trait RamProbe {
+    fn available_mib(&self) -> u64;
+}
+
+struct LiveRamProbe;
+
+impl RamProbe for LiveRamProbe {
+    fn available_mib(&self) -> u64 {
+        u64::from(HardwareProbe::run().ram_available_mib)
+    }
+}
+
+#[cfg(test)]
+struct SyntheticRamProbe(u64);
+
+#[cfg(test)]
+impl RamProbe for SyntheticRamProbe {
+    fn available_mib(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Outcome of [`memory_probe_for_model`]: either the request can proceed
+/// (model not in catalog, or fits), or it must be refused with a
+/// pre-built 503 body.
+enum MemoryCheck {
+    /// No catalog entry matched, or the entry fits in the available RAM
+    /// reported by the probe.
+    Ok,
+    /// The model's required working set exceeds available RAM. The
+    /// payload carries the rendered error message for the 503 body.
+    TooLarge { message: String },
+}
+
+/// Check whether the resolved model would fit in available RAM.
+///
+/// * If the `model` label parses as a [`ModelSlug`] and the catalog has
+///   a matching entry, the entry's `size_mib` is multiplied through
+///   [`required_mib_for_model`] and compared to the probe's available
+///   MiB.
+/// * If the label does not parse as a slug, or the slug is not in the
+///   catalog, the check is skipped and the request is allowed through
+///   (the eventual provider handles the "unknown model" surface).
+fn memory_probe_for_model(
+    model: &str,
+    catalog: &ModelCatalog,
+    probe: &dyn RamProbe,
+) -> MemoryCheck {
+    let Ok(slug) = model.parse::<ModelSlug>() else {
+        return MemoryCheck::Ok;
+    };
+    let Some(entry) = catalog.get(&slug) else {
+        return MemoryCheck::Ok;
+    };
+    let required = required_mib_for_model(entry.size_mib);
+    let available = probe.available_mib();
+    if required > available {
+        MemoryCheck::TooLarge {
+            message: format!(
+                "model '{model}' requires {required} MiB but only {available} MiB is available",
+            ),
+        }
+    } else {
+        MemoryCheck::Ok
+    }
+}
+
 fn handle_chat_completions(
     mut req: tiny_http::Request,
     factory: &LoopFactory,
     catalog: &Arc<ModelCatalog>,
+    probe: &dyn RamProbe,
 ) {
     // Cap request body at 20 MiB to bound the memory cost of a
     // multimodal request that ships base64 image payloads inline.
@@ -1034,6 +1185,17 @@ fn handle_chat_completions(
 
     let stream = parsed.stream;
     let model_label = parsed.model.clone();
+
+    // Memory-probe gate: if the resolved model is in the catalog and
+    // the working-set estimate exceeds available RAM, refuse with 503
+    // + Retry-After so OpenAI-shaped clients can degrade rather than
+    // OOM the host (plan/07 Phase 6).
+    if let MemoryCheck::TooLarge { message } = memory_probe_for_model(&model_label, catalog, probe)
+    {
+        respond_model_too_large(req, &message);
+        return;
+    }
+
     let ctx: TurnContext = parsed.into();
 
     let agent = match (factory)() {
@@ -1280,16 +1442,33 @@ fn respond_error_owned(req: tiny_http::Request, status: u16, ty: &str, msg: &str
     let _ = req.respond(with_cors(response));
 }
 
+/// HTTP 503 response for a model-activation refusal: the OpenAI-shaped
+/// error body carries `code: "model_too_large"` (distinct from `type`)
+/// and the response sets `Retry-After: 30` so polite clients back off.
+fn respond_model_too_large(req: tiny_http::Request, msg: &str) {
+    let body = error_body_with_code("server_error", "model_too_large", msg);
+    let response = Response::from_string(body)
+        .with_status_code(StatusCode(503))
+        .with_header(json_header())
+        .with_header(static_header(b"Retry-After", b"30"));
+    let _ = req.respond(with_cors(response));
+}
+
 fn error_body(ty: &str, message: &str) -> String {
     // The OpenAI error shape carries `type`, `message`, AND `code`;
     // Python-SDK callers key on `error.code` for retry classification.
     // We mirror `code` to `type` since we don't yet emit a more
     // specific machine-readable code than the type label.
+    error_body_with_code(ty, ty, message)
+}
+
+fn error_body_with_code(ty: &str, code: &str, message: &str) -> String {
     serde_json::json!({
         "error": {
             "type": ty,
             "message": message,
-            "code": ty,
+            "code": code,
+            "param": serde_json::Value::Null,
         }
     })
     .to_string()
@@ -3514,7 +3693,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Virtual model name resolution (`stratum/<role>` mapping).
+    // Shared helpers for both virtual-model-name and memory-probe tests.
     // ---------------------------------------------------------------------
 
     fn mk_entry(
@@ -3522,7 +3701,7 @@ mod tests {
         size_mib: u64,
         tasks: &[crate::model_catalog::ModelTask],
     ) -> crate::model_catalog::ModelEntry {
-        use crate::model_catalog::{ArtifactRef, ModelEntry, ModelTier};
+        use crate::model_catalog::{ArtifactRef, ModelEntry};
         let artifact = ArtifactRef::new(
             "https://example.com/m.gguf".to_string(),
             "0".repeat(64),
@@ -3533,7 +3712,7 @@ mod tests {
             slug: slug.parse().unwrap(),
             family: "fam".to_string(),
             display_name: slug.to_string(),
-            tier: ModelTier::Low,
+            tier: crate::model_catalog::ModelTier::Low,
             task: tasks.iter().copied().collect(),
             size_mib,
             quantization: "Q4_K_M".to_string(),
@@ -3550,6 +3729,16 @@ mod tests {
             cat.insert(e);
         }
         cat
+    }
+
+    /// Single-model catalog helper used by the memory-probe tests:
+    /// inserts one chat-capable entry at the given slug + size.
+    fn catalog_with_model(slug: &str, size_mib: u64) -> ModelCatalog {
+        catalog_with(vec![mk_entry(
+            slug,
+            size_mib,
+            &[crate::model_catalog::ModelTask::Chat],
+        )])
     }
 
     #[test]
@@ -3745,7 +3934,89 @@ mod tests {
         }
     }
 
-    // ---------- HTTP-level virtual-model tests --------------------------
+    // ---------- Memory-probe unit tests --------------------------------
+
+    #[test]
+    fn required_mib_applies_one_point_five_x_overhead_to_file_size() {
+        // 1000 MiB file → 1000 + (1000 * 1.5) = 2500 MiB working set.
+        assert_eq!(required_mib_for_model(1_000), 2_500);
+        assert_eq!(required_mib_for_model(0), 0);
+        // 2 MiB → 2 + (2*1.5) = 5 (integer math: 2 + 3 = 5).
+        assert_eq!(required_mib_for_model(2), 5);
+        // Small rounding: 1 MiB → 1 + (1*3/2=1) = 2.
+        assert_eq!(required_mib_for_model(1), 2);
+    }
+
+    #[test]
+    fn required_mib_saturates_at_u64_max_instead_of_overflowing() {
+        let got = required_mib_for_model(u64::MAX);
+        assert_eq!(got, u64::MAX);
+    }
+
+    #[test]
+    fn memory_probe_skips_unknown_model_label() {
+        let cat = ModelCatalog::new();
+        let probe = SyntheticRamProbe(1);
+        assert!(matches!(
+            memory_probe_for_model("Unknown-MODEL", &cat, &probe),
+            MemoryCheck::Ok
+        ));
+    }
+
+    #[test]
+    fn memory_probe_skips_model_not_in_catalog() {
+        let cat = ModelCatalog::new();
+        let probe = SyntheticRamProbe(1);
+        assert!(matches!(
+            memory_probe_for_model("not-in-catalog", &cat, &probe),
+            MemoryCheck::Ok
+        ));
+    }
+
+    #[test]
+    fn memory_probe_refuses_when_required_exceeds_available() {
+        let cat = catalog_with_model("big-model", 10_000);
+        let probe = SyntheticRamProbe(1_024);
+        match memory_probe_for_model("big-model", &cat, &probe) {
+            MemoryCheck::TooLarge { message } => {
+                assert!(message.contains("big-model"));
+                assert!(message.contains("25000 MiB"));
+                assert!(message.contains("1024 MiB"));
+            }
+            MemoryCheck::Ok => panic!("expected refusal"),
+        }
+    }
+
+    #[test]
+    fn memory_probe_allows_when_required_fits_in_available() {
+        let cat = catalog_with_model("small-model", 100);
+        let probe = SyntheticRamProbe(8 * 1_024);
+        assert!(matches!(
+            memory_probe_for_model("small-model", &cat, &probe),
+            MemoryCheck::Ok
+        ));
+    }
+
+    #[test]
+    fn memory_probe_boundary_required_equals_available_is_ok() {
+        let cat = catalog_with_model("edge-model", 100);
+        let probe = SyntheticRamProbe(250);
+        assert!(matches!(
+            memory_probe_for_model("edge-model", &cat, &probe),
+            MemoryCheck::Ok
+        ));
+    }
+
+    #[test]
+    fn error_body_with_code_distinguishes_type_and_code_and_param_is_null() {
+        let body = error_body_with_code("server_error", "model_too_large", "msg");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["type"], "server_error");
+        assert_eq!(v["error"]["code"], "model_too_large");
+        assert_eq!(v["error"]["message"], "msg");
+        assert!(v["error"]["param"].is_null());
+        assert!(v["error"].as_object().unwrap().contains_key("param"));
+    }
 
     /// Build a server with a custom catalog and the echo factory.
     fn start_server_with_catalog(reply: &str, catalog: ModelCatalog) -> OpenAIServerHandle {
@@ -3758,11 +4029,65 @@ mod tests {
             .expect("start")
     }
 
+    /// Spin up an HTTP server with a synthetic catalog + synthetic
+    /// probe so the wire-level 503 path runs without depending on the
+    /// host's free RAM.
+    fn start_server_with_probe(
+        reply: &str,
+        catalog: ModelCatalog,
+        available_mib: u64,
+    ) -> OpenAIServerHandle {
+        let cfg = OpenAIServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            request_timeout: Duration::from_secs(2),
+        };
+        let probe: Arc<dyn RamProbe + Send + Sync> = Arc::new(SyntheticRamProbe(available_mib));
+        OpenAIServer::new(cfg, factory_for_echo(reply), Arc::new(catalog))
+            .with_probe(probe)
+            .start()
+            .expect("start")
+    }
+
+    /// Variant of `post` that returns the raw response headers — needed
+    /// to assert the `Retry-After` header on the 503.
+    fn post_capture_headers(addr: &str, path: &str, body: &str) -> (u16, String, String) {
+        use std::io::{BufRead, BufReader, Read as _, Write};
+        use std::net::TcpStream;
+        let mut s = TcpStream::connect(addr).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        s.flush().unwrap();
+        let mut r = BufReader::new(s);
+        let mut status_line = String::new();
+        r.read_line(&mut status_line).unwrap();
+        let code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            headers.push_str(&line);
+        }
+        let mut body_buf = String::new();
+        let _ = r.read_to_string(&mut body_buf);
+        (code, headers, body_buf)
+    }
+
+    // ---------- HTTP-level virtual-model tests (from #182) --------------
+
     #[test]
     fn http_chat_completion_resolves_stratum_fast_to_smallest_model() {
-        // `stratum/fast` against a catalog with two entries resolves to
-        // the smaller slug; the response `model` field echoes the
-        // resolved slug, not the virtual name.
         let cat = catalog_with(vec![
             mk_entry("big", 9_000, &[ModelTask::Chat]),
             mk_entry("tiny", 100, &[ModelTask::Chat]),
@@ -3784,9 +4109,6 @@ mod tests {
 
     #[test]
     fn http_chat_completion_unresolved_stratum_name_returns_400_model_not_found() {
-        // `stratum/bogus` isn't one of the canonical 5; expected 400 with
-        // `error.code == "model_not_found"` and a helpful list of names
-        // that DO resolve.
         let cat = catalog_with(vec![mk_entry("only", 100, &[ModelTask::Chat])]);
         let handle = start_server_with_catalog("x", cat);
         let addr = handle.bound_address().to_string();
@@ -3809,10 +4131,6 @@ mod tests {
 
     #[test]
     fn http_chat_completion_stratum_multimodal_with_no_vision_falls_back() {
-        // No vision model in catalog — `stratum/multimodal` MUST still
-        // resolve (falls back to largest) so callers don't get a 400.
-        // Pin that the resolution lands on a concrete slug AND the
-        // response model echoes the resolved name.
         let cat = catalog_with(vec![mk_entry("only", 100, &[ModelTask::Chat])]);
         let handle = start_server_with_catalog("x", cat);
         let addr = handle.bound_address().to_string();
@@ -3830,8 +4148,6 @@ mod tests {
 
     #[test]
     fn http_chat_completion_stratum_multimodal_with_empty_catalog_returns_400() {
-        // No installed models at all → multimodal cannot resolve; the
-        // typed 400 fires.
         let handle = start_server_with_catalog("x", ModelCatalog::new());
         let addr = handle.bound_address().to_string();
         let body = serde_json::json!({
@@ -3852,9 +4168,6 @@ mod tests {
 
     #[test]
     fn http_list_models_includes_resolvable_virtual_names() {
-        // /v1/models against a Code-capable catalog includes the concrete
-        // entry AND every virtual name that resolves (including the
-        // `stratum/code` row that the Chat-only catalog suppresses).
         let cat = catalog_with(vec![mk_entry(
             "qwen-coder-7b",
             7_000,
@@ -3883,10 +4196,159 @@ mod tests {
                 "missing {vname} in {ids:?}"
             );
         }
-        // Every row is owned_by stratum.
         for row in arr {
             assert_eq!(row["owned_by"], "stratum");
         }
         let _ = handle.stop();
+    }
+
+    // ---------- HTTP-level memory-probe tests (from #184) --------------
+
+    #[test]
+    fn http_chat_completion_returns_503_when_model_too_large_for_available_ram() {
+        let cat = catalog_with_model("huge-model", 10_000);
+        let handle = start_server_with_probe("x", cat, 1);
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "huge-model",
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": false
+        })
+        .to_string();
+        let (code, headers, resp_body) = post_capture_headers(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 503);
+        let v: serde_json::Value = serde_json::from_str(&resp_body).expect("json");
+        assert_eq!(v["error"]["code"], "model_too_large");
+        assert_eq!(v["error"]["type"], "server_error");
+        assert!(v["error"]["param"].is_null());
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("huge-model"));
+        let lh = headers.to_ascii_lowercase();
+        assert!(
+            lh.contains("retry-after: 30"),
+            "expected Retry-After: 30 in headers; got:\n{headers}"
+        );
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_chat_completion_proceeds_with_200_when_available_ram_is_sufficient() {
+        let cat = catalog_with_model("small-model", 100);
+        let handle = start_server_with_probe("hello", cat, 8 * 1_024);
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "small-model",
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": false
+        })
+        .to_string();
+        let (code, _headers, resp_body) =
+            post_capture_headers(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_str(&resp_body).expect("json");
+        assert_eq!(v["object"], "chat.completion");
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn http_chat_completion_unknown_model_label_skips_memory_probe() {
+        let cat = ModelCatalog::new();
+        let handle = start_server_with_probe("echoed", cat, 1);
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "no-such-model",
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": false
+        })
+        .to_string();
+        let (code, _headers, resp_body) =
+            post_capture_headers(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 200);
+        assert!(resp_body.contains("echoed"));
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn handle_list_models_works_when_using_default_live_probe() {
+        // Companion to the chat-completion no-override test: verify
+        // the GET /v1/models route also works when no probe override
+        // is installed (LiveRamProbe is the default in the test
+        // dispatcher's `else` arm).
+        use std::io::{BufRead, BufReader, Read as _, Write};
+        use std::net::TcpStream;
+        let cfg = OpenAIServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            request_timeout: Duration::from_secs(2),
+        };
+        let handle = OpenAIServer::new(cfg, factory_for_echo("ok"), Arc::new(ModelCatalog::new()))
+            .start()
+            .expect("start");
+        let addr = handle.bound_address().to_string();
+        let mut s = TcpStream::connect(&addr).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let req = format!("GET /v1/models HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).unwrap();
+        s.flush().unwrap();
+        let mut r = BufReader::new(s);
+        let mut status_line = String::new();
+        r.read_line(&mut status_line).unwrap();
+        assert!(status_line.contains("200"), "got {status_line}");
+        let mut sink = String::new();
+        let _ = r.read_to_string(&mut sink);
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn handle_request_with_no_probe_override_routes_through_live_probe() {
+        // When `OpenAIServer::with_probe` is *not* called, the test
+        // dispatcher falls through to `LiveRamProbe`. Exercise that
+        // arm by spinning up a server with the default config and an
+        // empty catalog (memory check is a no-op for unknown models),
+        // then issuing a 200-able request.
+        let cfg = OpenAIServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            request_timeout: Duration::from_secs(2),
+        };
+        let handle = OpenAIServer::new(cfg, factory_for_echo("ok"), Arc::new(ModelCatalog::new()))
+            .start()
+            .expect("start");
+        let addr = handle.bound_address().to_string();
+        let body = serde_json::json!({
+            "model": "unknown-model",
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": false
+        })
+        .to_string();
+        let (code, _h, resp_body) = post_capture_headers(&addr, "/v1/chat/completions", &body);
+        assert_eq!(code, 200);
+        assert!(resp_body.contains("ok"));
+        let _ = handle.stop();
+    }
+
+    #[test]
+    fn live_ram_probe_reads_hardware_probe_value() {
+        // Exercise the production probe path so the `LiveRamProbe`
+        // impl isn't dead code at coverage time. The exact value
+        // depends on the host, but any non-broken probe returns
+        // *some* value reachable from `HardwareProbe::run()`. The
+        // assertion below pins the type-level invariant (call
+        // succeeds, returns u64) — a stronger numeric assertion
+        // would race with concurrent allocations on the CI host.
+        let live = LiveRamProbe;
+        let got = live.available_mib();
+        // Cross-check: the probe must round-trip through the same
+        // upstream call within a small tolerance. The exact value
+        // depends on the host's free memory and shifts moment-to-
+        // moment with allocator activity, so we just bound the delta
+        // at 4 GiB — wide enough to be flake-free under cargo test
+        // load, tight enough to catch an impl that returns garbage.
+        let expected = u64::from(HardwareProbe::run().ram_available_mib);
+        let delta = got.max(expected) - got.min(expected);
+        assert!(
+            delta <= 4 * 1_024,
+            "delta={delta} got={got} expected={expected}"
+        );
     }
 }
