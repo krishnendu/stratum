@@ -25,22 +25,35 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux prebuilts ship WITHOUT --features voice. cpal pulls
+          # `alsa-sys` which requires libasound2-dev on the build runner
+          # AND links libasound2.so.2 at runtime — keeping voice off on
+          # the Linux tarball means the prebuilt runs on minimal distros
+          # without an ALSA dep, and users who want voice compile from
+          # source with --features voice after `apt install libasound2-dev`.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
             builder: cargo
+            features: ""
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
             builder: zigbuild
+            features: ""
+          # macOS prebuilts ship WITH --features voice. CoreAudio is a
+          # system framework with no extra deps so the resulting binary
+          # has no surprise runtime requirements.
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
             builder: cargo
+            features: "--features voice"
           - target: x86_64-apple-darwin
             os: macos-13
             archive: tar.gz
             builder: cargo
+            features: "--features voice"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
@@ -60,10 +73,10 @@ jobs:
         run: cargo install --locked cargo-zigbuild
       - name: cargo build --release
         if: matrix.builder == 'cargo'
-        run: cargo build --release --bin stratum --target ${{ matrix.target }}
+        run: cargo build --release --bin stratum --target ${{ matrix.target }} ${{ matrix.features }}
       - name: cargo zigbuild --release
         if: matrix.builder == 'zigbuild'
-        run: cargo zigbuild --release --bin stratum --target ${{ matrix.target }}
+        run: cargo zigbuild --release --bin stratum --target ${{ matrix.target }} ${{ matrix.features }}
       - name: archive
         shell: bash
         run: |

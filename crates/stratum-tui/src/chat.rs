@@ -193,6 +193,27 @@ struct MicCaptureCell {
     started_rx: mpsc::Receiver<Result<(), String>>,
 }
 
+#[cfg(not(feature = "voice"))]
+impl MicCaptureCell {
+    /// Stub used when the `voice` feature is off (e.g. the prebuilt Linux
+    /// tarball). Always returns the same typed error so the
+    /// `/mic` palette command and the F5 hotkey surface a clear "voice
+    /// support not compiled in — rebuild with `--features voice`" message
+    /// instead of silently doing nothing.
+    fn start() -> Result<Self, String> {
+        Err("voice support not compiled in (rebuild with --features voice)".to_string())
+    }
+
+    /// Stub that mirrors the live signature. Unreachable in practice
+    /// because [`Self::start`] always returns `Err` under non-voice
+    /// builds, so no caller ever holds a `MicCaptureCell` to stop.
+    fn stop_and_save(self, _path: std::path::PathBuf) -> Result<std::path::PathBuf, String> {
+        let _ = (self.join, self.stop_tx, self.started_rx);
+        Err("voice support not compiled in".to_string())
+    }
+}
+
+#[cfg(feature = "voice")]
 impl MicCaptureCell {
     /// Spawn the worker thread, open the cpal stream, and return once
     /// the worker reports a successful start (or a typed error).
@@ -1362,7 +1383,13 @@ impl ChatState {
             // — that test asserts input/quit are untouched, which still
             // holds because the mic toggle mutates other fields only).
             KeyCode::F(5) => {
-                let _ = self.toggle_ptt();
+                // Surface any error (e.g. "voice support not compiled in"
+                // on a default-features build) as a transient status so
+                // the user gets visible feedback. Without this, pressing
+                // F5 on a non-voice build is a silent no-op.
+                if let Err(e) = self.toggle_ptt() {
+                    self.set_transient_status(format!("mic: {e}"));
+                }
             }
             // ---- editing ----------------------------------------------
             KeyCode::Char(c) => {
@@ -2498,6 +2525,28 @@ impl ChatState {
     /// Failures from Piper update the sticky session-disable flag and
     /// raise a transient status line so the user knows playback is off.
     fn speak_async(&mut self, text: String) {
+        // Default-features build (no `voice` feature): rodio is not
+        // linked, so even if piper synthesises successfully there is no
+        // way to play the resulting WAV. Disable TTS for the session
+        // and surface a visible status so the user does not believe
+        // playback is silently working.
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = text;
+            self.tts_enabled = false;
+            self.set_transient_status(
+                "tts: playback unavailable — rebuild with --features voice".to_string(),
+            );
+        }
+        #[cfg(feature = "voice")]
+        self.speak_async_inner(text);
+    }
+
+    /// Voice-feature-only body of [`Self::speak_async`]. Extracted so the
+    /// outer fn can short-circuit cleanly under `#[cfg(not(feature = "voice"))]`
+    /// without leaving an unused-binding lint or duplicated bookkeeping.
+    #[cfg(feature = "voice")]
+    fn speak_async_inner(&mut self, text: String) {
         let Some(piper) = self.piper.clone() else {
             return;
         };
@@ -4625,6 +4674,7 @@ fn base64_encode_chat(bytes: &[u8]) -> String {
 /// "[tts unavailable]" message that lights up on Piper failure is the
 /// user-visible feedback channel; rodio failures during playback are
 /// rare enough that a transient log is the right signal.
+#[cfg(feature = "voice")]
 fn play_wav_blocking(path: &std::path::Path) {
     use std::io::BufReader;
     let file = match std::fs::File::open(path) {
@@ -5791,6 +5841,7 @@ mod tests {
         assert_eq!(s.expire_transient_status(), Some("heard: hi"));
     }
 
+    #[cfg(feature = "voice")]
     #[test]
     fn speak_async_disables_session_when_piper_missing() {
         let mut s = state();
@@ -5810,6 +5861,7 @@ mod tests {
             .unwrap_or(false));
     }
 
+    #[cfg(feature = "voice")]
     #[test]
     fn speak_async_no_piper_is_noop() {
         let mut s = state();
@@ -5821,6 +5873,7 @@ mod tests {
         assert!(s.transient_status().is_none());
     }
 
+    #[cfg(feature = "voice")]
     #[test]
     fn speak_async_empty_text_is_noop() {
         let mut s = state();
@@ -5833,6 +5886,24 @@ mod tests {
         // Whitespace-only payload should short-circuit before reaching piper.
         assert!(s.tts_enabled());
         assert!(!s.tts_session_disabled());
+    }
+
+    #[cfg(not(feature = "voice"))]
+    #[test]
+    fn speak_async_on_non_voice_build_surfaces_visible_status_and_disables_tts() {
+        // Pin the v1.0.0 Linux-prebuilt UX contract: pressing /tts on,
+        // then completing a turn, must produce a visible status line
+        // rather than a silent no-op. Without this guard a user who
+        // never set RUST_LOG=debug would believe playback worked.
+        let mut s = state();
+        s.tts_enabled = true;
+        s.speak_async("anything".to_string());
+        assert!(!s.tts_enabled());
+        let msg = s.transient_status().unwrap_or("");
+        assert!(
+            msg.contains("playback unavailable") && msg.contains("--features voice"),
+            "expected the non-voice tts message, got: {msg:?}"
+        );
     }
 
     #[test]

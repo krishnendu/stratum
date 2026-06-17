@@ -24,6 +24,13 @@ default = []
 # Forwards to `stratum-runtime`'s `provider-llama-cpp` feature so the CLI
 # can opt into the llama.cpp-backed provider. Off by default.
 provider-llama-cpp = ["stratum-runtime/provider-llama-cpp"]
+# Forwards to `stratum-tui` and `stratum-runtime`'s `voice` feature, which
+# enables cpal-backed microphone capture (push-to-talk). Off by default
+# so cross-compile to Linux from macOS works without ALSA headers. macOS
+# release tarballs enable this; the Linux prebuilt does not. Users who
+# want voice-in on Linux compile from source with
+# `cargo install --features voice` after `apt install libasound2-dev`.
+voice = ["stratum-tui/voice", "stratum-runtime/voice"]
 
 [dependencies]
 stratum-types       = { path = "../stratum-types" }

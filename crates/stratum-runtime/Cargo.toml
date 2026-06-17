@@ -17,6 +17,15 @@ workspace = true
 
 [features]
 default = []
+# Push-to-talk microphone capture via `cpal`. Off by default so the
+# default build does not pull a platform audio dep — important for
+# cross-compile on hosts without ALSA headers (Linux) or CoreAudio
+# (when targeting Linux from macOS). Voice-out (`piper` subprocess)
+# is unaffected: it shells out to a binary and has no link-time
+# dependency, so it stays on regardless. macOS release builds enable
+# this; the Linux prebuilt does not — users who want voice-in on
+# Linux compile from source after `apt install libasound2-dev`.
+voice = ["dep:cpal", "dep:hound"]
 # Pulls in the optional `llama-cpp-2` crate and compiles the
 # `LlamaCppProvider` scaffold. Off by default; the heavy llama.cpp build
 # is exercised by the `provider-llama-cpp` workflow (nightly cron, release
@@ -59,8 +68,8 @@ keyring            = { workspace = true, optional = true }
 notify             = { workspace = true, optional = true }
 thiserror          = { workspace = true }
 tiny_http          = { workspace = true }
-cpal               = { workspace = true }
-hound              = { workspace = true }
+cpal               = { workspace = true, optional = true }
+hound              = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
