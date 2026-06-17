@@ -36,3 +36,4 @@ target/
 
 # Local release artifacts (built via manual ship; CI uploads from a clean runner)
 release-files/
+release-files-*/
