@@ -698,6 +698,50 @@ mod tests {
             path
         }
 
+        /// Wrap a judge invocation with a small retry-on-ETXTBSY loop.
+        ///
+        /// Linux's `execve(2)` can return `ETXTBSY` if any open file
+        /// descriptor in any process still has the to-be-executed file
+        /// open for writing. Under `cargo llvm-cov`'s fork-heavy
+        /// instrumentation, the test-runner parent occasionally hangs
+        /// onto the just-written script's fd a few hundred microseconds
+        /// longer than the spawn path's `Command::spawn()` expects, and
+        /// that races with the in-process test thread that produced the
+        /// file. The actual file is fine; we just need to wait the
+        /// window out.
+        ///
+        /// This shim catches the specific `Spawn(ETXTBSY)` arm,
+        /// re-spawns up to 8 times across a budget of ~80 ms (geometric
+        /// 1ms+2ms+4ms+...+128ms), then surfaces the last error if it
+        /// still hasn't cleared. Any non-ETXTBSY outcome — including
+        /// the successful `Ok(_)` arm — short-circuits the loop.
+        fn judge_retry_etxtbsy(
+            judge: &ClaudeCliJudge,
+            prompt: &JudgePrompt,
+        ) -> Result<JudgeResponse, JudgeError> {
+            use std::thread::sleep;
+            use std::time::Duration;
+            // ETXTBSY is `26` on both Linux and macOS — hardcoded so we
+            // don't pull in the `libc` crate just for one constant.
+            const ETXTBSY: i32 = 26;
+            let mut backoff = Duration::from_millis(1);
+            let mut last_err = None;
+            for _ in 0..8 {
+                match judge.judge(prompt) {
+                    Err(JudgeError::Spawn(e)) if e.raw_os_error() == Some(ETXTBSY) => {
+                        last_err = Some(JudgeError::Spawn(e));
+                        sleep(backoff);
+                        backoff = backoff.saturating_mul(2);
+                    }
+                    other => return other,
+                }
+            }
+            // Eight retries hit ETXTBSY — surface the last error.
+            Err(last_err.unwrap_or_else(|| {
+                JudgeError::Spawn(std::io::Error::other("ETXTBSY retry budget exhausted"))
+            }))
+        }
+
         #[test]
         fn judge_with_pass_script_returns_pass() {
             let tmp = TempDir::new().expect("tmp");
@@ -709,7 +753,7 @@ mod tests {
             let judge = ClaudeCliJudge::new()
                 .with_binary(script)
                 .with_timeout(Duration::from_secs(5));
-            let resp = judge.judge(&sample_prompt()).expect("judge ok");
+            let resp = judge_retry_etxtbsy(&judge, &sample_prompt()).expect("judge ok");
             assert_eq!(resp.verdict, JudgeVerdict::Pass);
             assert!(resp.raw_stdout.contains("pass"));
         }
@@ -725,7 +769,7 @@ mod tests {
             let judge = ClaudeCliJudge::new()
                 .with_binary(script)
                 .with_timeout(Duration::from_secs(5));
-            let resp = judge.judge(&sample_prompt()).expect("judge ok");
+            let resp = judge_retry_etxtbsy(&judge, &sample_prompt()).expect("judge ok");
             assert_eq!(
                 resp.verdict,
                 JudgeVerdict::Fail {
@@ -745,7 +789,7 @@ mod tests {
             let judge = ClaudeCliJudge::new()
                 .with_binary(script)
                 .with_timeout(Duration::from_secs(5));
-            let resp = judge.judge(&sample_prompt()).expect("judge ok");
+            let resp = judge_retry_etxtbsy(&judge, &sample_prompt()).expect("judge ok");
             assert_eq!(
                 resp.verdict,
                 JudgeVerdict::Ambiguous {
@@ -765,7 +809,7 @@ mod tests {
             let judge = ClaudeCliJudge::new()
                 .with_binary(script)
                 .with_timeout(Duration::from_secs(5));
-            let resp = judge.judge(&sample_prompt()).expect("judge ok");
+            let resp = judge_retry_etxtbsy(&judge, &sample_prompt()).expect("judge ok");
             assert_eq!(resp.verdict, JudgeVerdict::Pass);
         }
 
@@ -776,7 +820,7 @@ mod tests {
             let judge = ClaudeCliJudge::new()
                 .with_binary(script)
                 .with_timeout(Duration::from_millis(100));
-            let err = judge.judge(&sample_prompt()).expect_err("expected timeout");
+            let err = judge_retry_etxtbsy(&judge, &sample_prompt()).expect_err("expected timeout");
             match err {
                 JudgeError::Timeout { after } => {
                     assert_eq!(after, Duration::from_millis(100));
@@ -832,7 +876,7 @@ mod tests {
                     "/nonexistent/path/to/claude-binary-xyzzy-12345",
                 ))
                 .with_timeout(Duration::from_secs(2));
-            let err = judge.judge(&sample_prompt()).expect_err("expected missing");
+            let err = judge_retry_etxtbsy(&judge, &sample_prompt()).expect_err("expected missing");
             assert!(matches!(err, JudgeError::BinaryMissing(_)));
         }
 
@@ -850,7 +894,7 @@ mod tests {
                 .with_binary(script)
                 .with_extra_args(vec!["--flag-a".to_string(), "--flag-b".to_string()])
                 .with_timeout(Duration::from_secs(5));
-            let resp = judge.judge(&sample_prompt()).expect("ok");
+            let resp = judge_retry_etxtbsy(&judge, &sample_prompt()).expect("ok");
             // -p + prompt + 2 extra args = 4
             assert!(
                 resp.stderr_tail.contains("argc=4"),
@@ -870,7 +914,7 @@ mod tests {
             let judge = ClaudeCliJudge::new()
                 .with_binary(script)
                 .with_timeout(Duration::from_secs(5));
-            let resp = judge.judge(&sample_prompt()).expect("ok");
+            let resp = judge_retry_etxtbsy(&judge, &sample_prompt()).expect("ok");
             // Trivially: elapsed_ms is a u64; just ensure the field is
             // populated (>=0 is tautological for u64, so check the
             // upper bound is sensible).
