@@ -122,6 +122,11 @@ pub mod mcp_jsonrpc;
 /// `STRATUM.md` walk-up loader with `@file` imports (plan/39).
 pub mod memory_loader;
 /// cpal-backed microphone capture scaffold for Phase 5 voice-in.
+///
+/// Gated behind the `voice` feature so the default build does not pull
+/// platform audio deps (ALSA on Linux, CoreAudio on macOS). macOS release
+/// tarballs enable `voice`; the Linux prebuilt does not.
+#[cfg(feature = "voice")]
 pub mod mic;
 /// Curated model catalog: structured index of installer-resolvable models.
 pub mod model_catalog;

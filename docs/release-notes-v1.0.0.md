@@ -123,8 +123,20 @@ cargo install --path crates/stratum-cli --locked
 stratum --version   # → stratum 1.0.0
 ```
 
-For voice support, install `whisper.cpp` and `piper` on `$PATH`; Stratum
-discovers them at startup and surfaces status in `/audio`.
+For voice support (push-to-talk mic capture + TTS playback), build with
+the `voice` feature:
+
+```sh
+cargo install --path crates/stratum-cli --locked --features voice
+```
+
+On Linux you also need ALSA development headers (`sudo apt install
+libasound2-dev` on Debian/Ubuntu, `sudo dnf install alsa-lib-devel` on
+Fedora, etc.) so `cpal` can build.
+
+For voice transcription + synthesis, install `whisper.cpp` and `piper`
+on `$PATH`; Stratum discovers them at startup and surfaces status in
+`/audio`.
 
 ### Prebuilt tarballs
 
@@ -148,6 +160,14 @@ stratum --version
 
 Each tarball ships with a detached SHA-256 sum file; verify before
 installing.
+
+**Voice in/out (cpal mic capture + rodio TTS playback) is enabled in
+the macOS tarballs.** The Linux tarballs are built without the `voice`
+feature so they do not require ALSA headers at build time and do not
+link `libasound2` at runtime — the prebuilt binary runs on minimal
+distros. Linux users who want voice support compile from source with
+`--features voice` after installing ALSA dev headers (see the "From
+source" section above).
 
 ---
 

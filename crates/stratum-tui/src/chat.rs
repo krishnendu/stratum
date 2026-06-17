@@ -193,6 +193,27 @@ struct MicCaptureCell {
     started_rx: mpsc::Receiver<Result<(), String>>,
 }
 
+#[cfg(not(feature = "voice"))]
+impl MicCaptureCell {
+    /// Stub used when the `voice` feature is off (e.g. the prebuilt Linux
+    /// tarball). Always returns the same typed error so the
+    /// `/mic` palette command and the F5 hotkey surface a clear "voice
+    /// support not compiled in — rebuild with `--features voice`" message
+    /// instead of silently doing nothing.
+    fn start() -> Result<Self, String> {
+        Err("voice support not compiled in (rebuild with --features voice)".to_string())
+    }
+
+    /// Stub that mirrors the live signature. Unreachable in practice
+    /// because [`Self::start`] always returns `Err` under non-voice
+    /// builds, so no caller ever holds a `MicCaptureCell` to stop.
+    fn stop_and_save(self, _path: std::path::PathBuf) -> Result<std::path::PathBuf, String> {
+        let _ = (self.join, self.stop_tx, self.started_rx);
+        Err("voice support not compiled in".to_string())
+    }
+}
+
+#[cfg(feature = "voice")]
 impl MicCaptureCell {
     /// Spawn the worker thread, open the cpal stream, and return once
     /// the worker reports a successful start (or a typed error).
@@ -4625,6 +4646,7 @@ fn base64_encode_chat(bytes: &[u8]) -> String {
 /// "[tts unavailable]" message that lights up on Piper failure is the
 /// user-visible feedback channel; rodio failures during playback are
 /// rare enough that a transient log is the right signal.
+#[cfg(feature = "voice")]
 fn play_wav_blocking(path: &std::path::Path) {
     use std::io::BufReader;
     let file = match std::fs::File::open(path) {
@@ -4651,6 +4673,18 @@ fn play_wav_blocking(path: &std::path::Path) {
     let sink = rodio::Sink::connect_new(stream.mixer());
     sink.append(decoder);
     sink.sleep_until_end();
+}
+
+/// Stub used when the `voice` feature is off. Voice-out is a UX nicety
+/// and the upstream code paths log a "[tts unavailable]" status when
+/// piper synth fails; this stub keeps the call site uniform so the
+/// caller does not need its own cfg.
+#[cfg(not(feature = "voice"))]
+fn play_wav_blocking(_path: &std::path::Path) {
+    tracing::debug!(
+        target = "tts",
+        "tts: playback skipped — voice support not compiled in"
+    );
 }
 
 /// Trim `text` for display in a one-line palette acknowledgement.

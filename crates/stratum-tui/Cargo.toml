@@ -20,13 +20,22 @@ publish      = false
 [lints]
 workspace = true
 
+[features]
+default = []
+# Forwards to `stratum-runtime`'s `voice` feature, gates the TUI's
+# mic-capture path, AND pulls in `rodio` for piper-driven TTS playback.
+# Rodio transitively pulls cpal → alsa-sys, which requires Linux ALSA
+# headers at build time — making the whole voice surface optional
+# unblocks cross-compile from a macOS host targeting Linux.
+voice = ["stratum-runtime/voice", "dep:rodio"]
+
 [dependencies]
 ratatui          = { workspace = true }
 crossterm        = { workspace = true }
 serde            = { workspace = true }
 serde_json       = { workspace = true }
 thiserror        = { workspace = true }
-rodio            = { workspace = true }
+rodio            = { workspace = true, optional = true }
 tracing          = { workspace = true }
 stratum-runtime  = { path = "../stratum-runtime" }
 stratum-types    = { path = "../stratum-types" }
