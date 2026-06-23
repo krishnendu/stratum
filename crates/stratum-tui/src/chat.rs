@@ -4684,23 +4684,21 @@ fn play_wav_blocking(path: &std::path::Path) {
             return;
         }
     };
-    let stream = match rodio::OutputStreamBuilder::open_default_stream() {
-        Ok(s) => s,
+    let handle = match rodio::DeviceSinkBuilder::open_default_sink() {
+        Ok(h) => h,
         Err(e) => {
             tracing::warn!(target = "tts", error = %e, "tts: cannot open default audio out");
             return;
         }
     };
-    let decoder = match rodio::Decoder::new(BufReader::new(file)) {
-        Ok(d) => d,
+    let player = match rodio::play(handle.mixer(), BufReader::new(file)) {
+        Ok(p) => p,
         Err(e) => {
             tracing::warn!(target = "tts", error = %e, "tts: cannot decode wav");
             return;
         }
     };
-    let sink = rodio::Sink::connect_new(stream.mixer());
-    sink.append(decoder);
-    sink.sleep_until_end();
+    player.sleep_until_end();
 }
 
 /// Trim `text` for display in a one-line palette acknowledgement.
