@@ -1,0 +1,43 @@
+[package]
+name         = "stratum-mobile-core"
+description  = "Phase 8 mobile cdylib skeleton: re-exports the Stratum runtime surface across an FFI boundary for iOS/Android hosts."
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+homepage     = { workspace = true }
+readme       = { workspace = true }
+keywords     = { workspace = true }
+categories   = { workspace = true }
+publish      = false
+
+[lib]
+# `cdylib` is the shipping artifact loaded by the iOS / Android host
+# app. `staticlib` covers the iOS XCFramework path that links the
+# Rust core directly into a Swift target. `rlib` keeps the crate
+# usable from in-workspace Rust integration tests and from any future
+# pure-Rust harness without a second build.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[lints]
+workspace = true
+
+[features]
+# Tier flags mirror `plan/21-mobile.md` §3: the mobile host picks one
+# tier at build time so the cdylib only carries the model / RAG / tool
+# surface the device can actually run. None are wired to deps yet —
+# this PR is the skeleton. Subsequent Phase 8 PRs gate the heavy code
+# paths (provider selection, RAG index size, ANE/coreml hooks) behind
+# these flags.
+default            = []
+mobile-ultra-low   = []
+mobile-low         = []
+mobile-medium      = []
+mobile-high        = []
+
+[dependencies]
+stratum-runtime  = { path = "../stratum-runtime" }
+stratum-types    = { path = "../stratum-types" }
+stratum-tui-api  = { path = "../stratum-tui-api" }
