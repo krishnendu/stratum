@@ -1,0 +1,14 @@
+# Mobile high tier bundle, per `plan/21-mobile-clients.md` §5.
+#
+# Target: foldables and tablets with 16 GB+ RAM.
+# Resident budget: ~5-6 GB. Dense 7B is in reach; the 30B MoE swap remains
+# desktop-only.
+
+[bundle."mobile-high-v1"]
+description   = "Dense 7B crew for tablets and foldables."
+tier          = "mobile_high"
+
+role_main     = "qwen3-coder-7b-instruct-q4_k_m"
+role_router   = "gemma-4-e2b-q4_k_m"
+role_polisher = "qwen3-0.6b-instruct-q4_k_m"
+role_embedder = "arctic-embed-l-v2-mrl-256"
