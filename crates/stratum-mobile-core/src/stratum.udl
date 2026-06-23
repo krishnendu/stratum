@@ -1,0 +1,4 @@
+namespace stratum_mobile {
+  u32 mobile_init();
+  string mobile_version();
+};

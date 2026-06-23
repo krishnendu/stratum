@@ -1,0 +1,28 @@
+[package]
+name         = "stratum-mobile-core"
+description  = "Mobile (Android / iOS) FFI surface for Stratum. uniffi-rs scaffold; Phase 8."
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+homepage     = { workspace = true }
+readme       = { workspace = true }
+keywords     = { workspace = true }
+categories   = { workspace = true }
+
+[lints]
+workspace = true
+
+[lib]
+# `cdylib` for Android (`lib*.so`) and iOS (`lib*.dylib`/static-bundled).
+# `rlib` is kept so the workspace can `cargo check` / unit-test the crate
+# without needing a cross toolchain installed.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+uniffi = { workspace = true }
+
+[build-dependencies]
+uniffi = { workspace = true, features = ["build"] }

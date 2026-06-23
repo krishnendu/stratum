@@ -9,6 +9,7 @@ members = [
     "crates/stratum-backend-local",
     "crates/stratum-cli",
     "crates/stratum-eval",
+    "crates/stratum-mobile-core",
     "crates/xtask",
 ]
 
@@ -117,6 +118,12 @@ hound           = "3"
 # returns through the OS default audio out. `default-features = false`
 # trims encoder/format support to just the `wav` reader piper emits.
 rodio           = { version = "0.21", default-features = false, features = ["wav", "playback"] }
+# uniffi-rs — Mozilla's multi-language bindings generator. Used by
+# `stratum-mobile-core` to expose a tiny C-ABI surface to Android
+# (Kotlin via JNI) and iOS (Swift). Pinned to the latest 0.28.x line —
+# that's what next-gen `uniffi-bindgen-kotlin` and Mozilla's own
+# Android consumers (Application Services, glean-core) currently track.
+uniffi          = { version = "0.28.3", default-features = false }
 
 [profile.release]
 lto             = "thin"
