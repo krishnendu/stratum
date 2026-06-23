@@ -1,0 +1,55 @@
+[package]
+name         = "stratum-mobile-core"
+description  = "Phase 8 mobile cdylib skeleton: re-exports the Stratum runtime surface across an FFI boundary for iOS/Android hosts."
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+homepage     = { workspace = true }
+readme       = { workspace = true }
+keywords     = { workspace = true }
+categories   = { workspace = true }
+publish      = false
+
+[lib]
+# `cdylib` is the shipping artifact loaded by the iOS / Android host
+# app. `staticlib` covers the iOS XCFramework path that links the
+# Rust core directly into a Swift target. `rlib` keeps the crate
+# usable from in-workspace Rust integration tests and from any future
+# pure-Rust harness without a second build.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[lints]
+workspace = true
+
+[features]
+# Tier flags mirror `plan/21-mobile.md` §3: the mobile host picks one
+# tier at build time so the cdylib only carries the model / RAG / tool
+# surface the device can actually run. None are wired to deps yet —
+# this PR is the skeleton. Subsequent Phase 8 PRs gate the heavy code
+# paths (provider selection, RAG index size, ANE/coreml hooks) behind
+# these flags.
+default            = []
+mobile-ultra-low   = []
+mobile-low         = []
+mobile-medium      = []
+mobile-high        = []
+
+[dependencies]
+stratum-runtime  = { path = "../stratum-runtime" }
+stratum-types    = { path = "../stratum-types" }
+stratum-tui-api  = { path = "../stratum-tui-api" }
+# uniffi-rs runtime + bindings: the Android JNI scaffolding generator
+# emits Rust shims that we `include!` from `src/lib.rs`, and they call
+# into uniffi's runtime helpers at link time.
+uniffi           = { workspace = true }
+
+[build-dependencies]
+# Generates the per-platform FFI scaffolding artifacts. uniffi runs
+# unconditionally (its scaffolding is `include!`'d from `src/lib.rs`);
+# cbindgen runs only on iOS targets (or when `STRATUM_FORCE_CBINDGEN=1`)
+# to refresh the C header used by the Swift Package's `binaryTarget`.
+uniffi           = { workspace = true, features = ["build"] }
+cbindgen         = { workspace = true }

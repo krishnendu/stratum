@@ -9,6 +9,7 @@ members = [
     "crates/stratum-backend-local",
     "crates/stratum-cli",
     "crates/stratum-eval",
+    "crates/stratum-mobile-core",
     "crates/xtask",
 ]
 
@@ -117,6 +118,12 @@ hound           = "3"
 # returns through the OS default audio out. `default-features = false`
 # trims encoder/format support to just the `wav` reader piper emits.
 rodio           = { version = "0.22", default-features = false, features = ["wav", "playback"] }
+# Phase 8 mobile FFI generators. `uniffi` powers the Android JNI path
+# (UDL → Kotlin bindings + Rust scaffolding); `cbindgen` powers the iOS
+# Swift Package path (C header generated from #[no_mangle] extern "C"
+# fns). Both are consumed only by `stratum-mobile-core`.
+uniffi          = "0.28"
+cbindgen        = "0.27"
 
 [profile.release]
 lto             = "thin"

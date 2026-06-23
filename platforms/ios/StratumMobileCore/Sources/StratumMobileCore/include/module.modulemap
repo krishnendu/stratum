@@ -1,0 +1,5 @@
+module CStratumMobile {
+  header "stratum_mobile.h"
+  link "stratum_mobile_core"
+  export *
+}
