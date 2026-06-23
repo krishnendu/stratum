@@ -1,0 +1,13 @@
+# Mobile low tier bundle, per `plan/21-mobile-clients.md` §5.
+#
+# Target: flagship phones with ~8 GB total RAM.
+# Resident budget: ~1.5-2 GB. Adds an embedder for on-device retrieval.
+
+[bundle."mobile-low-v1"]
+description   = "Compact dense crew."
+tier          = "mobile_low"
+
+role_main     = "qwen3-1.7b-instruct-q4_k_m"
+role_router   = "qwen3-0.6b-instruct-q4_k_m"
+role_polisher = "qwen3-0.6b-instruct-q4_k_m"
+role_embedder = "arctic-embed-s-v2-mrl-256"
