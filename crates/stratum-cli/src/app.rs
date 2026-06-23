@@ -3351,10 +3351,16 @@ fn catalog_slugs(paths: &Paths) -> Vec<String> {
 fn auto_select_model(paths: &Paths, host_tier: Tier) -> Option<String> {
     let catalog_path = paths.state.join("models.json");
     let catalog = ModelCatalog::load(&catalog_path).ok()?;
+    // Mobile rungs project onto the catalog's coarser desktop `ModelTier`
+    // buckets so the same auto-select walk works on phones. The mobile
+    // ladder caps at a dense 7B (`MobileHigh` -> `High`); the rest are
+    // smaller. See `assets/bundles/mobile-*.toml` for the per-tier sizes.
+    // This path is gated on `provider-llama-cpp`, which mobile builds do
+    // not currently enable; the arms exist for exhaustiveness today.
     let cli_tier = match host_tier {
-        Tier::Low => ModelTier::Low,
-        Tier::Medium => ModelTier::Medium,
-        Tier::High => ModelTier::High,
+        Tier::Low | Tier::MobileUltraLow | Tier::MobileLow => ModelTier::Low,
+        Tier::Medium | Tier::MobileMedium => ModelTier::Medium,
+        Tier::High | Tier::MobileHigh => ModelTier::High,
     };
     // Hard preference list. Gemma 4 E4B wins by default: official Google
     // QAT GGUF, fast (MatFormer ~4B effective), follows tool-call rules
