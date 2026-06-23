@@ -1,0 +1,29 @@
+[package]
+name         = "stratum-mobile-core"
+description  = "Mobile (iOS/Android) FFI surface for the Stratum runtime. Phase 8 scaffold."
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+repository   = { workspace = true }
+homepage     = { workspace = true }
+readme       = { workspace = true }
+keywords     = { workspace = true }
+categories   = { workspace = true }
+
+# The C-ABI surface is delivered as a cdylib (consumed by Swift via a
+# `binaryTarget`) and as a staticlib (for archive linking on Android / CI).
+# The plain `lib` is kept so we can keep using the crate normally inside the
+# workspace (tests, doc-tests).
+[lib]
+name       = "stratum_mobile_core"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[build-dependencies]
+cbindgen = { version = "0.27", default-features = false }
