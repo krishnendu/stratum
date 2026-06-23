@@ -116,7 +116,7 @@ hound           = "3"
 # for Phase 5 voice-out: playing the WAV that `PiperSubprocess::synthesize`
 # returns through the OS default audio out. `default-features = false`
 # trims encoder/format support to just the `wav` reader piper emits.
-rodio           = { version = "0.21", default-features = false, features = ["wav", "playback"] }
+rodio           = { version = "0.22", default-features = false, features = ["wav", "playback"] }
 
 [profile.release]
 lto             = "thin"
