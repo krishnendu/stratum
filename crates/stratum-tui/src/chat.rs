@@ -4684,23 +4684,21 @@ fn play_wav_blocking(path: &std::path::Path) {
             return;
         }
     };
-    let stream = match rodio::OutputStreamBuilder::open_default_stream() {
-        Ok(s) => s,
+    let handle = match rodio::DeviceSinkBuilder::open_default_sink() {
+        Ok(h) => h,
         Err(e) => {
             tracing::warn!(target = "tts", error = %e, "tts: cannot open default audio out");
             return;
         }
     };
-    let decoder = match rodio::Decoder::new(BufReader::new(file)) {
-        Ok(d) => d,
+    let player = match rodio::play(handle.mixer(), BufReader::new(file)) {
+        Ok(p) => p,
         Err(e) => {
             tracing::warn!(target = "tts", error = %e, "tts: cannot decode wav");
             return;
         }
     };
-    let sink = rodio::Sink::connect_new(stream.mixer());
-    sink.append(decoder);
-    sink.sleep_until_end();
+    player.sleep_until_end();
 }
 
 /// Trim `text` for display in a one-line palette acknowledgement.
@@ -5544,7 +5542,10 @@ pub fn run_with_state(
     result
 }
 
-fn event_loop<B: Backend>(terminal: &mut Terminal<B>, state: &mut ChatState) -> StratumResult<()> {
+fn event_loop<B: Backend>(terminal: &mut Terminal<B>, state: &mut ChatState) -> StratumResult<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     loop {
         let evt = if event::poll(Duration::from_millis(50)).map_err(map_io_error)? {
             Some(event::read().map_err(map_io_error)?)
@@ -5562,7 +5563,10 @@ fn step<B: Backend>(
     terminal: &mut Terminal<B>,
     state: &mut ChatState,
     event: Option<&Event>,
-) -> StratumResult<()> {
+) -> StratumResult<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     terminal
         .draw(|f| state.render(f.area(), f.buffer_mut()))
         .map_err(map_io_error)?;
@@ -5599,10 +5603,10 @@ fn step<B: Backend>(
 /// (falling back to `$EDITOR`, then `vi`) on it, read the contents
 /// back, and restore the TUI. Caller passes the edited result to
 /// [`ChatState::set_input_from_editor`].
-fn run_external_editor<B: Backend>(
-    terminal: &mut Terminal<B>,
-    seed: &str,
-) -> StratumResult<String> {
+fn run_external_editor<B: Backend>(terminal: &mut Terminal<B>, seed: &str) -> StratumResult<String>
+where
+    B::Error: Send + Sync + 'static,
+{
     use std::io::Write as _;
 
     let editor = std::env::var("VISUAL")
@@ -5637,7 +5641,10 @@ fn run_external_editor<B: Backend>(
     Ok(body)
 }
 
-fn map_io_error(err: io::Error) -> stratum_types::StratumError {
+fn map_io_error<E>(err: E) -> stratum_types::StratumError
+where
+    E: core::error::Error + Send + Sync + 'static,
+{
     stratum_types::StratumError::new(
         stratum_types::error::codes::E1001_INSTALLED_SCHEMA_UNREADABLE,
         "TUI io error",

@@ -68,8 +68,8 @@ sysinfo         = "0.32"
 dirs            = "6"
 time            = { version = "0.3", features = ["formatting", "serde"] }
 tempfile        = "3"
-ratatui         = { version = "0.29", default-features = false, features = ["crossterm"] }
-crossterm       = "0.28"
+ratatui         = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm       = "0.29"
 sha2            = "0.11"
 ureq            = { version = "2", default-features = false, features = ["tls"] }
 rand            = { version = "0.9", default-features = false, features = ["small_rng", "std", "std_rng"] }
@@ -116,7 +116,7 @@ hound           = "3"
 # for Phase 5 voice-out: playing the WAV that `PiperSubprocess::synthesize`
 # returns through the OS default audio out. `default-features = false`
 # trims encoder/format support to just the `wav` reader piper emits.
-rodio           = { version = "0.21", default-features = false, features = ["wav", "playback"] }
+rodio           = { version = "0.22", default-features = false, features = ["wav", "playback"] }
 
 [profile.release]
 lto             = "thin"
