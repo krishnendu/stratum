@@ -139,17 +139,24 @@ impl MicCapture {
     /// `Result` and a missing name is rare but not fatal.
     #[must_use]
     pub fn list_input_devices() -> Vec<String> {
+        // cpal 0.17 deprecated `DeviceTrait::name()` in favour of
+        // `description()` (returns a richer struct). Use
+        // `description().name()` to keep the same user-facing label.
         let host = cpal::default_host();
         host.input_devices().map_or_else(
             |_| Vec::new(),
-            |iter| iter.filter_map(|d| d.name().ok()).collect(),
+            |iter| {
+                iter.filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
+                    .collect()
+            },
         )
     }
 
     /// Returns the native sample rate of the input device, in Hz.
     #[must_use]
     pub const fn native_sample_rate_hz(&self) -> u32 {
-        self.native_config.sample_rate.0
+        // cpal 0.17 made `sample_rate` a plain `u32` (was `SampleRate(u32)`).
+        self.native_config.sample_rate
     }
 
     /// Returns the native channel count of the input device.
@@ -177,7 +184,7 @@ impl MicCapture {
         Self {
             native_config: StreamConfig {
                 channels,
-                sample_rate: cpal::SampleRate(sample_rate_hz),
+                sample_rate: sample_rate_hz,
                 buffer_size: cpal::BufferSize::Default,
             },
             buffer: Arc::new(Mutex::new(samples)),

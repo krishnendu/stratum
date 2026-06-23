@@ -95,7 +95,7 @@ keyring         = "2"
 # Filesystem watcher for settings / agents / hooks hot-reload.
 # Off by default so per-PR CI doesn't pay the inotify / FSEvents
 # / ReadDirectoryChanges link surface; production CLI opts in.
-notify          = { version = "6", default-features = false, features = ["macos_kqueue"] }
+notify          = { version = "8", default-features = false, features = ["macos_kqueue"] }
 # Synchronous HTTP server for the `stratum serve --openai` egress path.
 # Kept sync to match the rest of the runtime — no tokio in the request path.
 tiny_http       = { version = "0.12", default-features = false }
@@ -107,7 +107,7 @@ ctrlc           = { version = "3", default-features = false, features = ["termin
 # Phase 5 voice-in capture scaffold. Pinned to 0.16 to match the
 # host-API surface the module targets (`Host::default_input_device`,
 # `Device::default_input_config`, `Stream::play`).
-cpal            = "0.16"
+cpal            = "0.17"
 # hound — minimal 16-bit PCM WAV reader/writer. Used by
 # `stratum-runtime::mic::save_wav` to dump the 16 kHz mono buffer to
 # disk in the format whisper.cpp wants.
