@@ -6,7 +6,7 @@ on:
   # warnings && cargo test --workspace --no-fail-fast && cargo llvm-cov
   # --workspace --exclude xtask --exclude stratum-tui --exclude
   # stratum-backend-local --ignore-filename-regex
-  # 'crates/stratum-runtime/src/mic\.rs' --fail-under-lines 95`.
+  # 'crates/stratum-runtime/src/mic\.rs' --fail-under-lines 96`.
   # PR review remains a local-discipline gate.
   workflow_dispatch:
 
@@ -147,7 +147,7 @@ jobs:
             --exclude stratum-tui \
             --exclude stratum-backend-local \
             --ignore-filename-regex 'crates/stratum-runtime/src/mic\.rs' \
-            --fail-under-lines 95
+            --fail-under-lines 96
       - name: cargo llvm-cov (lcov artifact)
         shell: bash
         # Excludes the `provider-llama-cpp` feature; see clippy job comment.
