@@ -11,10 +11,10 @@ name: bench-floor
 # Gated on `schedule:` + `workflow_dispatch:` only — never per-PR.
 
 on:
+  # Manual-only: nightly cron disabled (GH Actions quota gone). Run
+  # locally with `cargo run -p stratum-eval --bin bench-floor` and
+  # `cargo run -p stratum-eval --bin bench-history` when needed.
   workflow_dispatch:
-  schedule:
-    # 03:17 UTC nightly; offset from eval-baseline/eval-llm windows.
-    - cron: '17 3 * * *'
 
 env:
   CARGO_TERM_COLOR: always

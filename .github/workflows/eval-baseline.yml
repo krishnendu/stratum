@@ -1,10 +1,8 @@
 name: eval-baseline
 
 on:
+  # Manual-only: nightly cron disabled (GH Actions quota gone).
   workflow_dispatch:
-  schedule:
-    # 04:00 UTC nightly.
-    - cron: '0 4 * * *'
 
 env:
   CARGO_TERM_COLOR: always

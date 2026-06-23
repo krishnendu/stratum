@@ -4,9 +4,10 @@ name: provider-llama-cpp
 # when a maintainer asks for it via `gh workflow run provider-llama-cpp.yml`
 # or right before a release tag is published.
 on:
+  # Manual-only: release-created trigger removed because creating a GH
+  # release (via `gh release create`) would auto-fire this and burn the
+  # quota. Run via `gh workflow run provider-llama-cpp.yml` when needed.
   workflow_dispatch:
-  release:
-    types: [created]
 
 env:
   CARGO_TERM_COLOR: always

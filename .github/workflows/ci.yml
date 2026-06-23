@@ -1,10 +1,14 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # Manual-only: GH Actions quota is gone; CI runs locally via
+  # `cargo fmt --check && cargo clippy --workspace --all-targets -- -D
+  # warnings && cargo test --workspace --no-fail-fast && cargo llvm-cov
+  # --workspace --exclude xtask --exclude stratum-tui --exclude
+  # stratum-backend-local --ignore-filename-regex
+  # 'crates/stratum-runtime/src/mic\.rs' --fail-under-lines 95`.
+  # PR review remains a local-discipline gate.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

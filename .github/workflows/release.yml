@@ -1,13 +1,18 @@
 name: release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  # Manual-only: tag-push trigger removed because GH Actions quota is
+  # gone. The actual release flow is: maintainer builds binaries +
+  # tarballs + sha256s LOCALLY (cross-compile from macOS via
+  # `cargo build` for native arm64/x86_64 mac and `cargo zigbuild`
+  # for linux arm64/x86_64), then `gh release create vX.Y.Z` uploads
+  # them. This workflow is retained ONLY as a documented build recipe
+  # and can be triggered via `gh workflow run release.yml` in the rare
+  # case a future quota window allows a CI-built release.
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v0.1.0)'
+        description: 'Tag to release (e.g. v1.0.0)'
         required: true
         type: string
 

@@ -1,10 +1,8 @@
 name: eval-llm
 
 on:
+  # Manual-only: nightly cron disabled (GH Actions quota gone).
   workflow_dispatch:
-  schedule:
-    # 04:30 UTC nightly (30 min after eval-baseline).
-    - cron: '30 4 * * *'
 
 env:
   CARGO_TERM_COLOR: always
