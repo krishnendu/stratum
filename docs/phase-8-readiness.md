@@ -153,6 +153,37 @@ extension (a `home()` accessor and/or a `sandbox_dir()` accessor) and
 is best done together at the top of Phase 8 once the mobile `Paths`
 implementation is decided.
 
+## What landed in the Phase 8 groundwork sweep
+
+The following scaffolding PRs were opened together on 2026-06-23 to make
+the Phase 8 entry tractable. They are scaffolds — real wiring lands in
+follow-ups gated by toolchain availability and tracked in the issue
+linked at the bottom of this document.
+
+- **PR #205 — `feat(phase-8): stratum-mobile-core cdylib skeleton`** —
+  Creates `crates/stratum-mobile-core/` as a `cdylib` + `staticlib` +
+  `rlib` workspace member, with `mobile_init` / `mobile_version` FFI
+  stubs and `mobile-ultra-low` … `mobile-high` tier feature flags.
+- **PR #207 — `feat(phase-8): cbindgen scaffold for iOS Swift Package`** —
+  Adds cbindgen config + `build.rs` that emits `include/stratum_mobile.h`,
+  the checked-in header, and a `platforms/ios/StratumMobileCore` SwiftPM
+  package with a module map so Swift sees the C symbols.
+- **PR #208 — `feat(phase-8): uniffi-rs scaffold for Android JNI bindings`** —
+  Pins `uniffi = 0.28.3`, adds `src/stratum.udl` and a `build.rs` that
+  runs `uniffi::generate_scaffolding`, giving Kotlin and Swift a single
+  UDL source of truth.
+- **PR #209 — `feat(phase-8): mobile tier ladder + bundle TOMLs`** —
+  Extends `Tier` with `MobileUltraLow` / `MobileLow` / `MobileMedium` /
+  `MobileHigh`, adds an `is_mobile()` helper, makes `classify` default
+  to `MobileMedium` on `target_os = "ios" | "android"`, and ships the
+  four matching `assets/bundles/mobile-*-v1.toml` files.
+
+PRs #205, #207, #208 all create `crates/stratum-mobile-core/` — whichever
+lands first sets the crate-type / dependency baseline, and the other two
+will need a merge resolution to combine their `build.rs` flows and
+dependency sets (cbindgen build-dep + uniffi build-dep on top of the
+runtime re-exports).
+
 ## Phase 8 entry checklist
 
 Before a mobile build can start, this is the remaining work:
@@ -188,10 +219,32 @@ Before a mobile build can start, this is the remaining work:
         as far as the `ring` failure, so this audit was inconclusive.)
   - [ ] Re-run Audit 1 after the toolchains are present; resolve any
         new failures that surface past the `ring` build.
-- [ ] **TUI mobile decision**
-  - [ ] Confirm `stratum-tui` is *not* built for mobile (separate
-        frontend). If correct, no further Paths cleanup needed in
-        that crate for Phase 8.
+- [x] **TUI mobile decision** — confirmed in the groundwork sweep:
+      `stratum-tui` is desktop-only and is not part of the Phase 8
+      mobile frontend. The mobile frontend goes through
+      `stratum-mobile-core` (scaffolded — PRs #205 / #207 / #208).
+- [x] **`stratum-mobile-core` cdylib carved out** — scaffolded —
+      PR #205. The crate is in the workspace with the right
+      crate-types and tier feature flags; real runtime wiring is the
+      follow-up.
+- [x] **FFI bindings generators chosen and scaffolded** — scaffolded —
+      PRs #207 (cbindgen → iOS Swift Package) and #208 (uniffi-rs →
+      Android JNI). UDL is the source of truth for Kotlin / Swift;
+      cbindgen is kept for the raw-C Swift bridge.
+- [x] **Mobile tier ladder defined** — scaffolded — PR #209.
+      `Tier::Mobile{UltraLow,Low,Medium,High}` plus the four bundle
+      TOMLs are in tree. Device-class detection and bundle-resolver
+      wiring are the follow-up.
+
+## Follow-up tracking
+
+Phase 8's remaining work needs hardware + IDE (Xcode, Android Studio,
+real iPhone / Pixel / Samsung / Xiaomi devices, Apple Developer Program
+enrollment, store submission flows) that can't be driven from a headless
+shell. That work is tracked in the GitHub issue
+**"Phase 8 (mobile clients) — work that requires real hardware"** —
+maintainers with the right setup pick items off of it as they become
+unblocked.
 
 ## Fixes applied in this PR
 
