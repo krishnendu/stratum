@@ -41,3 +41,15 @@ mobile-high        = []
 stratum-runtime  = { path = "../stratum-runtime" }
 stratum-types    = { path = "../stratum-types" }
 stratum-tui-api  = { path = "../stratum-tui-api" }
+# uniffi-rs runtime + bindings: the Android JNI scaffolding generator
+# emits Rust shims that we `include!` from `src/lib.rs`, and they call
+# into uniffi's runtime helpers at link time.
+uniffi           = { workspace = true }
+
+[build-dependencies]
+# Generates the per-platform FFI scaffolding artifacts. uniffi runs
+# unconditionally (its scaffolding is `include!`'d from `src/lib.rs`);
+# cbindgen runs only on iOS targets (or when `STRATUM_FORCE_CBINDGEN=1`)
+# to refresh the C header used by the Swift Package's `binaryTarget`.
+uniffi           = { workspace = true, features = ["build"] }
+cbindgen         = { workspace = true }

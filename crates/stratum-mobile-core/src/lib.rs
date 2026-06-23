@@ -1,3 +1,22 @@
+// uniffi-generated scaffolding (included from $OUT_DIR/stratum.uniffi.rs via
+// `uniffi::include_scaffolding!` below) trips three pedantic clippy lints
+// that we cannot fix at our end without forking uniffi-rs:
+//
+// - `clippy::empty_line_after_doc_comments` on the version checksum block
+// - `clippy::missing_const_for_fn` on the two `..._checksum_func_...`
+//   exported helpers (they evaluate `u16` literals so clippy thinks they
+//   could be `const fn`, but uniffi emits them as plain fns)
+//
+// These are upstream-stable as of uniffi 0.28.x. Allowing crate-wide is
+// the lowest-friction option; reverting to per-call `#[allow]` would
+// require us to modify the generated file, which `build.rs` rewrites on
+// every build.
+#![allow(
+    clippy::empty_line_after_doc_comments,
+    clippy::missing_const_for_fn,
+    reason = "lints triggered by uniffi-rs 0.28-generated scaffolding; cannot annotate generated code"
+)]
+
 //! Phase 8 mobile cdylib skeleton.
 //!
 //! `stratum-mobile-core` is the single artifact the iOS and Android
@@ -83,6 +102,16 @@ pub use stratum_types::{
 /// direct dep.
 pub use stratum_runtime as runtime;
 
+// ---- uniffi-rs scaffolding ---------------------------------------------
+//
+// `build.rs` runs `uniffi::generate_scaffolding("src/stratum.udl")`
+// before this file compiles, dropping a generated Rust shim into
+// `$OUT_DIR/stratum.uniffi.rs`. The `include_scaffolding!` macro pulls
+// that file in so the uniffi runtime can dispatch into the C ABI
+// functions defined below from the generated Kotlin / Swift bindings.
+// Without this, the UDL would be inert.
+uniffi::include_scaffolding!("stratum");
+
 // ---- C ABI -------------------------------------------------------------
 
 /// Workspace version string, materialised once and leaked for the
@@ -128,6 +157,38 @@ pub const extern "C" fn stratum_mobile_init() -> i32 {
 #[no_mangle]
 pub extern "C" fn stratum_mobile_version() -> *const c_char {
     version_cstring().as_ptr()
+}
+
+// ---- uniffi-rs surface -------------------------------------------------
+//
+// The UDL at `src/stratum.udl` declares two top-level functions in the
+// `stratum_mobile` namespace. uniffi's generator (run by `build.rs`)
+// expects Rust functions with those exact names; the C-ABI fns above
+// use a `stratum_` prefix for C-convention readability and the
+// type-system shapes (`i32`, `*const c_char`) do not match uniffi's
+// declared signatures (`u32`, `String`). These thin wrappers bridge
+// the two surfaces:
+//
+// * Kotlin / Swift consumers call the uniffi-generated bindings, which
+//   resolve to these wrappers.
+// * Cross-platform C consumers (legacy / non-uniffi hosts) call the
+//   `stratum_mobile_*` C ABI directly.
+
+/// uniffi-side `mobile_init` — wraps the C-ABI return into the `u32`
+/// the UDL declares. Identical semantics: `0` on success.
+#[must_use]
+pub fn mobile_init() -> u32 {
+    u32::try_from(stratum_mobile_init()).unwrap_or(0)
+}
+
+/// uniffi-side `mobile_version` — returns the workspace version as an
+/// owned `String` (uniffi serialises `String` values across the FFI
+/// boundary, so we return a copy of the static C string here).
+#[must_use]
+pub fn mobile_version() -> String {
+    version_cstring()
+        .to_str()
+        .map_or_else(|_| env!("CARGO_PKG_VERSION").to_string(), str::to_owned)
 }
 
 #[cfg(test)]
