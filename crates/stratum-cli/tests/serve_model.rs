@@ -141,12 +141,44 @@ fn serve_with_unknown_model_slug_errors() {
 /// CI budget.
 #[cfg(not(feature = "provider-llama-cpp"))]
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "integration test inlines a daemon-spawn + timeout-bounded stdout reader + TCP round-trip; splitting fragments the test's narrative without removing complexity"
+)]
 fn serve_default_provider_accepts_jsonrpc_ping_over_tcp() {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
-    use std::process::Stdio;
+    use std::process::{Child, ChildStdout, Stdio};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    // Mirror `serve_daemon.rs::read_startup_line`: hand stdout off to a
+    // worker thread that does the actual `read_line`, then bound the
+    // wait via `recv_timeout`. Without this, a buggy daemon that emits
+    // an error on stderr but never writes to stdout would hang this
+    // test until the CI watchdog killed the runner. Tracked as a
+    // follow-up in the v1.0 cleanup batch (originally surfaced in the
+    // PR #171 review comments).
+    fn read_startup_line(stdout: ChildStdout, timeout: Duration, child: &mut Child) -> String {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let res = reader.read_line(&mut line);
+            let _ = tx.send((line, res));
+        });
+        if let Ok((line, res)) = rx.recv_timeout(timeout) {
+            res.expect("read startup line");
+            line
+        } else {
+            // Kill the child so it does not linger as a zombie holding
+            // the stdout pipe open, then panic the test.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child stdout read_line timed out");
+        }
+    }
 
     let tmp = TempDir::new().unwrap();
     let mut child = bin()
@@ -167,9 +199,7 @@ fn serve_default_provider_accepts_jsonrpc_ping_over_tcp() {
 
     let stdout = child.stdout.take().expect("child stdout");
     let stderr = child.stderr.take().expect("child stderr");
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read startup line");
+    let line = read_startup_line(stdout, Duration::from_secs(10), &mut child);
 
     let parsed: serde_json::Value =
         serde_json::from_str(line.trim()).expect("startup line is valid JSON");
