@@ -17,30 +17,30 @@ class Stratum < Formula
   desc "Stratum — your local model crew. Local-first chat with an LLM agent"
   homepage "https://github.com/krishnendu/stratum"
   license any_of: ["Apache-2.0", "MIT"]
-  version "1.0.0"
+  version "1.0.1"
 
   conflicts_with "stratum-llama-cpp",
     because: "both install a `stratum` binary; pick the prebuilt or the LLM-enabled build"
 
   on_macos do
     on_arm do
-      url "https://github.com/krishnendu/stratum/releases/download/v1.0.0/stratum-v1.0.0-aarch64-apple-darwin.tar.gz"
-      sha256 "a9125e82a30ebac8b19a4512e70ecce016c2728168a05def8486a7a1ccca9db5"
+      url "https://github.com/krishnendu/stratum/releases/download/v1.0.1/stratum-v1.0.1-aarch64-apple-darwin.tar.gz"
+      sha256 "2591227aea3972786523994c8eca53577de124d3abcaf98d34ee730387884988"
     end
     on_intel do
-      url "https://github.com/krishnendu/stratum/releases/download/v1.0.0/stratum-v1.0.0-x86_64-apple-darwin.tar.gz"
-      sha256 "926cd617f636b9d267d0edf950e0d3ac2bae00eec8664e3cf27f195918bdade0"
+      url "https://github.com/krishnendu/stratum/releases/download/v1.0.1/stratum-v1.0.1-x86_64-apple-darwin.tar.gz"
+      sha256 "f81b2538560220b809455db2f159c9a6e5daea32034af4645113abc0e3341a15"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/krishnendu/stratum/releases/download/v1.0.0/stratum-v1.0.0-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "7d72e0fd4065372ca22795587da79c3f176e38afe9e59b311786b146ee191e80"
+      url "https://github.com/krishnendu/stratum/releases/download/v1.0.1/stratum-v1.0.1-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "10eb2953c92efdbea582facbc235568eeb62b2740f21628d38163475993ead04"
     end
     on_intel do
-      url "https://github.com/krishnendu/stratum/releases/download/v1.0.0/stratum-v1.0.0-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "6a4976887a27082e8892a22323dee3b96a597d950e5dd4a06ff259e9becb9263"
+      url "https://github.com/krishnendu/stratum/releases/download/v1.0.1/stratum-v1.0.1-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "19d011d66d5d043a3826251ec591462ccb581967f79849c050524f728225e694"
     end
   end
 
