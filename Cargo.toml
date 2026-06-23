@@ -95,7 +95,7 @@ keyring         = "2"
 # Filesystem watcher for settings / agents / hooks hot-reload.
 # Off by default so per-PR CI doesn't pay the inotify / FSEvents
 # / ReadDirectoryChanges link surface; production CLI opts in.
-notify          = { version = "6", default-features = false, features = ["macos_kqueue"] }
+notify          = { version = "8", default-features = false, features = ["macos_kqueue"] }
 # Synchronous HTTP server for the `stratum serve --openai` egress path.
 # Kept sync to match the rest of the runtime — no tokio in the request path.
 tiny_http       = { version = "0.12", default-features = false }
