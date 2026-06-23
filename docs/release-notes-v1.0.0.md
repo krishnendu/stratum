@@ -8,6 +8,34 @@ landed in the form of a cross-compile audit and a Paths abstraction.
 
 This release covers everything between **v0.2.10 → v1.0.0**.
 
+> ## ⚠️ Important — pick the right install
+>
+> **The prebuilt tarballs (and `brew install stratum`) ship with an `EchoProvider`
+> only.** That means `stratum chat` will echo your input back at you instead of
+> calling a real LLM. The TUI, palette, hotkeys, sessions, slash commands, tools,
+> sandbox, OpenAI HTTP egress, voice in/out, self-update, and eval scaffolding
+> all work — but the model-inference path is a stub until you opt in.
+>
+> Why: `provider-llama-cpp` links the full llama.cpp C++ stack (~10–20 min cold
+> compile, pulls cmake + GPU SDK, balloons the binary to ~50 MB+). Shipping that
+> in the default prebuilt would make first-run install painful for users who
+> just want to evaluate the TUI, drive the OpenAI surface, or wire up an
+> external provider.
+>
+> **For real local-LLM responses, install the source-built variant instead:**
+>
+> ```sh
+> # Option A — Homebrew (recommended)
+> brew tap krishnendu/stratum https://github.com/krishnendu/stratum
+> brew install stratum-llama-cpp    # builds from source with provider-llama-cpp; ~10-20 min cold
+>
+> # Option B — cargo
+> cargo install --path crates/stratum-cli --locked --features provider-llama-cpp,voice
+> ```
+>
+> Both expose the same CLI; the LLM-enabled binary `conflicts_with` the
+> prebuilt `stratum` so you only ever have one on `PATH`.
+
 ---
 
 ## Highlights

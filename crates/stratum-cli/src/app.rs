@@ -2477,6 +2477,33 @@ fn format_gb_one_decimal(mib: u32) -> String {
     format!("{whole}.{frac}")
 }
 
+/// Print a one-shot stderr banner explaining that this build of
+/// `stratum` does not include the `provider-llama-cpp` feature, so
+/// `chat` will fall through to `EchoProvider` and just echo input
+/// back. Compiled only on the no-feature build path; under the
+/// feature-enabled build the banner is dead code and never emitted.
+///
+/// Format kept short (5 lines) so it does not flood a TUI session
+/// resume or scripted `--prompt` run. The install commands match the
+/// ones documented in `docs/release-notes-v1.0.0.md`.
+#[cfg(not(feature = "provider-llama-cpp"))]
+fn warn_echo_only_build(err: &mut dyn Write) {
+    let _ = writeln!(err, "stratum: this build is EchoProvider-only (no LLM).");
+    let _ = writeln!(
+        err,
+        "  For real local-LLM responses, install the source-built variant:"
+    );
+    let _ = writeln!(err, "    brew install krishnendu/stratum/stratum-llama-cpp");
+    let _ = writeln!(
+        err,
+        "    # or: cargo install --path crates/stratum-cli --locked --features provider-llama-cpp,voice"
+    );
+    let _ = writeln!(
+        err,
+        "  Silence this banner with STRATUM_QUIET_BANNERS=1 or --json."
+    );
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "subcommand dispatch fans out into many branches; splitting just shuffles state"
@@ -2583,6 +2610,22 @@ fn chat_command(
         }
     }
 
+    // No --model resolved AND `provider-llama-cpp` is NOT compiled in:
+    // we are guaranteed to fall through to EchoProvider, which echoes
+    // user input back instead of running real inference. The prebuilt
+    // v1.0.0 tarballs ship without this feature (cold-build cost +
+    // ~50 MB binary), so a new user typing `stratum chat` would
+    // otherwise have no way to know their session is a stub. Print a
+    // one-shot banner so they learn the limitation and the install
+    // path to the real-LLM build.
+    //
+    // Suppressed under --json (machine-output discipline) and under
+    // STRATUM_QUIET_BANNERS=1 (lets tests + scripted CI consumers
+    // keep stderr clean without a flag dance).
+    #[cfg(not(feature = "provider-llama-cpp"))]
+    if !json && std::env::var("STRATUM_QUIET_BANNERS").as_deref() != Ok("1") {
+        warn_echo_only_build(err);
+    }
     // No --model: keep EchoProvider behavior. `--prompt` still works for
     // the scripted path; otherwise fall through to the interactive TUI.
     if let Some(prompt) = args.prompt.as_deref() {
@@ -2766,6 +2809,10 @@ impl CliProviderResolver {
             kv_cache_type: stratum_runtime::llama_provider::KvCacheKind::parse(
                 &std::env::var("STRATUM_KV_CACHE").unwrap_or_default(),
             ),
+            // Vision projector deferred: the runtime field was added for
+            // Phase 5 mmproj wiring but no CLI surface routes a value
+            // yet (gated on the upstream `mtmd` ABI seam — see #172).
+            mmproj_path: None,
         };
         let provider = LlamaCppProvider::open(&cfg)
             .map_err(|e| ProviderResolveError::Backend(format!("open {slug}: {e}")))?;
@@ -3572,6 +3619,9 @@ fn resolve_llama_provider(
         kv_cache_type: stratum_runtime::llama_provider::KvCacheKind::parse(
             &std::env::var("STRATUM_KV_CACHE").unwrap_or_default(),
         ),
+        // Vision projector deferred (see chat_command's parallel
+        // construction for the same TODO).
+        mmproj_path: None,
     };
     // Build memory context once at provider open. Per plan/39 §10
     // hot-reload would re-run this every turn; v1 ships a load-once
