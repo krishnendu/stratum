@@ -9,6 +9,7 @@ members = [
     "crates/stratum-backend-local",
     "crates/stratum-cli",
     "crates/stratum-eval",
+    "crates/stratum-mobile-core",
     "crates/xtask",
 ]
 

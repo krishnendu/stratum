@@ -3132,6 +3132,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "stratum-mobile-core"
+version = "1.0.1"
+dependencies = [
+ "stratum-runtime",
+ "stratum-tui-api",
+ "stratum-types",
+]
+
+[[package]]
 name = "stratum-runtime"
 version = "1.0.1"
 dependencies = [
