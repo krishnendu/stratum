@@ -5307,18 +5307,38 @@ fn extract_first_file_from_targz(path: &Path) -> Result<(), String> {
     for entry in entries {
         let mut entry = entry.map_err(|e| format!("entry: {e}"))?;
         let header = entry.header().clone();
-        if header.entry_type().is_file() {
-            // Replace the original tarball with the extracted file
-            // contents (atomic enough — caller still validates via
-            // make_executable + atomic_swap after we return).
-            let tmp = path.with_extension("extract.tmp");
-            let mut out = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
-            std::io::copy(&mut entry, &mut out).map_err(|e| format!("copy: {e}"))?;
-            out.sync_all().map_err(|e| format!("sync: {e}"))?;
-            drop(out);
-            std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
-            return Ok(());
+        if !header.entry_type().is_file() {
+            continue;
         }
+        // Skip macOS AppleDouble sidecar entries (`._stratum` next to
+        // `stratum`). BSD `tar -czf` on macOS bundles a 163-byte
+        // AppleDouble metadata file alongside any binary with extended
+        // attributes (notably Mach-O), and that sidecar sorts BEFORE
+        // the real binary in the archive. Without this skip, self-update
+        // would write the metadata blob to disk as the new exe and the
+        // user would hit `exec format error` on the next invocation.
+        // The skip is keyed on the basename so it is robust to any
+        // archive that nests the file in a directory.
+        let path_in_tar = entry
+            .path()
+            .map_or_else(|_| std::path::PathBuf::new(), std::borrow::Cow::into_owned);
+        if path_in_tar
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("._"))
+        {
+            continue;
+        }
+        // Replace the original tarball with the extracted file
+        // contents (atomic enough — caller still validates via
+        // make_executable + atomic_swap after we return).
+        let tmp = path.with_extension("extract.tmp");
+        let mut out = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
+        std::io::copy(&mut entry, &mut out).map_err(|e| format!("copy: {e}"))?;
+        out.sync_all().map_err(|e| format!("sync: {e}"))?;
+        drop(out);
+        std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
+        return Ok(());
     }
     Err("no regular file inside tarball".to_string())
 }
@@ -8543,6 +8563,60 @@ mod tests {
         // The cfg(debug_assertions) branch is always true under `cargo test`,
         // which builds with debug profile by default.
         assert!(insecure_flags_allowed());
+    }
+
+    /// Regression: BSD `tar -czf` on macOS bundles a 163-byte `AppleDouble`
+    /// sidecar (`._stratum`) BEFORE the real `stratum` binary. The first
+    /// implementation of [`extract_first_file_from_targz`] took the first
+    /// regular file, so self-update wrote the metadata blob to disk as
+    /// the new exe — every macOS user who ran `stratum self-update --apply`
+    /// against a BSD-tar-produced v1.0.0 tarball got `exec format error`
+    /// on the next invocation. Fix: skip any entry whose basename starts
+    /// with `._`.
+    #[test]
+    fn extract_first_file_from_targz_skips_appledouble_sidecar() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let tmp = TempDir::new().unwrap();
+        let tarball = tmp.path().join("payload.tar.gz");
+
+        // Build a fake macOS-shaped tarball: `._payload` first
+        // (AppleDouble metadata, 163 bytes), then `payload` (the real
+        // file). The extractor must skip the sidecar and land on
+        // `payload`.
+        let gz_file = std::fs::File::create(&tarball).unwrap();
+        let gz = GzEncoder::new(gz_file, Compression::default());
+        let mut builder = tar::Builder::new(gz);
+
+        let sidecar_bytes = vec![0u8; 163];
+        let mut sidecar_header = tar::Header::new_gnu();
+        sidecar_header.set_path("._payload").unwrap();
+        sidecar_header.set_size(163);
+        sidecar_header.set_mode(0o755);
+        sidecar_header.set_cksum();
+        builder
+            .append(&sidecar_header, sidecar_bytes.as_slice())
+            .unwrap();
+
+        let real_bytes = b"the-real-binary-bytes";
+        let mut real_header = tar::Header::new_gnu();
+        real_header.set_path("payload").unwrap();
+        real_header.set_size(real_bytes.len() as u64);
+        real_header.set_mode(0o755);
+        real_header.set_cksum();
+        builder.append(&real_header, &real_bytes[..]).unwrap();
+
+        builder.into_inner().unwrap().finish().unwrap();
+
+        // Run the extractor: should overwrite `tarball` with the real
+        // binary bytes, ignoring the AppleDouble sidecar.
+        extract_first_file_from_targz(&tarball).expect("extract");
+        let extracted = std::fs::read(&tarball).unwrap();
+        assert_eq!(
+            extracted, real_bytes,
+            "expected the real binary, got AppleDouble sidecar — regression"
+        );
     }
 
     #[test]
