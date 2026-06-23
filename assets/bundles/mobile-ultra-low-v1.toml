@@ -1,0 +1,12 @@
+# Mobile ultra-low tier bundle, per `plan/21-mobile-clients.md` §5.
+#
+# Target: mid-range phones with less than 6 GB total RAM.
+# Resident budget: ~0.5-1 GB. No router model; routing is rule-based.
+
+[bundle."mobile-ultra-low-v1"]
+description   = "Tiny model only; no router; rule-based routing."
+tier          = "mobile_ultra_low"
+
+role_main     = "qwen3-0.6b-instruct-q4_k_m"
+role_router   = "rule-based"
+role_polisher = "qwen3-0.6b-instruct-q4_k_m"
