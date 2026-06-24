@@ -1,14 +1,13 @@
 # Coverage Exclusions
 
-Stratum's CI gate (`G2.1` in `plan/36-verification-gates.md`) requires line coverage **≥ 95%** (`cargo llvm-cov --fail-under-lines 95`). The plan v2 target is 100%; the gap is the documented carve-outs below.
-
-The threshold was previously restored from 95 → 96 once Phase 5/6 backfills landed (openai.rs 93%→98%, whisper.rs 60%→97%). It is **temporarily** back at 95 for the v1.0.0 cross-build PR (#191): the cpal / rodio surface was feature-gated behind `voice` so the Linux release tarball can cross-compile without ALSA headers, and that gate moved a small slice of always-compiled code into a stub branch. Workspace coverage sits at 95.99% under default features (rounded to 96.00 by llvm-cov's display, but the `--fail-under-lines` check uses the unrounded value). A follow-up PR restores the gate to 96 with targeted backfill on the new stub paths plus a couple of low-coverage arms in `serve_server.rs` and `tool_dispatchers.rs`.
+Stratum's CI gate (`G2.1` in `plan/36-verification-gates.md`) requires line coverage **≥ 96%** (`cargo llvm-cov --fail-under-lines 96`). The plan v2 target is 100%; the gap is the documented carve-outs below.
 
 History of the gate movement:
 
 1. v0.2.10: dropped from 96 → 95 when `openai.rs` (~1.1k LOC of HTTP-handler code) landed without full unit coverage on the acceptor / streaming / per-thread response paths.
 2. v0.2.10 follow-up: restored 95 → 96 once `openai.rs` hit ~98% (unit tests in `openai.rs::tests`) and `whisper.rs` hit ~97% via a `script_driven` test module with a fake `#!/bin/sh` whisper.cpp stand-in.
-3. v1.0.0: dropped 96 → 95 for the voice feature-gate cross-build PR. To be restored in a follow-up before the next minor release.
+3. v1.0.0: dropped 96 → 95 for the voice feature-gate cross-build PR (PR #191) — the cpal / rodio surface was feature-gated behind `voice` so the Linux release tarball could cross-compile without ALSA headers, and that gate moved a small slice of always-compiled code into a stub branch.
+4. **v1.0.1+ (2026-06-24)**: restored 95 → 96. The intervening Phase 8 groundwork (mobile-bundles PR #209, mobile-core PR #212) and the rodio/ratatui migrations (PRs #204 / #206) added enough new well-tested code that the workspace organically crossed 96%. Current measured line coverage is 96.03% — the gate at 96 has comfortable headroom.
 
 When a new carve-out is added it MUST be appended here in the same PR. The PR description's `G2.1` checkbox cannot be ticked otherwise.
 
